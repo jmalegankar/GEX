@@ -90,6 +90,7 @@ class PPOGEX(PPO):
         # GEX always encodes via the TARGET network, not the online one.
         if self.sc_vae_target is not None:
             self.sc_vae_target.to(self.device)
+            self.sc_vae_target.eval()
             self._sc_vae_wrap = SCVAEEncoderWrapper(self.sc_vae_target, self.device)
 
         if self.sc_vae is not None:
@@ -109,11 +110,12 @@ class PPOGEX(PPO):
         """Polyak-average online encoder into target encoder."""
         if self.sc_vae is None or self.sc_vae_target is None:
             return
-        for p_online, p_target in zip(
-            self.sc_vae.parameters(),
-            self.sc_vae_target.parameters(),
-        ):
-            p_target.data.mul_(1.0 - self.tau).add_(self.tau * p_online.data)
+        with th.no_grad():
+            for p_online, p_target in zip(
+                self.sc_vae.parameters(),
+                self.sc_vae_target.parameters(),
+            ):
+                p_target.mul_(1.0 - self.tau).add_(self.tau * p_online)
 
     # ------------------------------------------------------------------
     # SC-VAE online update
@@ -229,12 +231,12 @@ class PPOGEX(PPO):
                     if dones[i]:
                         self.gex_modules[i].reset()
 
-                        s0    = new_obs[i]
+                        episode0_obs = new_obs[i]
                         no_op = self.sc_vae.cfg.no_op_action
-                        mu0   = self._sc_vae_wrap.encode_mu(
-                            s0[None],
+                        mu0  = self._sc_vae_wrap.encode_mu(
+                            episode0_obs[None],
                             np.array([no_op]),
-                            s0[None],
+                            episode0_obs[None],
                         )[0].detach().cpu()
 
                         self.gex_modules[i].episodic.query_and_add(mu0)

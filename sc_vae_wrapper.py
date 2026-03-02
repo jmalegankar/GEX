@@ -6,8 +6,8 @@ class SCVAEEncoderWrapper:
     Wraps TransitionSCVAE to accept numpy batches from SB3 VecEnv and return torch mu.
     """
 
-    def __init__(self, scvae, device: th.device):
-        self.scvae = scvae
+    def __init__(self, sc_vae, device: th.device):
+        self.sc_vae = sc_vae
         self.device = device
 
     @th.no_grad()
@@ -33,5 +33,5 @@ class SCVAEEncoderWrapper:
             s_n = s_n.unsqueeze(0)
             a_t = a_t.unsqueeze(0)
 
-        mu, _rho = self.scvae.encode(s_t, a_t, s_n)
+        mu, _rho = self.sc_vae.encode(s_t, a_t, s_n)
         return mu
