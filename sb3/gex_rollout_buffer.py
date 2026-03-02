@@ -26,13 +26,13 @@ class GEXRolloutBuffer(RolloutBuffer):
         value: th.Tensor,
         log_prob: th.Tensor,
         *,
-        next_obs: np.ndarray,
-        intrinsic_reward: np.ndarray,
-        extrinsic_reward: np.ndarray,
+        next_obs: np.ndarray = None,
+        intrinsic_reward: np.ndarray = None,
+        extrinsic_reward: np.ndarray = None,
     ) -> None:
         # store extras at current position BEFORE parent increments pos
-        self.next_observations[self.pos] = next_obs
-        self.intrinsic_rewards[self.pos] = intrinsic_reward
-        self.extrinsic_rewards[self.pos] = extrinsic_reward
+        self.next_observations[self.pos] = next_obs if next_obs is not None else obs
+        self.intrinsic_rewards[self.pos] = intrinsic_reward if intrinsic_reward is not None else 0.0
+        self.extrinsic_rewards[self.pos] = extrinsic_reward if extrinsic_reward is not None else reward
 
         super().add(obs, action, reward, episode_start, value, log_prob)

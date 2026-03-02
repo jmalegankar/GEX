@@ -1,5 +1,5 @@
 import torch
-from sb3.reward_normalizer import RunningMeanStd
+from intrinsic_reward.reward_normalizer import RunningMeanStd
 
 
 def test_rms_basic():
