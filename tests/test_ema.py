@@ -3,7 +3,7 @@ import numpy as np
 import torch as th
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from ppo_gex import PPOGEX
+from sb3.ppo_gex import PPOGEX
 from models.sc_vae import TransitionSCVAE
 from models.config import SCVAEConfig
 from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus

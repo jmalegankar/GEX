@@ -10,8 +10,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 
-from sc_vae_wrapper import SCVAEEncoderWrapper
-from gex_rollout_buffer import GEXRolloutBuffer
+from sb3.sc_vae_wrapper import SCVAEEncoderWrapper
+from sb3.gex_rollout_buffer import GEXRolloutBuffer
 from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus
 
 

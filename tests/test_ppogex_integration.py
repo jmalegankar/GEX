@@ -4,9 +4,9 @@ import torch as th
 
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from ppo_gex import PPOGEX
+from sb3.ppo_gex import PPOGEX
 from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus
-from reward_normalizer import RunningMeanStd
+from sb3.reward_normalizer import RunningMeanStd
 from models.sc_vae import TransitionSCVAE
 from models.config import SCVAEConfig
 from models.obs_embeddings import ObservationEmbedding
