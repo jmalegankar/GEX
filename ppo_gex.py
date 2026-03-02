@@ -201,6 +201,7 @@ class PPOGEX(PPO):
 
             actions_np = actions.cpu().numpy()
             new_obs, rewards_ext, dones, infos = env.step(actions_np)
+            self._update_info_buffer(infos, dones)
 
             # Recover true terminal observations before SB3 overwrites them.
             real_next_obs = new_obs.copy()
@@ -237,6 +238,21 @@ class PPOGEX(PPO):
                         )[0].detach().cpu()
 
                         self.gex_modules[i].episodic.query_and_add(mu0)
+            
+            # Truncation bootstrap — must happen before rollout_buffer.add()
+            # so rewards_total gets the corrected value
+            for i in range(env.num_envs):
+                if (
+                    dones[i]
+                    and infos[i].get("terminal_observation") is not None
+                    and infos[i].get("TimeLimit.truncated", False)
+                ):
+                    terminal_obs = th.as_tensor(
+                        infos[i]["terminal_observation"], device=self.device
+                    ).unsqueeze(0)
+                    with th.no_grad():
+                        terminal_value = self.policy.predict_values(terminal_obs)[0]
+                    rewards_ext[i] += self.gamma * terminal_value.item()
 
             r_int_norm = r_int.copy()
             if self.rms is not None:

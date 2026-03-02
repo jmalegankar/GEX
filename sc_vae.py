@@ -14,7 +14,8 @@ from config import SCVAEConfig
 # Spherical Cauchy helpers
 # ===================================================================
 
-_KL_SERIES_CACHE = {}
+_KL_SERIES_CACHE: dict = {}
+
 
 def _mobius_add(a: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     a_sq = (a * a).sum(-1, keepdim=True)
@@ -30,43 +31,68 @@ def _sc_sample(mu: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
     return _mobius_add(rho * mu, xi)
 
 
-def _sc_z_of_rho(rho: torch.Tensor) -> torch.Tensor:
-    return 4.0 * rho / (1.0 + rho).pow(2)
-
-def _get_kl_series_terms(dim: int, max_terms: int, device, dtype):
+def _get_kl_series_terms(
+    dim: int,
+    max_terms: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     """
-    Returns tensor of shape (K,) containing:
-        coeff_k * (psi(d-1+k) - psi(d-1))
-    Cached per (dim, max_terms, device, dtype).
+    Cached (K,) tensor of  coeff_k * psi_diff_k  for k = 1..max_terms.
+    Independent of rho and batch size, so safe to cache per (dim, device, dtype).
     """
-    key = (dim, max_terms, device.type, str(dtype))
+    key = (dim, max_terms, str(device), str(dtype))
 
     if key in _KL_SERIES_CACHE:
         return _KL_SERIES_CACHE[key]
 
     d_minus_1 = float(dim - 1)
-    a = d_minus_1 / 2.0
+    a         = d_minus_1 / 2.0
+    a_t       = torch.tensor(a, device=device, dtype=dtype)
 
     k = torch.arange(1, max_terms + 1, device=device, dtype=dtype)
 
-    a_t = torch.tensor(a, device=device, dtype=dtype)
-
-    log_coeff = (
-        torch.lgamma(a_t + k)
-        - torch.lgamma(a_t)
-        - torch.lgamma(k + 1.0)
-    )
-
-    coeff = torch.exp(log_coeff)
+    # log( (a)_k / k! )  via lgamma
+    log_coeff = torch.lgamma(a_t + k) - torch.lgamma(a_t) - torch.lgamma(k + 1.0)
+    coeff     = torch.exp(log_coeff)
 
     psi_base = torch.digamma(torch.tensor(d_minus_1, device=device, dtype=dtype))
-    psi_diff = torch.digamma(d_minus_1 + k) - psi_base
+    psi_diff = torch.digamma(d_minus_1 + k) - psi_base   # ψ(d-1+k) - ψ(d-1)
 
-    scalar_terms = coeff * psi_diff  # (K,)
+    scalar_terms = coeff * psi_diff   # (K,)
 
     _KL_SERIES_CACHE[key] = scalar_terms
-
     return scalar_terms
+
+
+def _sc_kl_asymptotic(
+    rho: torch.Tensor,
+    dim: int,
+) -> torch.Tensor:
+    """
+    Proposition 2 (paper §3.2.2): asymptotic KL for rho → 1.
+
+    KL ≈ (d-1) * log((1+ρ)/(1-ρ)) + ψ((d-1)/2) - ψ(d-1)
+
+    Used when rho > RHO_ASYMP_THRESHOLD (= 0.9) because z(ρ) → 1
+    causes the power series to converge too slowly.
+    """
+    device    = rho.device
+    dtype     = rho.dtype
+    d_minus_1 = float(dim - 1)
+
+    log_term   = d_minus_1 * (torch.log1p(rho) - torch.log1p(-rho))  # (d-1)*log((1+ρ)/(1-ρ))
+    correction = (
+        torch.digamma(torch.tensor(d_minus_1 / 2.0, device=device, dtype=dtype))
+        - torch.digamma(torch.tensor(d_minus_1,     device=device, dtype=dtype))
+    )  # scalar
+
+    return (log_term + correction).clamp_min(0.0)
+
+
+# Threshold from paper: "for ρ > 0.9 we use the asymptotic approximation"
+_RHO_ASYMP = 0.9
+
 
 def _sc_kl_uniform(
     rho: torch.Tensor,
@@ -74,45 +100,76 @@ def _sc_kl_uniform(
     *,
     max_terms: int = 64,
 ) -> torch.Tensor:
+    """
+    KL( spCauchy_d(·|μ,ρ) ‖ Uniform(S^{d-1}) ) — Theorem 1.
 
+    Vectorised over batch; series terms cached per (dim, device, dtype).
+    For ρ > 0.9 falls back to Proposition 2 asymptotic to avoid slow
+    convergence when z(ρ) → 1.
+
+    Args:
+        rho:       (B,) or (B,1) tensor, values in [0, 1)
+        dim:       latent dimension d  (must be ≥ 2)
+        max_terms: series truncation for the ρ ≤ 0.9 branch
+    Returns:
+        kl: (B,1) non-negative tensor
+    """
     if dim < 2:
         raise ValueError("dim must be >= 2")
 
+    rho = rho.to(dtype=torch.float32)
     if rho.dim() == 1:
-        rho = rho.unsqueeze(-1)
+        rho = rho.unsqueeze(-1)   # (B,1)
 
     eps = 1e-7
     rho = rho.clamp(0.0, 1.0 - eps)
 
-    device = rho.device
-    dtype = rho.dtype
-
+    device    = rho.device
+    dtype     = rho.dtype
     d_minus_1 = float(dim - 1)
 
-    # ---- First term ----
-    log_ratio = torch.log1p(-rho) - torch.log1p(rho)
-    term1 = d_minus_1 * log_ratio
+    # ----------------------------------------------------------------
+    # Masks for the two branches
+    # ----------------------------------------------------------------
+    high_rho = rho > _RHO_ASYMP   # (B,1) bool
 
-    # ---- Prefactor ----
-    ratio = (1.0 - rho) / (1.0 + rho)
-    pref = d_minus_1 * ratio.pow(d_minus_1)
+    kl = torch.zeros_like(rho)
 
-    # ---- z(rho) ----
-    z = 4.0 * rho / (1.0 + rho).pow(2)  # (B,1)
+    # ----------------------------------------------------------------
+    # Branch A — power series (ρ ≤ 0.9)
+    # ----------------------------------------------------------------
+    if high_rho.logical_not().any():
+        rho_lo = rho.clone()
+        rho_lo[high_rho] = 0.0   # dummy safe value; result masked out below
 
-    # ---- Cached scalar series terms ----
-    scalar_terms = _get_kl_series_terms(dim, max_terms, device, dtype)  # (K,)
+        log_ratio = torch.log1p(-rho_lo) - torch.log1p(rho_lo)
+        term1     = d_minus_1 * log_ratio
 
-    k = torch.arange(1, max_terms + 1, device=device, dtype=dtype)
+        ratio = (1.0 - rho_lo) / (1.0 + rho_lo)
+        pref  = d_minus_1 * ratio.pow(d_minus_1)
 
-    # (B,K)
-    z_pow = z.pow(k)
+        z = 4.0 * rho_lo / (1.0 + rho_lo).pow(2)   # (B,1)
 
-    series = (z_pow * scalar_terms).sum(dim=-1, keepdim=True)
+        scalar_terms = _get_kl_series_terms(dim, max_terms, device, dtype)  # (K,)
+        k     = torch.arange(1, max_terms + 1, device=device, dtype=dtype)
+        z_pow = z.pow(k)                             # (B,K)
 
-    kl = term1 + pref * series
+        series = (z_pow * scalar_terms).sum(dim=-1, keepdim=True)  # (B,1)
+        kl_lo  = (term1 + pref * series).clamp_min(0.0)
 
-    return kl.clamp_min(0.0)
+        kl = torch.where(high_rho, kl, kl_lo)
+
+    # ----------------------------------------------------------------
+    # Branch B — asymptotic (ρ > 0.9, Proposition 2)
+    # ----------------------------------------------------------------
+    if high_rho.any():
+        rho_hi = rho.clone()
+        rho_hi[~high_rho] = 0.5   # dummy safe value; result masked out below
+
+        kl_hi = _sc_kl_asymptotic(rho_hi, dim)
+        kl    = torch.where(high_rho, kl_hi, kl)
+
+    return kl
 
 
 # ===================================================================
@@ -120,10 +177,10 @@ def _sc_kl_uniform(
 # ===================================================================
 
 class SCVAEForwardOutput(NamedTuple):
-    recon: torch.Tensor
-    mu: torch.Tensor
-    rho: torch.Tensor
-    z: torch.Tensor
+    recon:        torch.Tensor
+    mu:           torch.Tensor
+    rho:          torch.Tensor
+    z:            torch.Tensor
     recon_target: torch.Tensor
 
 
@@ -135,10 +192,8 @@ class ConvBlock(nn.Module):
     def __init__(self, in_ch: int, out_ch: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1),
-            nn.ReLU(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.ReLU(),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -154,7 +209,7 @@ class TransitionSCVAE(nn.Module):
     Env-agnostic Spherical Cauchy VAE.
 
     Contract:
-      embedding(obs) -> (B, C, H, W) float tensor
+      embedding(obs) -> (B, C, H, W) float
       SCVAE never tries to infer obs layout.
     """
 
@@ -162,68 +217,60 @@ class TransitionSCVAE(nn.Module):
         self,
         embedding: ObservationEmbedding,
         cfg: SCVAEConfig,
-        sample_input_shape: Tuple[int, ...],  # raw obs shape WITHOUT batch
+        sample_input_shape: Tuple[int, ...],
     ):
         super().__init__()
-        self.embedding = embedding
-        self.cfg = cfg
+        self.embedding  = embedding
+        self.cfg        = cfg
         self.latent_dim = cfg.latent_dim
 
-        # --- conv encoder ---
+        # conv encoder
         layers = []
-        in_ch = embedding.out_channels
+        in_ch  = embedding.out_channels
         for ch in cfg.conv_channels:
             layers.append(ConvBlock(in_ch, ch))
             in_ch = ch
         self.conv = nn.Sequential(*layers)
 
-        # --- infer conv feature dim ---
+        # infer conv feature dim
         with torch.no_grad():
-            dummy = torch.zeros((1, *sample_input_shape))
-            dummy_emb = self._embed(dummy)
-            dummy_feat = self.conv(dummy_emb)
+            dummy          = torch.zeros((1, *sample_input_shape))
+            dummy_feat     = self.conv(self._embed(dummy))
             self._feat_dim = dummy_feat.flatten(1).shape[1]
 
-        # --- action embedding ---
+        # action embedding
         self.action_embed = nn.Embedding(cfg.n_actions, cfg.action_embed_dim)
 
-        # --- bottleneck ---
+        # bottleneck
         self.fc = nn.Sequential(
             nn.Linear(2 * self._feat_dim + cfg.action_embed_dim, cfg.hidden_dim),
             nn.ReLU(),
         )
-        self.fc_mu = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
+        self.fc_mu  = nn.Linear(cfg.hidden_dim, cfg.latent_dim)
         self.fc_rho = nn.Linear(cfg.hidden_dim, 1)
 
-        # --- decoder ---
+        # decoder
         self.decoder_trunk = nn.Sequential(
-            nn.Linear(cfg.latent_dim, cfg.hidden_dim),
-            nn.ReLU(),
-            nn.Linear(cfg.hidden_dim, cfg.hidden_dim),
-            nn.ReLU(),
+            nn.Linear(cfg.latent_dim, cfg.hidden_dim), nn.ReLU(),
+            nn.Linear(cfg.hidden_dim, cfg.hidden_dim), nn.ReLU(),
         )
-        self.state_t_head = nn.Linear(cfg.hidden_dim, self._feat_dim)
-        self.action_head = nn.Linear(cfg.hidden_dim, cfg.action_embed_dim)
+        self.state_t_head    = nn.Linear(cfg.hidden_dim, self._feat_dim)
+        self.action_head     = nn.Linear(cfg.hidden_dim, cfg.action_embed_dim)
         self.state_next_head = nn.Linear(cfg.hidden_dim, self._feat_dim)
 
-    # ============================================================
-    # Private helpers (kept above public API as requested)
-    # ============================================================
-
     def _embed(self, obs: torch.Tensor) -> torch.Tensor:
-        # embedding must handle dtype/layout; enforce float output
         x = self.embedding(obs)
         if x.dim() != 4:
-            raise ValueError(f"embedding must return (B,C,H,W), got shape {tuple(x.shape)}")
+            raise ValueError(f"embedding must return (B,C,H,W), got {tuple(x.shape)}")
         return x
 
-    def _encode_parts(self, s_t: torch.Tensor, a_t: torch.Tensor, s_next: torch.Tensor):
-        h_s = self.conv(self._embed(s_t)).flatten(1)
+    def _encode_parts(self, s_t, a_t, s_next):
+        h_s  = self.conv(self._embed(s_t)).flatten(1)
         h_sn = self.conv(self._embed(s_next)).flatten(1)
         a_emb = self.action_embed(a_t.long())
         return h_s, a_emb, h_sn
 
-    def _build_target(self, s_t: torch.Tensor, a_t: torch.Tensor, s_next: torch.Tensor) -> torch.Tensor:
+    def _build_target(self, s_t, a_t, s_next) -> torch.Tensor:
         with torch.no_grad():
             h_s, a_emb, h_sn = self._encode_parts(s_t, a_t, s_next)
         return torch.cat([h_s, a_emb, h_sn], dim=-1)
@@ -235,15 +282,10 @@ class TransitionSCVAE(nn.Module):
             dim=-1,
         )
 
-    # ============================================================
-    # Public API
-    # ============================================================
-
-    def encode(self, s_t: torch.Tensor, a_t: torch.Tensor, s_next: torch.Tensor):
+    def encode(self, s_t, a_t, s_next):
         h_s, a_emb, h_sn = self._encode_parts(s_t, a_t, s_next)
-        h = self.fc(torch.cat([h_s, a_emb, h_sn], dim=-1))
-
-        mu = F.normalize(self.fc_mu(h), p=2, dim=-1)
+        h   = self.fc(torch.cat([h_s, a_emb, h_sn], dim=-1))
+        mu  = F.normalize(self.fc_mu(h), p=2, dim=-1)
         rho = torch.sigmoid(self.fc_rho(h))
         rho = self.cfg.rho_min + rho * (self.cfg.rho_max - self.cfg.rho_min)
         return mu, rho
@@ -251,16 +293,16 @@ class TransitionSCVAE(nn.Module):
     def decode(self, z: torch.Tensor) -> torch.Tensor:
         return self._decode_z(z)
 
-    def forward(self, s_t: torch.Tensor, a_t: torch.Tensor, s_next: torch.Tensor) -> SCVAEForwardOutput:
-        mu, rho = self.encode(s_t, a_t, s_next)
-        z = _sc_sample(mu, rho) if self.training else mu
-        recon = self._decode_z(z)
+    def forward(self, s_t, a_t, s_next) -> SCVAEForwardOutput:
+        mu, rho      = self.encode(s_t, a_t, s_next)
+        z            = _sc_sample(mu, rho) if self.training else mu
+        recon        = self._decode_z(z)
         recon_target = self._build_target(s_t, a_t, s_next)
         return SCVAEForwardOutput(recon, mu, rho, z, recon_target)
 
     def loss(self, out: SCVAEForwardOutput) -> Tuple[torch.Tensor, torch.Tensor]:
         l_recon = F.mse_loss(out.recon, out.recon_target)
-        l_kl = _sc_kl_uniform(
+        l_kl    = _sc_kl_uniform(
             out.rho,
             self.latent_dim,
             max_terms=self.cfg.kl_max_terms,
