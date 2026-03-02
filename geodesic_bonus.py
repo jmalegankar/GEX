@@ -1,14 +1,9 @@
 """
-Geodesic Exploration Bonus (Minimal Clean Version)
+Geodesic Exploration Bonus
 
 Combines:
-  - Episodic kNN novelty (cosine distance)
+  - Episodic kNN novelty (cosine distance on S^{d-1})
   - Lifetime pseudo-counts via SimHash
-
-Does NOT:
-  - Normalize reward
-  - Apply eta scaling
-  - Train anything
 """
 
 from __future__ import annotations
@@ -31,33 +26,36 @@ class AngularPseudoCounts:
         hash_bits: int = 32,
         seed: int = 0,
     ):
-        self.mu_dim = mu_dim
+        self.mu_dim    = mu_dim
         self.hash_bits = hash_bits
 
-        rng = np.random.RandomState(seed)
+        rng    = np.random.RandomState(seed)
         planes = rng.randn(mu_dim, hash_bits).astype(np.float32)
         planes /= np.linalg.norm(planes, axis=0, keepdims=True) + 1e-8
 
-        self.planes = torch.from_numpy(planes)  # CPU OK
-        self._counts = {}
+        self.planes   = torch.from_numpy(planes)   # CPU
+        self._counts  = {}
 
     def _hash(self, mu: torch.Tensor) -> bytes:
         mu_cpu = mu.detach().cpu()
-        proj = mu_cpu @ self.planes  # (hash_bits,)
-        bits = (proj > 0).byte()
+        proj   = mu_cpu @ self.planes   # (hash_bits,)
+        bits   = (proj > 0).byte()
         return bits.numpy().tobytes()
 
     def get_count(self, mu: torch.Tensor) -> int:
-        key = self._hash(mu)
-        return self._counts.get(key, 0)
+        return self._counts.get(self._hash(mu), 0)
 
     def increment(self, mu: torch.Tensor):
-        key = self._hash(mu)
+        key              = self._hash(mu)
         self._counts[key] = self._counts.get(key, 0) + 1
 
     def bonus(self, mu: torch.Tensor) -> float:
-        n = self.get_count(mu)
-        return 1.0 / math.sqrt(n + 1)
+        return 1.0 / math.sqrt(self.get_count(mu) + 1)
+
+    @property
+    def n_buckets(self) -> int:
+        """Number of distinct SimHash buckets seen so far."""
+        return len(self._counts)
 
 
 # ============================================================
@@ -66,7 +64,9 @@ class AngularPseudoCounts:
 
 class GeodesicExplorationBonus:
     """
-    Pure intrinsic reward computation.
+    Pure intrinsic reward computation.  Stateless except for:
+      - episodic ring buffer  (resets every episode)
+      - lifetime hash counts  (never resets during training)
     """
 
     def __init__(
@@ -91,41 +91,36 @@ class GeodesicExplorationBonus:
             hash_bits=hash_bits,
         )
 
-    # ========================================================
-
     def reset(self):
-        """Reset episodic memory only."""
+        """Reset episodic memory only (call at episode boundary)."""
         self.episodic.reset()
-
-    # ========================================================
 
     def step(self, mu: torch.Tensor):
         """
         Args:
-            mu: (d,) unit vector
+            mu: (d,) unit vector on S^{d-1}
         Returns:
             r_int (float), info (dict)
         """
-        # Ensure mu is 1D (d,), not (1, d)
         if mu.dim() == 2:
             mu = mu.squeeze(0)
-        
-        # --- compute episodic bonus ---
+
+        # Episodic bonus: mean cosine distance to k nearest neighbours.
         r_epi = self.episodic.query_and_add(mu)
 
-        # --- compute lifetime bonus BEFORE increment ---
+        # Lifetime bonus BEFORE incrementing so the first visit gets 1/sqrt(1).
         r_life = self.lifetime.bonus(mu)
-
-        # --- now increment lifetime ---
         self.lifetime.increment(mu)
 
         r_int = r_epi * r_life
 
         info = {
-            "r_episodic": r_epi,
-            "r_lifetime": r_life,
-            "r_int": r_int,
-            "episodic_size": self.episodic.size,
+            "r_episodic":        r_epi,
+            "r_lifetime":        r_life,
+            "r_int":             r_int,
+            "episodic_size":     self.episodic.size,
+            # FIX (Bug 4): expose the key that ppo_gex.py logs.
+            "lifetime_n_buckets": self.lifetime.n_buckets,
         }
 
         return r_int, info

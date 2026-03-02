@@ -7,7 +7,6 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from ppo_gex import PPOGEX
 from geodesic_bonus import GeodesicExplorationBonus
 from reward_normalizer import RunningMeanStd
-from sc_vae_wrapper import SCVAEEncoderWrapper
 from sc_vae import TransitionSCVAE
 from config import SCVAEConfig
 from obs_embeddings import ObservationEmbedding
@@ -17,7 +16,10 @@ def test_ppogex_runs_one_iteration():
 
     env = DummyVecEnv([lambda: gym.make("CartPole-v1")])
 
-    # ---- Fake minimal embedding for test ----
+    # ------------------------------------------------------------------
+    # Minimal embedding: (B, D) vector obs -> (B, 1, D, 1) feature map.
+    # out_channels = 1 so the conv encoder sees a (1, D, 1) "image".
+    # ------------------------------------------------------------------
     class IdentityEmbedding(ObservationEmbedding):
         def __init__(self, obs_dim):
             super().__init__()
@@ -28,14 +30,11 @@ def test_ppogex_runs_one_iteration():
             return 1
 
         def forward(self, obs):
-            obs = obs.float()
-            return obs.unsqueeze(1).unsqueeze(-1)  # (B,1,D,1)
-        
+            return obs.float().unsqueeze(1).unsqueeze(-1)   # (B,1,D,1)
 
-    obs_dim = env.observation_space.shape[0]
-
+    obs_dim   = env.observation_space.shape[0]
     embedding = IdentityEmbedding(obs_dim)
-    cfg = SCVAEConfig(n_actions=env.action_space.n)
+    cfg       = SCVAEConfig(n_actions=env.action_space.n)
 
     scvae = TransitionSCVAE(
         embedding=embedding,
@@ -43,11 +42,8 @@ def test_ppogex_runs_one_iteration():
         sample_input_shape=(obs_dim,),
     )
 
-    gex_modules = [
-        GeodesicExplorationBonus(mu_dim=cfg.latent_dim)
-    ]
-
-    rms = RunningMeanStd()
+    gex_modules = [GeodesicExplorationBonus(mu_dim=cfg.latent_dim)]
+    rms         = RunningMeanStd()
 
     model = PPOGEX(
         "MlpPolicy",
@@ -61,15 +57,35 @@ def test_ppogex_runs_one_iteration():
         verbose=0,
     )
 
+    # Snapshot parameters before training.
+    params_before = {
+        n: p.clone().detach() for n, p in scvae.named_parameters()
+    }
+
     model.learn(total_timesteps=64)
 
-    # Assert SCVAE was updated
-    params = list(scvae.parameters())
-    grads_exist = any(p.grad is not None for p in params)
-    assert grads_exist
+    # ------------------------------------------------------------------
+    # 1. SC-VAE parameters must have changed (online training happened).
+    # ------------------------------------------------------------------
+    params_changed = any(
+        not th.allclose(params_before[n], p.detach())
+        for n, p in scvae.named_parameters()
+    )
+    assert params_changed, "SC-VAE parameters did not change — online training failed"
 
-    # Assert intrinsic reward was nonzero at some point
-    assert len(model._rollout_r_int) > 0
-    assert np.mean(model._rollout_r_int) >= 0.0
+    # ------------------------------------------------------------------
+    # 2. Intrinsic reward was computed and is non-negative.
+    # ------------------------------------------------------------------
+    assert len(model._rollout_r_int) > 0, "No intrinsic reward logged"
+    assert np.mean(model._rollout_r_int) >= 0.0, "Negative intrinsic reward"
+
+    # ------------------------------------------------------------------
+    # 3. Episodic size grows during a rollout (memory is accumulating).
+    # ------------------------------------------------------------------
+    assert len(model._rollout_epi_size) > 0, "Episodic size not logged"
+    assert max(model._rollout_epi_size) > 0, "Episodic memory never grew"
+
+    print("All assertions passed.")
+
 
 test_ppogex_runs_one_iteration()
