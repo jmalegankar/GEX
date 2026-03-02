@@ -4,12 +4,12 @@ import torch as th
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from ppo_gex import PPOGEX
-from sc_vae import TransitionSCVAE
-from config import SCVAEConfig
-from geodesic_bonus import GeodesicExplorationBonus
+from models.sc_vae import TransitionSCVAE
+from models.config import SCVAEConfig
+from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus
 
 # Minimal embedding for vector obs
-from obs_embeddings import ObservationEmbedding
+from models.obs_embeddings import ObservationEmbedding
 
 class IdentityEmbedding(ObservationEmbedding):
     def __init__(self, obs_dim: int):

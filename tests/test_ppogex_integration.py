@@ -5,11 +5,11 @@ import torch as th
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from ppo_gex import PPOGEX
-from geodesic_bonus import GeodesicExplorationBonus
+from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus
 from reward_normalizer import RunningMeanStd
-from sc_vae import TransitionSCVAE
-from config import SCVAEConfig
-from obs_embeddings import ObservationEmbedding
+from models.sc_vae import TransitionSCVAE
+from models.config import SCVAEConfig
+from models.obs_embeddings import ObservationEmbedding
 
 
 def test_ppogex_runs_one_iteration():

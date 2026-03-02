@@ -6,8 +6,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from obs_embeddings import ObservationEmbedding
-from config import SCVAEConfig
+from models.obs_embeddings import ObservationEmbedding
+from models.config import SCVAEConfig
 
 
 # ===================================================================

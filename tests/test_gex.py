@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from geodesic_bonus import GeodesicExplorationBonus
+from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus
 
 #positive
 def test_first_visit_positive():
@@ -26,7 +26,7 @@ def test_repeat_same_transition_zero_epi():
     assert np.isclose(r2, 0.0, atol=1e-6)  # cosine distance = 0 → episodic = 0
 
 def test_lifetime_decay_isolated():
-    from geodesic_bonus import AngularPseudoCounts
+    from intrinsic_reward.geodesic_bonus import AngularPseudoCounts
 
     pc = AngularPseudoCounts(mu_dim=8)
 

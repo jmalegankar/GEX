@@ -1,5 +1,5 @@
 import torch
-from episodic_memory import EpisodicMemory
+from intrinsic_reward.episodic_memory import EpisodicMemory
 
 
 def test_empty_memory_returns_max_bonus():

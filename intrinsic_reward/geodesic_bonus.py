@@ -12,7 +12,7 @@ import math
 import torch
 import numpy as np
 
-from episodic_memory import EpisodicMemory
+from intrinsic_reward.episodic_memory import EpisodicMemory
 
 
 # ============================================================

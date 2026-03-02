@@ -12,7 +12,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from sc_vae_wrapper import SCVAEEncoderWrapper
 from gex_rollout_buffer import GEXRolloutBuffer
-from geodesic_bonus import GeodesicExplorationBonus
+from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus
 
 
 class PPOGEX(PPO):
