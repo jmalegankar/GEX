@@ -23,6 +23,7 @@ from models.obs_embeddings import CategoricalGridEmbedding, CategoricalGridSpec
 from models.config import SCVAEConfig
 from intrinsic_reward.geodesic_bonus import GeodesicExplorationBonus
 from intrinsic_reward.reward_normalizer import RunningMeanStd
+from sb3.gex_features_extractor import GEXFeaturesExtractor
 from sb3.ppo_gex import PPOGEX
 
 
@@ -30,7 +31,7 @@ from sb3.ppo_gex import PPOGEX
 # MultiGrid object catalogue (standard 11-type, 6-color, 4-state)
 # -----------------------------------------------------------------------
 GRID_SPEC = CategoricalGridSpec(
-    n_object_types=11,
+    n_object_types=12,  # 11 standard MultiGrid types + Button (id=11)
     n_colors=6,
     n_states=4,
     embed_per_channel=4,   # → out_channels = 12
@@ -56,6 +57,7 @@ def build_model(
 
     # ---- Embedding + SC-VAE ----------------------------------------
     embedding = CategoricalGridEmbedding(GRID_SPEC)
+    
 
     cfg = SCVAEConfig(
         conv_channels=(32, 64),
@@ -96,9 +98,22 @@ def build_model(
         rms         = None
 
     # ---- PPOGEX -------------------------------------------------------
+    policy_embedding = CategoricalGridEmbedding(GRID_SPEC)
+    extractor_kwargs = dict(
+        embedding=policy_embedding,
+        conv_channels=(32, 64),
+        features_dim=256,
+        sample_obs_shape=(view_size, view_size, 3),
+    )
+
     model = PPOGEX(
-        "MlpPolicy",
+        "CnnPolicy",
         env,
+        policy_kwargs=dict(
+            features_extractor_class=GEXFeaturesExtractor,
+            features_extractor_kwargs=extractor_kwargs,
+            net_arch=[256, 256],
+        ),
         sc_vae=sc_vae,
         gex_modules=gex_modules,
         rms=rms,
@@ -199,6 +214,7 @@ def main():
         callback=[eval_cb, ckpt_cb],
         tb_log_name=tag,
         reset_num_timesteps=True,
+        progress_bar=True,
     )
 
     # ---- Final eval --------------------------------------------------
