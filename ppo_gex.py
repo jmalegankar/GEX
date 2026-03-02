@@ -1,4 +1,8 @@
+from __future__ import annotations
+
+import copy
 from typing import Optional
+
 import numpy as np
 import torch as th
 
@@ -13,11 +17,17 @@ from geodesic_bonus import GeodesicExplorationBonus
 
 class PPOGEX(PPO):
     """
-    PPO with GEX intrinsic reward and online SC-VAE training.
+    PPO + GEX intrinsic reward + online SC-VAE with EMA target network.
 
-    SC-VAE is trained online: after each PPO update, _update_sc_vae()
-    trains on the most recent rollout buffer.  The encoder improves as
-    the agent explores, at the cost of slow μ-distribution drift.
+    Two SC-VAE copies:
+      sc_vae          — online encoder, trained every PPO iteration
+      sc_vae_target   — EMA copy, used exclusively for μ in GEX bonuses
+
+    EMA update after each SC-VAE gradient step:
+      θ_target ← (1 - τ) · θ_target + τ · θ_online
+
+    τ ≈ 0.005 gives ~200-step lag, keeping episodic memory and SimHash
+    buckets consistent while still allowing the encoder to improve.
     """
 
     def __init__(
@@ -27,14 +37,24 @@ class PPOGEX(PPO):
         gex_modules=None,
         rms=None,
         eta: float = 1.0,
+        tau: float = 0.005,     # EMA momentum.  0 = frozen target, 1 = no lag
         **kwargs,
     ):
-        # Must be set before super().__init__() because SB3 calls
-        # _setup_model() inside it.
-        self.sc_vae = sc_vae
-        self.gex_modules = gex_modules   # list, one GeodesicExplorationBonus per env
-        self.rms = rms
-        self.eta = float(eta)
+        # Set before super().__init__() — SB3 calls _setup_model() inside it.
+        self.sc_vae        = sc_vae
+        self.gex_modules   = gex_modules
+        self.rms           = rms
+        self.eta           = float(eta)
+        self.tau           = float(tau)
+
+        # Target network: deep copy of online, frozen, EMA-updated.
+        if sc_vae is not None:
+            self.sc_vae_target = copy.deepcopy(sc_vae)
+            for p in self.sc_vae_target.parameters():
+                p.requires_grad_(False)
+        else:
+            self.sc_vae_target = None
+
         self._sc_vae_wrap: Optional[SCVAEEncoderWrapper] = None
         self.sc_vae_optimizer = None
 
@@ -55,9 +75,8 @@ class PPOGEX(PPO):
 
         from gymnasium import spaces
         assert isinstance(self.action_space, spaces.Discrete), \
-            "PPOGEX + SCVAE currently supports Discrete action spaces only."
+            "PPOGEX currently supports Discrete action spaces only."
 
-        # Replace SB3 rollout buffer with our extended version.
         self.rollout_buffer = GEXRolloutBuffer(
             self.n_steps,
             self.observation_space,
@@ -68,8 +87,13 @@ class PPOGEX(PPO):
             n_envs=self.n_envs,
         )
 
+        # GEX always encodes via the TARGET network, not the online one.
+        if self.sc_vae_target is not None:
+            self.sc_vae_target.to(self.device)
+            self._sc_vae_wrap = SCVAEEncoderWrapper(self.sc_vae_target, self.device)
+
         if self.sc_vae is not None:
-            self._sc_vae_wrap = SCVAEEncoderWrapper(self.sc_vae, self.device)
+            self.sc_vae.to(self.device)
 
         if self.gex_modules is not None:
             assert len(self.gex_modules) == self.n_envs, (
@@ -78,42 +102,46 @@ class PPOGEX(PPO):
             )
 
     # ------------------------------------------------------------------
+    # EMA update
+    # ------------------------------------------------------------------
+
+    def _update_ema(self) -> None:
+        """Polyak-average online encoder into target encoder."""
+        if self.sc_vae is None or self.sc_vae_target is None:
+            return
+        for p_online, p_target in zip(
+            self.sc_vae.parameters(),
+            self.sc_vae_target.parameters(),
+        ):
+            p_target.data.mul_(1.0 - self.tau).add_(self.tau * p_online.data)
+
+    # ------------------------------------------------------------------
     # SC-VAE online update
     # ------------------------------------------------------------------
 
-    def _update_sc_vae(self):
+    def _update_sc_vae(self) -> None:
         """
-        Train SC-VAE for one pass over the current rollout buffer.
-
-        Shape-agnostic: next_observations is a custom field that SB3 never
-        touches, so it is always (n_steps, n_envs, *obs_shape).  We use it
-        as the source of truth for the total sample count and obs shape,
-        then reshape obs and actions to match — regardless of whether
-        super().train() has already called swap_and_flatten on them.
+        One pass over the rollout buffer to update the ONLINE encoder.
+        Shape-agnostic: uses next_observations (never mutated by SB3)
+        as the source of truth for (n_steps, n_envs, *obs_shape).
         """
         if self.sc_vae is None:
             return
 
         self.sc_vae.train()
 
-        # next_observations: always (n_steps, n_envs, *obs_shape) — never mutated by SB3.
-        next_obs = self.rollout_buffer.next_observations
+        # next_observations is our custom field — always in original shape.
+        next_obs  = self.rollout_buffer.next_observations          # (T, E, *obs)
         n_steps, n_envs = next_obs.shape[:2]
-        n_total  = n_steps * n_envs
+        n_total   = n_steps * n_envs
         obs_shape = next_obs.shape[2:]
 
-        # Flatten to (n_total, *obs_shape).
-        # If obs was already flattened by SB3's swap_and_flatten this is a no-op;
-        # if it's still in (n_steps, n_envs, *obs_shape) form it reshapes correctly.
         next_obs_flat = next_obs.reshape(n_total, *obs_shape)
         obs_flat      = self.rollout_buffer.observations.reshape(n_total, *obs_shape)
+        actions_flat  = self.rollout_buffer.actions.reshape(n_total, -1).squeeze(-1)
 
-        # actions: SB3 may have flattened to (n_total, 1) or left as (n_steps, n_envs).
-        # Flatten to (n_total,) either way.
-        actions_flat = self.rollout_buffer.actions.reshape(n_total, -1).squeeze(-1)
-
-        batch_size = 256
         indices    = np.random.permutation(n_total)
+        batch_size = 256
 
         for start in range(0, n_total, batch_size):
             idx = indices[start : start + batch_size]
@@ -122,13 +150,17 @@ class PPOGEX(PPO):
             s_n = th.as_tensor(next_obs_flat[idx], device=self.device)
             a_t = th.as_tensor(actions_flat[idx],  device=self.device)
 
-            out            = self.sc_vae(s_t, a_t, s_n)
-            l_recon, l_kl  = self.sc_vae.loss(out)
-            loss           = l_recon + self.sc_vae.cfg.beta * l_kl
+            out           = self.sc_vae(s_t, a_t, s_n)
+            l_recon, l_kl = self.sc_vae.loss(out)
+            loss          = l_recon + self.sc_vae.cfg.beta * l_kl
 
             self.sc_vae_optimizer.zero_grad()
             loss.backward()
             self.sc_vae_optimizer.step()
+
+            # EMA update after every gradient step, not just once per epoch.
+            # Finer-grained tracking = smoother target drift.
+            self._update_ema()
 
         self.sc_vae.eval()
 
@@ -145,15 +177,11 @@ class PPOGEX(PPO):
     ) -> bool:
         assert self._last_obs is not None
 
-        # If sc_vae was not provided fall back to plain SB3 behaviour.
         if self._sc_vae_wrap is None:
             return super().collect_rollouts(
                 env, callback, rollout_buffer, n_rollout_steps
             )
 
-        # ----------------------------------------------------------
-        # Tracking lists for logging (last rollout only)
-        # ----------------------------------------------------------
         self._rollout_r_int              = []
         self._rollout_r_ext              = []
         self._rollout_r_total            = []
@@ -162,11 +190,6 @@ class PPOGEX(PPO):
 
         self.policy.set_training_mode(False)
         rollout_buffer.reset()
-
-        # NOTE: Do NOT reset episodic memory here.
-        # Episodic memory resets on episode boundaries (dones), not on
-        # rollout-buffer boundaries.  Rollouts can cross episode borders.
-
         callback.on_rollout_start()
 
         n_steps = 0
@@ -179,52 +202,33 @@ class PPOGEX(PPO):
             actions_np = actions.cpu().numpy()
             new_obs, rewards_ext, dones, infos = env.step(actions_np)
 
-            # ----------------------------------------------------------
-            # FIX (Bug 1): recover true terminal observations.
-            # SB3 auto-resets done envs so new_obs[i] is already the
-            # first obs of the next episode.  The real last obs before
-            # reset lives in infos[i]["terminal_observation"].
-            # ----------------------------------------------------------
+            # Recover true terminal observations before SB3 overwrites them.
             real_next_obs = new_obs.copy()
             for i in range(env.num_envs):
                 if dones[i] and "terminal_observation" in infos[i]:
                     real_next_obs[i] = infos[i]["terminal_observation"]
 
-            # ----------------------------------------------------------
-            # Encode current transitions (uses pre-step obs).
-            # ----------------------------------------------------------
+            # Encode via TARGET network — stable μ distribution.
             mu_batch = self._sc_vae_wrap.encode_mu(
                 self._last_obs, actions_np, real_next_obs
-            )  # (n_envs, d)
+            )
             mu_cpu = mu_batch.detach().cpu()
 
-            # ----------------------------------------------------------
-            # Per-env intrinsic reward computation.
-            # Terminal transitions get zero reward; episodic memory is
-            # reset at the episode boundary AFTER computing this step's
-            # bonus so the terminal transition still gets scored against
-            # its own episode's memory.
-            # ----------------------------------------------------------
             r_int     = np.zeros_like(rewards_ext, dtype=np.float32)
             gex_infos = [None] * env.num_envs
 
             if self.gex_modules is not None:
                 for i in range(env.num_envs):
-                    ri, info      = self.gex_modules[i].step(mu_cpu[i])
-                    r_int[i]      = float(ri)
-                    gex_infos[i]  = info
+                    # Score transition against this episode's memory first ...
+                    ri, info     = self.gex_modules[i].step(mu_cpu[i])
+                    r_int[i]     = float(ri)
+                    gex_infos[i] = info
 
-                    # --------------------------------------------------
-                    # FIX (Bug 2 + 3): reset episodic memory AFTER
-                    # scoring this transition, not before.  Then seed
-                    # the fresh memory with a dummy no-op transition for
-                    # s0 so the first real transition of the new episode
-                    # is scored against something.
-                    # --------------------------------------------------
+                    # ... then reset memory at episode boundary.
                     if dones[i]:
                         self.gex_modules[i].reset()
 
-                        s0    = new_obs[i]          # first obs of new episode
+                        s0    = new_obs[i]
                         no_op = self.sc_vae.cfg.no_op_action
                         mu0   = self._sc_vae_wrap.encode_mu(
                             s0[None],
@@ -232,12 +236,8 @@ class PPOGEX(PPO):
                             s0[None],
                         )[0].detach().cpu()
 
-                        # Seed memory without generating a reward.
                         self.gex_modules[i].episodic.query_and_add(mu0)
 
-            # ----------------------------------------------------------
-            # RMS normalisation.
-            # ----------------------------------------------------------
             r_int_norm = r_int.copy()
             if self.rms is not None:
                 r_int_tensor = th.as_tensor(r_int, dtype=th.float32)
@@ -246,9 +246,6 @@ class PPOGEX(PPO):
 
             rewards_total = rewards_ext + self.eta * r_int_norm
 
-            # ----------------------------------------------------------
-            # Logging
-            # ----------------------------------------------------------
             for i in range(env.num_envs):
                 self._rollout_r_int.append(float(r_int[i]))
                 self._rollout_r_ext.append(float(rewards_ext[i]))
@@ -259,16 +256,11 @@ class PPOGEX(PPO):
                         self._rollout_epi_size.append(
                             float(gex_infos[i]["episodic_size"])
                         )
-                    # FIX (Bug 4): use the key that geodesic_bonus.py
-                    # actually puts in info.
                     if "lifetime_n_buckets" in gex_infos[i]:
                         self._rollout_lifetime_n_buckets.append(
                             float(gex_infos[i]["lifetime_n_buckets"])
                         )
 
-            # ----------------------------------------------------------
-            # Buffer storage
-            # ----------------------------------------------------------
             rollout_buffer.add(
                 self._last_obs,
                 actions_np,
@@ -281,8 +273,8 @@ class PPOGEX(PPO):
                 extrinsic_reward=rewards_ext,
             )
 
-            self._last_obs             = new_obs
-            self._last_episode_starts  = dones
+            self._last_obs            = new_obs
+            self._last_episode_starts = dones
 
             n_steps += 1
             self.num_timesteps += env.num_envs
@@ -290,9 +282,6 @@ class PPOGEX(PPO):
             if not callback.on_step():
                 return False
 
-        # ----------------------------------------------------------
-        # GAE / returns
-        # ----------------------------------------------------------
         with th.no_grad():
             obs_tensor = th.as_tensor(self._last_obs).to(self.device)
             values = self.policy.predict_values(obs_tensor)
@@ -300,22 +289,16 @@ class PPOGEX(PPO):
         rollout_buffer.compute_returns_and_advantage(
             last_values=values, dones=self._last_episode_starts
         )
-
         callback.on_rollout_end()
 
-        # ----------------------------------------------------------
-        # Emit to SB3 logger
-        # ----------------------------------------------------------
         if self._rollout_r_int:
             self.logger.record("gex/r_int_mean",   np.mean(self._rollout_r_int))
             self.logger.record("gex/r_ext_mean",   np.mean(self._rollout_r_ext))
             self.logger.record("gex/r_total_mean", np.mean(self._rollout_r_total))
-
         if self._rollout_epi_size:
             self.logger.record(
                 "gex/episodic_size_mean", np.mean(self._rollout_epi_size)
             )
-
         if self._rollout_lifetime_n_buckets:
             self.logger.record(
                 "gex/lifetime_n_buckets_mean",
@@ -328,6 +311,8 @@ class PPOGEX(PPO):
     # PPO train step + SC-VAE online update
     # ------------------------------------------------------------------
 
-    def train(self):
+    def train(self) -> None:
+        self._update_sc_vae()   # read buffer before SB3 swap_and_flatten mutates it
         super().train()
-        self._update_sc_vae()
+
+
