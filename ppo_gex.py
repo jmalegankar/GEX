@@ -6,7 +6,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3.common.callbacks import BaseCallback
 
-from scvae_wrapper import SCVAEEncoderWrapper
+from sc_vae_wrapper import SCVAEEncoderWrapper
 from gex_rollout_buffer import GEXRolloutBuffer
 from geodesic_bonus import GeodesicExplorationBonus
 
@@ -23,24 +23,26 @@ class PPOGEX(PPO):
     def __init__(
         self,
         *args,
-        scvae=None,
+        sc_vae=None,
         gex_modules=None,
         rms=None,
         eta: float = 1.0,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
-        self.scvae = scvae
+        # Must be set before super().__init__() because SB3 calls _setup_model() inside it.
+        self.sc_vae = sc_vae
         self.gex_modules = gex_modules  # list, one per env
         self.rms = rms
         self.eta = float(eta)
+        self._sc_vae_wrap: Optional[SCVAEEncoderWrapper] = None
+        self.sc_vae_optimizer = None
 
-        self._scvae_wrap: Optional[SCVAEEncoderWrapper] = None
-        self.scvae_optimizer = None
-        if self.scvae is not None:
-            self.scvae_optimizer = th.optim.Adam(
-                self.scvae.parameters(),
-                lr=self.scvae.cfg.lr,
+        super().__init__(*args, **kwargs)
+
+        if self.sc_vae is not None:
+            self.sc_vae_optimizer = th.optim.Adam(
+                self.sc_vae.parameters(),
+                lr=self.sc_vae.cfg.lr,
             )
 
     def _setup_model(self) -> None:
@@ -61,8 +63,8 @@ class PPOGEX(PPO):
         )
 
         # SCVAE wrapper
-        if self.scvae is not None:
-            self._scvae_wrap = SCVAEEncoderWrapper(self.scvae, self.device)
+        if self.sc_vae is not None:
+            self._sc_vae_wrap = SCVAEEncoderWrapper(self.sc_vae, self.device)
 
         # sanity for env-count
         if self.gex_modules is not None:
@@ -71,11 +73,11 @@ class PPOGEX(PPO):
                 f"but n_envs={self.n_envs}"
             )
 
-    def _update_scvae(self):
-        if self.scvae is None:
+    def _update_sc_vae(self):
+        if self.sc_vae is None:
             return
 
-        self.scvae.train()
+        self.sc_vae.train()
 
         obs = self.rollout_buffer.observations
         next_obs = self.rollout_buffer.next_observations
@@ -103,15 +105,15 @@ class PPOGEX(PPO):
             s_n = th.as_tensor(next_obs[idx], device=self.device)
             a_t = th.as_tensor(actions[idx], device=self.device)
 
-            out = self.scvae(s_t, a_t, s_n)
-            l_recon, l_kl = self.scvae.loss(out)
+            out = self.sc_vae(s_t, a_t, s_n)
+            l_recon, l_kl = self.sc_vae.loss(out)
 
-            loss = l_recon + self.scvae.cfg.beta * l_kl
+            loss = l_recon + self.sc_vae.cfg.beta * l_kl
 
-            self.scvae_optimizer.zero_grad()
+            self.sc_vae_optimizer.zero_grad()
             loss.backward()
-            self.scvae_optimizer.step()
-        self.scvae.eval()
+            self.sc_vae_optimizer.step()
+        self.sc_vae.eval()
 
     def collect_rollouts(
         self,
@@ -124,7 +126,7 @@ class PPOGEX(PPO):
         Copy of SB3 PPO.collect_rollouts with intrinsic reward injection.
         """
         assert self._last_obs is not None
-        assert self._scvae_wrap is not None, "scvae wrapper not initialized"
+        assert self._sc_vae_wrap is not None, "sc_vae wrapper not initialized"
 
 
         self._rollout_r_int = []
@@ -156,38 +158,37 @@ class PPOGEX(PPO):
 
             # SB3: if done, env auto-resets; terminal_observation holds the real last obs
             real_next_obs = new_obs.copy()
-            for i in range(env.num_envs):
-                # If episode ended
-                if dones[i]:
+            # Bug fix: guard gex_modules usage; reset only once here (removed duplicate below)
+            if self.gex_modules is not None:
+                for i in range(env.num_envs):
+                    if dones[i]:
+                        # Reset episodic memory
+                        self.gex_modules[i].reset()
 
-                    # Reset episodic memory
-                    self.gex_modules[i].reset()
+                        # SB3 auto-resets env; new_obs[i] is start of next episode
+                        s0 = new_obs[i]
 
-                    # SB3 auto-resets env; new_obs[i] is start of next episode
-                    s0 = new_obs[i]
+                        no_op = self.sc_vae.cfg.no_op_action
 
-                    no_op = self.scvae.cfg.no_op_action
+                        # Compute dummy transition (s0, no_op, s0)
+                        mu0 = self._sc_vae_wrap.encode_mu(
+                            s0[None],
+                            np.array([no_op]),
+                            s0[None],
+                        )[0]
 
-                    # Compute dummy transition (s0, no_op, s0)
-                    mu0 = self._scvae_wrap.encode_mu(
-                        s0[None],
-                        np.array([no_op]),
-                        s0[None],
-                    )[0]
+                        # Ensure CPU tensor for GEX
+                        mu0 = mu0.detach().cpu()
 
-                    # Ensure CPU tensor for GEX
-                    mu0 = mu0.detach().cpu()
-
-                    # Insert into episodic memory WITHOUT reward
-                    self.gex_modules[i].episodic.query_and_add(mu0)
+                        # Insert into episodic memory WITHOUT reward
+                        self.gex_modules[i].episodic.query_and_add(mu0)
 
             # --- compute intrinsic reward ---
             r_int = np.zeros_like(rewards_ext, dtype=np.float32)
+            gex_infos = [None] * env.num_envs  # always defined; populated below if gex active
 
             if self.gex_modules is not None:
-                gex_infos = [None] * env.num_envs
-
-                mu_batch = self._scvae_wrap.encode_mu(self._last_obs, actions_np, real_next_obs)  # (n_envs, d)
+                mu_batch = self._sc_vae_wrap.encode_mu(self._last_obs, actions_np, real_next_obs)  # (n_envs, d)
 
                 # per-env intrinsic
                 mu_cpu = mu_batch.detach().cpu()
@@ -197,17 +198,16 @@ class PPOGEX(PPO):
                         ri, info = ri
                     else:
                         info = {}
-                        
+
                     r_int[i] = float(ri)
                     gex_infos[i] = info
 
-            # --- RMS normalization (recommended to keep) ---
+            # --- RMS normalization ---
             r_int_norm = r_int.copy()
             if self.rms is not None:
-                # update using mean over envs (or per-env update; choose one consistent rule)
-                for i in range(env.num_envs):
-                    self.rms.update(float(r_int[i]))
-                    r_int_norm[i] = float(self.rms.normalize(float(r_int[i])))
+                r_int_tensor = th.as_tensor(r_int, dtype=th.float32)
+                self.rms.update(r_int_tensor)
+                r_int_norm = self.rms.normalize(r_int_tensor).numpy()
 
             # total reward PPO uses for returns/advantages
             rewards_total = rewards_ext + self.eta * r_int_norm
@@ -245,12 +245,6 @@ class PPOGEX(PPO):
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
-            # reset episodic gex module for envs that ended
-            if self.gex_modules is not None:
-                for i in range(env.num_envs):
-                    if dones[i]:
-                        self.gex_modules[i].reset()
-
             n_steps += 1
             callback.update_locals(locals())
             if not callback.on_step():
@@ -283,4 +277,4 @@ class PPOGEX(PPO):
     
     def train(self):
         super().train()
-        self._update_scvae()
+        self._update_sc_vae()

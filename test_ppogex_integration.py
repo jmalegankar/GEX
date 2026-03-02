@@ -7,7 +7,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 from ppo_gex import PPOGEX
 from geodesic_bonus import GeodesicExplorationBonus
 from reward_normalizer import RunningMeanStd
-from scvae_wrapper import SCVAEEncoderWrapper
+from sc_vae_wrapper import SCVAEEncoderWrapper
 from sc_vae import TransitionSCVAE
 from config import SCVAEConfig
 from obs_embeddings import ObservationEmbedding
@@ -20,12 +20,16 @@ def test_ppogex_runs_one_iteration():
     # ---- Fake minimal embedding for test ----
     class IdentityEmbedding(ObservationEmbedding):
         def __init__(self, obs_dim):
-            self.out_channels = 1
+            super().__init__()
             self.obs_dim = obs_dim
 
-        def __call__(self, obs):
+        @property
+        def out_channels(self):
+            return 1
+
+        def forward(self, obs):
             obs = obs.float()
-            return obs.unsqueeze(1)  # (B,1,D)
+            return obs.unsqueeze(1).unsqueeze(-1)  # (B,1,D,1)
         
 
     obs_dim = env.observation_space.shape[0]
@@ -48,7 +52,7 @@ def test_ppogex_runs_one_iteration():
     model = PPOGEX(
         "MlpPolicy",
         env,
-        scvae=scvae,
+        sc_vae=scvae,
         gex_modules=gex_modules,
         rms=rms,
         n_steps=32,

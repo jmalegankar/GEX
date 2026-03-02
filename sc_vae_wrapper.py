@@ -1,7 +1,6 @@
 import numpy as np
 import torch as th
 
-
 class SCVAEEncoderWrapper:
     """
     Wraps TransitionSCVAE to accept numpy batches from SB3 VecEnv and return torch mu.
@@ -29,7 +28,7 @@ class SCVAEEncoderWrapper:
         s_n = th.as_tensor(next_obs, device=self.device)
 
         # ensure batch dimension exists
-        if s_t.ndim == len(self.scvae.cfg.obs_shape):  # only if you store obs_shape in cfg
+        if s_t.dim() == 1:
             s_t = s_t.unsqueeze(0)
             s_n = s_n.unsqueeze(0)
             a_t = a_t.unsqueeze(0)
