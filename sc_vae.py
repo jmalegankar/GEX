@@ -14,6 +14,8 @@ from config import SCVAEConfig
 # Spherical Cauchy helpers
 # ===================================================================
 
+_KL_SERIES_CACHE = {}
+
 def _mobius_add(a: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     a_sq = (a * a).sum(-1, keepdim=True)
     x_sq = (x * x).sum(-1, keepdim=True)
@@ -31,57 +33,85 @@ def _sc_sample(mu: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
 def _sc_z_of_rho(rho: torch.Tensor) -> torch.Tensor:
     return 4.0 * rho / (1.0 + rho).pow(2)
 
+def _get_kl_series_terms(dim: int, max_terms: int, device, dtype):
+    """
+    Returns tensor of shape (K,) containing:
+        coeff_k * (psi(d-1+k) - psi(d-1))
+    Cached per (dim, max_terms, device, dtype).
+    """
+    key = (dim, max_terms, device.type, str(dtype))
+
+    if key in _KL_SERIES_CACHE:
+        return _KL_SERIES_CACHE[key]
+
+    d_minus_1 = float(dim - 1)
+    a = d_minus_1 / 2.0
+
+    k = torch.arange(1, max_terms + 1, device=device, dtype=dtype)
+
+    a_t = torch.tensor(a, device=device, dtype=dtype)
+
+    log_coeff = (
+        torch.lgamma(a_t + k)
+        - torch.lgamma(a_t)
+        - torch.lgamma(k + 1.0)
+    )
+
+    coeff = torch.exp(log_coeff)
+
+    psi_base = torch.digamma(torch.tensor(d_minus_1, device=device, dtype=dtype))
+    psi_diff = torch.digamma(d_minus_1 + k) - psi_base
+
+    scalar_terms = coeff * psi_diff  # (K,)
+
+    _KL_SERIES_CACHE[key] = scalar_terms
+
+    return scalar_terms
 
 def _sc_kl_uniform(
     rho: torch.Tensor,
     dim: int,
     *,
-    max_terms: int = 256,
-    tol: float = 1e-10,
+    max_terms: int = 64,
 ) -> torch.Tensor:
-    if dim < 2:
-        raise ValueError(f"spCauchy KL requires dim>=2, got dim={dim}")
 
-    rho = rho.to(dtype=torch.float32)
+    if dim < 2:
+        raise ValueError("dim must be >= 2")
+
     if rho.dim() == 1:
         rho = rho.unsqueeze(-1)
 
     eps = 1e-7
-    rho = rho.clamp(min=0.0, max=1.0 - eps)
+    rho = rho.clamp(0.0, 1.0 - eps)
 
-    d_minus_1 = float(dim - 1)
     device = rho.device
     dtype = rho.dtype
 
-    log_ratio = torch.log1p(-rho) - torch.log1p(rho)  # (B,1)
+    d_minus_1 = float(dim - 1)
+
+    # ---- First term ----
+    log_ratio = torch.log1p(-rho) - torch.log1p(rho)
     term1 = d_minus_1 * log_ratio
 
+    # ---- Prefactor ----
     ratio = (1.0 - rho) / (1.0 + rho)
-    pref = d_minus_1 * ratio.pow(d_minus_1)  # (B,1)
+    pref = d_minus_1 * ratio.pow(d_minus_1)
 
-    z = _sc_z_of_rho(rho)  # (B,1)
+    # ---- z(rho) ----
+    z = 4.0 * rho / (1.0 + rho).pow(2)  # (B,1)
 
-    a = (d_minus_1 / 2.0)
-    a_t = torch.tensor(a, device=device, dtype=dtype)
-    psi_base = torch.digamma(torch.tensor(d_minus_1, device=device, dtype=dtype))
+    # ---- Cached scalar series terms ----
+    scalar_terms = _get_kl_series_terms(dim, max_terms, device, dtype)  # (K,)
 
-    series = torch.zeros_like(rho)
+    k = torch.arange(1, max_terms + 1, device=device, dtype=dtype)
 
-    for k in range(1, max_terms + 1):
-        k_t = torch.tensor(float(k), device=device, dtype=dtype)
+    # (B,K)
+    z_pow = z.pow(k)
 
-        log_coeff = torch.lgamma(a_t + k_t) - torch.lgamma(a_t) - torch.lgamma(k_t + 1.0)
-        coeff = torch.exp(log_coeff)  # scalar
-
-        psi_diff = torch.digamma(torch.tensor(d_minus_1 + float(k), device=device, dtype=dtype)) - psi_base
-        term = coeff * z.pow(k) * psi_diff  # (B,1)
-
-        series = series + term
-
-        if float(term.abs().max().detach().cpu()) < tol:
-            break
+    series = (z_pow * scalar_terms).sum(dim=-1, keepdim=True)
 
     kl = term1 + pref * series
+
     return kl.clamp_min(0.0)
 
 

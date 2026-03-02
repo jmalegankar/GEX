@@ -71,6 +71,7 @@ def test_ppogex_runs_one_iteration():
         not th.allclose(params_before[n], p.detach())
         for n, p in scvae.named_parameters()
     )
+    print("SC-VAE parameters changed:", params_changed)    
     assert params_changed, "SC-VAE parameters did not change — online training failed"
 
     # ------------------------------------------------------------------

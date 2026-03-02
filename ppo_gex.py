@@ -285,6 +285,7 @@ class PPOGEX(PPO):
             self._last_episode_starts  = dones
 
             n_steps += 1
+            self.num_timesteps += env.num_envs
             callback.update_locals(locals())
             if not callback.on_step():
                 return False
