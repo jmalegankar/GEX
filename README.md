@@ -4,26 +4,6 @@
 
 ---
 
-## What to KEEP
-
-- `models/spherical_cauchy.py` — core distribution, sampling, KL
-- `models/sc_unet_vae.py` — U-Net encoder/decoder
-- `models/transition_sc_vae.py` — siamese transition encoder
-- `models/memory.py` — SimHash (refactor to expose angular properties)
-- `sparse_env.py` — DoorButton env (keep as unit test env, not main benchmark)
-- `dataset.py` — transition dataset utilities
-- `offline_rl/extractor.py` — SB3 feature extractor (modify input dim)
-- SB3 PPO integration pattern (wrappers, callbacks, VecEnv)
-
-## What to DROP
-
-- `models/wyner.py` — entire GRU adaptive prior / Gaussian z module
-- `online_rl/online_module.py` — online joint training (replace with simpler version)
-- `online_rl/online_callback.py` — VAE+Wyner training callback
-- The whole "Phase A / Phase B" training loop
-- Teacher-Student mechanism (never implemented, remove from README)
-- Variant B (use_skips) — dead code path
-- KL(posterior || adaptive_prior) as surprise signal
 
 ## What to BUILD
 
