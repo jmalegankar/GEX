@@ -106,7 +106,10 @@ class GeodesicExplorationBonus:
         Returns:
             r_int (float), info (dict)
         """
-
+        # Ensure mu is 1D (d,), not (1, d)
+        if mu.dim() == 2:
+            mu = mu.squeeze(0)
+        
         # --- compute episodic bonus ---
         r_epi = self.episodic.query_and_add(mu)
 

@@ -1,21 +1,22 @@
 from dataclasses import dataclass
 from typing import Tuple
 
-
 @dataclass
 class SCVAEConfig:
-    # Conv architecture (after embedding)
     conv_channels: Tuple[int, ...] = (32, 64)
     hidden_dim: int = 256
 
-    # Latent
     latent_dim: int = 32
     rho_min: float = 0.001
     rho_max: float = 0.999
 
-    # Action embedding
     n_actions: int = 7
     action_embed_dim: int = 8
 
-    # KL
     kl_max_terms: int = 128
+
+    no_op_action: int = 0
+
+    # VAE training
+    lr: float = 1e-4
+    beta: float = 0.005
