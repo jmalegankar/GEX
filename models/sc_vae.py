@@ -171,6 +171,28 @@ def _sc_kl_uniform(
 
     return kl
 
+# ==================================================================
+# Uniformity Loss
+# ==================================================================
+def _uniformity_loss(mu: torch.Tensor, t: float = 2.0) -> torch.Tensor:
+    """
+    Wang & Isola (2020) uniformity loss on S^{d-1}.
+
+    L_uniform = log E[exp(-t * ||mu_i - mu_j||^2)]  for i != j
+
+    For unit vectors: ||a-b||^2 = 2(1 - a·b)
+    Minimising this spreads mu's uniformly across the sphere.
+
+    Args:
+        mu: (B, d) unit vectors
+        t:  kernel bandwidth (default 2.0 from paper)
+    Returns:
+        scalar (lower = more uniform)
+    """
+    sq_dists = 2.0 - 2.0 * (mu @ mu.T)   # (B, B)
+    mask     = ~torch.eye(mu.size(0), dtype=torch.bool, device=mu.device)
+    return torch.log(torch.exp(-t * sq_dists[mask]).mean())
+
 
 # ===================================================================
 # Output type
@@ -312,4 +334,5 @@ class TransitionSCVAE(nn.Module):
             self.latent_dim,
             max_terms=self.cfg.kl_max_terms,
         ).mean()
-        return l_recon, l_kl
+        l_uniform = _uniformity_loss(out.mu, t=self.cfg.uniformity_t)
+        return l_recon, l_kl, l_uniform

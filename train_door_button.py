@@ -138,7 +138,7 @@ def build_model(
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--size",        type=int,   default=10)
+    parser.add_argument("--size",        type=int,   default=20)
     parser.add_argument("--view-size",   type=int,   default=5)
     parser.add_argument("--max-steps",   type=int,   default=400)
     parser.add_argument("--n-envs",      type=int,   default=4)

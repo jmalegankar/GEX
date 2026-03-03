@@ -20,3 +20,7 @@ class SCVAEConfig:
     # VAE training
     lr: float = 1e-4
     beta: float = 0.005
+
+    # Uniformity loss
+    uniformity_t: float = 2.0
+    alpha_uniform: float = 0.05

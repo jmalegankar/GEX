@@ -149,6 +149,8 @@ class PPOGEX(PPO):
 
         indices    = np.random.permutation(n_total)
         batch_size = 256
+        
+        sc_vae_losses = {"recon": [], "kl": [], "uniform": []}
 
         for start in range(0, n_total, batch_size):
             idx = indices[start : start + batch_size]
@@ -157,16 +159,27 @@ class PPOGEX(PPO):
             s_n = th.as_tensor(next_obs_flat[idx], device=self.device)
             a_t = th.as_tensor(actions_flat[idx],  device=self.device)
 
-            out           = self.sc_vae(s_t, a_t, s_n)
-            l_recon, l_kl = self.sc_vae.loss(out)
-            loss          = l_recon + self.sc_vae.cfg.beta * l_kl
+            out                    = self.sc_vae(s_t, a_t, s_n)
+            l_recon, l_kl, l_unif = self.sc_vae.loss(out)
+            loss = (
+                l_recon
+                + self.sc_vae.cfg.beta          * l_kl
+                + self.sc_vae.cfg.alpha_uniform  * l_unif
+            )
 
             self.sc_vae_optimizer.zero_grad()
             loss.backward()
             self.sc_vae_optimizer.step()
             self._update_ema()
 
+            sc_vae_losses["recon"].append(l_recon.item())
+            sc_vae_losses["kl"].append(l_kl.item())
+            sc_vae_losses["uniform"].append(l_unif.item())
+
         self.sc_vae.eval()
+        self.logger.record("sc_vae/loss_recon",   np.mean(sc_vae_losses["recon"]))
+        self.logger.record("sc_vae/loss_kl",      np.mean(sc_vae_losses["kl"]))
+        self.logger.record("sc_vae/loss_uniform", np.mean(sc_vae_losses["uniform"]))
 
     # ------------------------------------------------------------------
     # Rollout collection

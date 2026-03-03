@@ -2,14 +2,14 @@
 GEX on MiniGrid benchmarks.
 
 Recommended envs (in order of difficulty):
+    MiniGrid-DoorKey-6x6-v0       — key + door + goal, small
     MiniGrid-KeyCorridorS3R3-v0   — key + door + goal, procedural
     MiniGrid-MultiRoom-N6-v0      — 6 rooms, procedural
-    MiniGrid-ObstructedMaze-2Dlh-v0 — harder version
 
 Usage:
     python train_minigrid.py
-    python train_minigrid.py --env MiniGrid-MultiRoom-N6-v0 --timesteps 3_000_000
-    python train_minigrid.py --no-intrinsic   # PPO baseline
+    python train_minigrid.py --env MiniGrid-KeyCorridorS3R3-v0 --timesteps 5_000_000
+    python train_minigrid.py --no-intrinsic   # SC-VAE repr, no GEX bonus
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import os
 
 import numpy as np
 import torch
-import gymnasium as gym
 from stable_baselines3.common.vec_env import DummyVecEnv, VecMonitor
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 
@@ -33,7 +32,6 @@ from sb3.sc_vae_state_extractor import SCVAEStateExtractor
 from sb3.ppo_gex import PPOGEX
 
 
-# MiniGrid standard catalogue — same as MultiGrid
 GRID_SPEC = CategoricalGridSpec(
     n_object_types=11,
     n_colors=6,
@@ -48,16 +46,26 @@ def make_env(env_id: str):
     return _init
 
 
-def build_model(env, *, env_id: str, n_envs: int, eta: float, tau: float,
-                sc_vae_freeze_steps: int | None, use_intrinsic: bool, device: str) -> PPOGEX:
+def build_model(
+    env,
+    *,
+    env_id: str,
+    n_envs: int,
+    eta: float,
+    tau: float,
+    sc_vae_freeze_steps: int | None,
+    use_intrinsic: bool,
+    device: str,
+) -> PPOGEX:
 
-    # Infer obs shape and n_actions from a temp env
     tmp = MiniGridWrapper(env_id)
     obs_shape = tmp.observation_space.shape   # (H, W, 3)
     n_actions = tmp.action_space.n
     tmp.close()
 
     # ---- SC-VAE -------------------------------------------------------
+    # Always built — policy always uses SC-VAE state encoder.
+    # --no-intrinsic only disables the GEX bonus, not the encoder.
     embedding = CategoricalGridEmbedding(GRID_SPEC)
     cfg = SCVAEConfig(
         conv_channels=(32, 64),
@@ -68,6 +76,8 @@ def build_model(env, *, env_id: str, n_envs: int, eta: float, tau: float,
         kl_max_terms=128,
         lr=1e-4,
         beta=0.005,
+        alpha_uniform=0.05,
+        uniformity_t=2.0,
         no_op_action=0,
     )
     sc_vae = TransitionSCVAE(
@@ -77,6 +87,8 @@ def build_model(env, *, env_id: str, n_envs: int, eta: float, tau: float,
     )
 
     # ---- GEX modules --------------------------------------------------
+    # SC-VAE always trains regardless. GEX modules only added when
+    # use_intrinsic=True — controls whether bonus is injected into reward.
     if use_intrinsic:
         gex_modules = [
             GeodesicExplorationBonus(
@@ -90,14 +102,10 @@ def build_model(env, *, env_id: str, n_envs: int, eta: float, tau: float,
         ]
         rms = RunningMeanStd(device=device)
     else:
-        sc_vae      = None
         gex_modules = None
         rms         = None
 
-    # ---- CNN policy via SC-VAE state encoder --------------------------
-    # Policy reuses sc_vae's conv encoder (EMA target copy).
-    # No separate policy CNN — one set of weights does both jobs.
-    # _setup_model swaps the extractor to sc_vae_target after creation.
+    # ---- Model --------------------------------------------------------
     model = PPOGEX(
         "CnnPolicy",
         env,
@@ -129,15 +137,16 @@ def build_model(env, *, env_id: str, n_envs: int, eta: float, tau: float,
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env",          type=str,   default="MiniGrid-KeyCorridorS3R3-v0")
-    parser.add_argument("--n-envs",       type=int,   default=8)
-    parser.add_argument("--timesteps",    type=int,   default=3_000_000)
-    parser.add_argument("--eta",                type=float, default=0.05)
-    parser.add_argument("--tau",                type=float, default=0.005)
-    parser.add_argument("--sc-vae-freeze-steps", type=int,  default=300_000)
-    parser.add_argument("--device",       type=str,   default="auto")
-    parser.add_argument("--no-intrinsic", action="store_true")
-    parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--env",                 type=str,   default="MiniGrid-DoorKey-6x6-v0")
+    parser.add_argument("--n-envs",              type=int,   default=8)
+    parser.add_argument("--timesteps",           type=int,   default=1_000_000)
+    parser.add_argument("--eta",                 type=float, default=0.05)
+    parser.add_argument("--tau",                 type=float, default=0.005)
+    parser.add_argument("--sc-vae-freeze-steps", type=int,   default=500_000)
+    parser.add_argument("--device",              type=str,   default="auto")
+    parser.add_argument("--no-intrinsic",        action="store_true",
+                        help="SC-VAE repr kept, GEX bonus disabled (eta=0)")
+    parser.add_argument("--seed",                type=int,   default=42)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -166,7 +175,7 @@ def main():
     )
 
     env_slug = args.env.replace("/", "_")
-    tag = "gex" if not args.no_intrinsic else "ppo_baseline"
+    tag = "gex" if not args.no_intrinsic else "scvae_repr_only"
 
     os.makedirs(f"checkpoints/{env_slug}", exist_ok=True)
     os.makedirs(f"eval_logs/{env_slug}",   exist_ok=True)
@@ -189,6 +198,7 @@ def main():
     print(f"\n{'='*50}")
     print(f"  {args.env} — {tag}")
     print(f"  η={args.eta}  τ={args.tau}  n_envs={args.n_envs}")
+    print(f"  sc_vae_freeze_steps={args.sc_vae_freeze_steps:,}")
     print(f"  timesteps={args.timesteps:,}")
     print(f"{'='*50}\n")
 
