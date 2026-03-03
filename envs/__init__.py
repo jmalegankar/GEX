@@ -1,1 +1,2 @@
 from envs.door_button_wrapper import DoorButtonSB3Env
+from envs.minigrid_wrapper import MiniGridWrapper

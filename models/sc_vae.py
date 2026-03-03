@@ -282,6 +282,11 @@ class TransitionSCVAE(nn.Module):
             dim=-1,
         )
 
+    def encode_state(self, s_t: torch.Tensor) -> torch.Tensor:
+        """Returns flattened conv features for s_t. Used by policy."""
+        with torch.no_grad():
+            return self.conv(self._embed(s_t)).flatten(1)  # (B, feat_dim)
+
     def encode(self, s_t, a_t, s_next):
         h_s, a_emb, h_sn = self._encode_parts(s_t, a_t, s_next)
         h   = self.fc(torch.cat([h_s, a_emb, h_sn], dim=-1))
