@@ -9,8 +9,11 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 
-from typing import Any, Optional, Type, Union
+from typing import Any, Optional, Type, Union, Tuple
 
+
+from models.vae import VAEInterface, VAEOutput, VAELoss
+from models.wyner import WynerInterface, WynerOutput, WynerLoss
 
 class HSWVIMEFeaturesExtractor(nn.Module):
     """
@@ -23,12 +26,18 @@ class HSWVIMEFeaturesExtractor(nn.Module):
 
     def __init__(
             self,
-            observation_space: spaces.Space,
-            action_space: spaces.Space
+            transition_vae: VAEInterface,
+            wyner: WynerInterface,
+            features_dim: int = 256,
         ):
+        super().__init__()
+        self.transition_vae = transition_vae
+        self.wyner = wyner
+        self.features_dim = features_dim
 
-    def forward(self, observations: th.Tensor) -> th.Tensor:
-        return observations
+    def forward(self, s_tm1: th.Tensor, a_tm1: th.Tensor, s_t: th.Tensor) -> Tuple[VAEOutput, WynerOutput, th.Tensor]:
+        raise NotImplementedError("HSWVIME features extractor is not implemented yet.")
+
 
 class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
     """
@@ -75,7 +84,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         full_std: bool = True,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: type[BaseFeaturesExtractor] = BaseFeaturesExtractor,
+        features_extractor_class: type[HSWVIMEFeaturesExtractor] = HSWVIMEFeaturesExtractor,
         features_extractor_kwargs: Optional[dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,

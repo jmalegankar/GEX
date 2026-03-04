@@ -7,16 +7,14 @@ class WynerOutput:
     def __init__(
         self,
         recon: th.Tensor,
-        mu: th.Tensor,
-        rho: th.Tensor,
-        recon_target: th.Tensor,
-        skips: Optional[List[th.Tensor]] = None
+        recon_next: th.Tensor,
+        w: th.Tensor,
+        logvar: th.Tensor,
     ):
         self.recon = recon
-        self.mu = mu
-        self.rho = rho
-        self.recon_target = recon_target
-        self.skips = skips
+        self.recon_next = recon_next
+        self.w = w
+        self.logvar = logvar
 
 
 @th.jit.script
@@ -24,24 +22,26 @@ class WynerLoss:
     def __init__(
         self,
         recon_loss: th.Tensor,
+        recon_next_loss: th.Tensor,
         kl_loss: th.Tensor,
-        aux_loss: Optional[th.Tensor] = None,
+        kl_next_loss: th.Tensor,
     ):
         self.recon_loss = recon_loss
+        self.recon_next_loss = recon_next_loss
         self.kl_loss = kl_loss
-        self.aux_loss = aux_loss
+        self.kl_next_loss = kl_next_loss
 
 
 @th.jit.interface
 class WynerInterface:
-    def encode(self, s_t: th.Tensor, a_t: th.Tensor, s_tp1: th.Tensor) -> Tuple[th.Tensor, th.Tensor, Optional[List[th.Tensor]]]:
+    def encode(self, w: th.Tensor, mu: th.Tensor, skips: Optional[List[th.Tensor]]) -> Tuple[th.Tensor, th.Tensor]:
         pass
 
-    def decode(self, z_t: th.Tensor, skips: Optional[List[th.Tensor]]) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def decode(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
         pass
 
-    def forward(self, s_t: th.Tensor, a_t: th.Tensor, s_tp1: th.Tensor) -> WynerOutput:
+    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: th.Tensor) -> WynerOutput:
         pass
 
-    def loss(self, output: WynerOutput) -> WynerLoss:
+    def loss(self, output: WynerOutput, recon_target: th.Tensor, recon_next_target: th.Tensor) -> WynerLoss:
         pass

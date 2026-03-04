@@ -37,7 +37,7 @@ class VAEInterface:
     def encode(self, s_t: th.Tensor, a_t: th.Tensor, s_tp1: th.Tensor) -> Tuple[th.Tensor, th.Tensor, Optional[List[th.Tensor]]]:
         pass
 
-    def decode(self, z_t: th.Tensor, skips: Optional[List[th.Tensor]] = None) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def decode(self, z: th.Tensor, skips: Optional[List[th.Tensor]]) -> th.Tensor:
         pass
 
     def forward(self, s_t: th.Tensor, a_t: th.Tensor, s_tp1: th.Tensor) -> VAEOutput:
