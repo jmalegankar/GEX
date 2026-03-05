@@ -1,21 +1,23 @@
 from __future__ import annotations
-from typing import Optional, Tuple
 
-import torch as th
+from typing import Tuple
+import torch
 import torch.nn as nn
 
 
 # ============================================================
-# Descriptor
+# Metadata container
 # ============================================================
 
-@th.jit.script
+@torch.jit.script
 class EmbeddingMeta:
+    """Carries static information about an embedding's output format."""
+
     def __init__(self, out_channels: int, obs_h: int, obs_w: int, is_spatial: bool) -> None:
         self.out_channels = out_channels
-        self.obs_h        = obs_h
-        self.obs_w        = obs_w
-        self.is_spatial   = is_spatial
+        self.obs_h = obs_h
+        self.obs_w = obs_w
+        self.is_spatial = is_spatial
 
     def spatial_shape(self) -> Tuple[int, int]:
         return (self.obs_h, self.obs_w)
@@ -25,9 +27,9 @@ class EmbeddingMeta:
 # Interface
 # ============================================================
 
-@th.jit.interface
+@torch.jit.interface
 class EmbeddingInterface:
-    def forward(self, obs: th.Tensor) -> th.Tensor:
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
         pass
 
     def meta(self) -> EmbeddingMeta:
@@ -35,11 +37,15 @@ class EmbeddingInterface:
 
 
 # ============================================================
-# Implementations
+# 1) Categorical grid embedding
 # ============================================================
 
+# Example: MiniGrid obs (B, H, W, 3) with (object_type, color, state) integers per cell.
 class CategoricalGridEmbedding(nn.Module):
-    """(B,H,W,3) integer ids -> (B, 3*embed_per_channel, H, W)"""
+    """
+    Input:  (B, H, W, 3) integer tensor
+    Output: (B, 3 * embed_per_channel, H, W)
+    """
 
     def __init__(
         self,
@@ -49,50 +55,100 @@ class CategoricalGridEmbedding(nn.Module):
         obs_h: int,
         obs_w: int,
         embed_per_channel: int = 4,
-    ) -> None:
+    ):
         super().__init__()
+
         e = embed_per_channel
-        self.obj   = nn.Embedding(n_object_types, e)
-        self.col   = nn.Embedding(n_colors, e)
-        self.sta   = nn.Embedding(n_states, e)
-        self._meta = EmbeddingMeta(3 * e, obs_h, obs_w, is_spatial=True)
+
+        self.obj = nn.Embedding(n_object_types, e)
+        self.col = nn.Embedding(n_colors, e)
+        self.sta = nn.Embedding(n_states, e)
+
+        self._meta = EmbeddingMeta(3 * e, obs_h, obs_w, True)
 
     def meta(self) -> EmbeddingMeta:
         return self._meta
 
-    def forward(self, obs: th.Tensor) -> th.Tensor:
-        if obs.dim() != 4 or obs.size(-1) != 3:
-            raise ValueError(f"Expected (B,H,W,3), got {tuple(obs.shape)}")
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
         obs = obs.long()
-        x = th.cat([self.obj(obs[..., 0]),
-                    self.col(obs[..., 1]),
-                    self.sta(obs[..., 2])], dim=-1)
+
+        x = torch.cat(
+            [
+                self.obj(obs[..., 0]),
+                self.col(obs[..., 1]),
+                self.sta(obs[..., 2]),
+            ],
+            dim=-1,
+        )
+
         return x.permute(0, 3, 1, 2).contiguous().float()
 
 
-class PixelCNNEmbedding(nn.Module):
-    """(B,H,W,C) uint8 or float -> (B, out_channels, H, W)"""
+# ============================================================
+# 2) Pixel embedding
+# ============================================================
 
-    def __init__(
-        self,
-        in_channels: int,
-        obs_h: int,
-        obs_w: int,
-        out_channels: Optional[int] = None,
-    ) -> None:
+# Example: Atari obs (B, H, W, 3) uint8 RGB images.
+class PixelCNNEmbedding(nn.Module):
+    """
+    Input:  (B, H, W, C)
+    Output: (B, out_channels, H, W)
+    """
+
+    def __init__(self, in_channels: int, out_channels: int = None):
         super().__init__()
-        _out      = out_channels or in_channels
-        self.stem = nn.Conv2d(in_channels, _out, kernel_size=1) if _out != in_channels else None
-        self._meta = EmbeddingMeta(_out, obs_h, obs_w, is_spatial=True)
+
+        if out_channels is None:
+            out_channels = in_channels
+
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        if out_channels != in_channels:
+            self.stem = nn.Conv2d(in_channels, out_channels, 1)
+        else:
+            self.stem = nn.Identity()
+
+        self._meta = EmbeddingMeta(out_channels, 0, 0, True)
 
     def meta(self) -> EmbeddingMeta:
         return self._meta
 
-    def forward(self, obs: th.Tensor) -> th.Tensor:
-        if obs.dim() != 4:
-            raise ValueError(f"Expected (B,H,W,C), got {tuple(obs.shape)}")
-        x = (obs.float() / 255.0) if obs.dtype == th.uint8 else obs.float()
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = obs.float()
+
+        if obs.dtype == torch.uint8:
+            x = x / 255.0
+
         x = x.permute(0, 3, 1, 2).contiguous()
-        if self.stem is not None:
-            x = self.stem(x)
+        x = self.stem(x)
+
         return x
+
+
+# ============================================================
+# 3) Vector embedding
+# ============================================================
+
+# Example: Box2D obs (B, D) with D continuous variables.
+class VectorToMapEmbedding(nn.Module):
+    """
+    Input:  (B, D)
+    Output: (B, out_channels, 1, 1)
+    """
+
+    def __init__(self, in_dim: int, out_channels: int):
+        super().__init__()
+
+        self.in_dim = in_dim
+        self.out_channels = out_channels
+        self.proj = nn.Linear(in_dim, out_channels)
+
+        self._meta = EmbeddingMeta(out_channels, 1, 1, False)
+
+    def meta(self) -> EmbeddingMeta:
+        return self._meta
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        x = self.proj(obs.float())
+        return x.unsqueeze(-1).unsqueeze(-1)
