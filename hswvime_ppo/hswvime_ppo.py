@@ -125,13 +125,13 @@ class HSWVimePPO(PPO):
         if _init_setup_model:
             self._setup_model()
     
-    def set_env(self, env, force_reset = True):
+    def set_env(self, env, force_reset: bool = True):
         ret = super().set_env(env, force_reset)
-        if self.force_reset:
+        if force_reset:
             self._prev_last_obs = None
-        if self.force_reset:
+        if force_reset:
             self._last_memory = None
-        if self.force_reset:
+        if force_reset:
             self._prev_action = None
         return ret
     
@@ -187,7 +187,7 @@ class HSWVimePPO(PPO):
                 s_tm1 = obs_as_tensor(self._prev_last_obs, self.device)  # type: ignore[arg-type]
                 a_tm1 = obs_as_tensor(self._prev_action, self.device)  # type: ignore[arg-type]
                 s_t = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
-                actions, memory, values, log_probs = self.policy(s_tm1, a_tm1, s_t, self._last_memory)
+                actions, memory, values, log_probs = self.policy.forward(s_tm1, a_tm1, s_t, self._last_memory)
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -209,12 +209,9 @@ class HSWVimePPO(PPO):
             with th.no_grad():
                 s_tp1 = obs_as_tensor(new_obs, self.device)
                 a_t = obs_as_tensor(actions, self.device)
-                vae_t = self.policy.vae_feature_extractor(s_tm1, a_tm1, s_t)
-                vae_tp1 = self.policy.vae_feature_extractor(s_t, a_t, s_tp1)
-                wyner_loss = self.policy.wyner_feature_extractor.loss(
-                    self.policy.wyner_feature_extractor(self._last_memory, vae_t.mu, vae_tp1.mu, vae_t.skips),
-                    recon_target=vae_t.recon_target,
-                    recon_next_target=vae_tp1.recon_target,
+                vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
+                wyner_loss: WynerLoss = self.policy.wyner_feature_extractor.loss(
+                    self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips),
                 )
                 intrinsic_rewards = self.intrinsic_scale * (wyner_loss.kl_loss)
                 intrinsic_rewards = intrinsic_rewards.view(-1).cpu().numpy()
@@ -363,15 +360,15 @@ class HSWVimePPO(PPO):
                 entropy_losses.append(entropy_loss.item())
 
 
-                vae_t = self.policy.vae_feature_extractor(
+                vae_t = self.policy.vae_feature_extractor.forward(
                     rollout_data.prev_observations,
                     rollout_data.prev_actions,
                     rollout_data.observations,
                 )
 
-                vae_tp1 = self.policy.vae_feature_extractor(
+                vae_tp1 = self.policy.vae_feature_extractor.forward(
                     rollout_data.observations,
-                    actions.float(),
+                    actions,
                     rollout_data.next_observations,
                 )
 
@@ -384,7 +381,7 @@ class HSWVimePPO(PPO):
 
                 vae_losses.append(vae_loss.item())
 
-                wyner_out = self.policy.wyner_feature_extractor(
+                wyner_out = self.policy.wyner_feature_extractor.forward(
                     rollout_data.memories,
                     vae_t.mu,
                     vae_tp1.mu,
@@ -397,8 +394,8 @@ class HSWVimePPO(PPO):
                 )
 
                 wyner_loss = (
-                    self.wyner_recon_coef * wyner_loss_obj.recon_loss
-                    + self.wyner_kl_coef * wyner_loss_obj.kl_loss
+                    self.wyner_recon_coef * (wyner_loss_obj.recon_loss + wyner_loss_obj.recon_next_loss)
+                    + self.wyner_kl_coef * (wyner_loss_obj.kl_loss + wyner_loss_obj.kl_next_loss)
                 )
 
                 wyner_losses.append(wyner_loss.item())

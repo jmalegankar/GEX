@@ -7,11 +7,12 @@ from gymnasium import spaces
 from stable_baselines3.common.preprocessing import preprocess_obs
 from stable_baselines3.common.distributions import Distribution
 from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
+from stable_baselines3.common.type_aliases import Schedule
 
 
-from typing import Any, Optional, Type, Union, Tuple
+from typing import Any, Optional, Union, Tuple
+
+import typing
 
 
 from models.vae import VAEInterface
@@ -110,8 +111,8 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         if wyner_features_extractor_kwargs is None:
             self.wyner_features_extractor_kwargs = {}
         
-        self.vae_feature_extractor = self.vae_features_extractor_class(**self.vae_features_extractor_kwargs)
-        self.wyner_feature_extractor = self.wyner_features_extractor_class(**self.wyner_features_extractor_kwargs)
+        self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(**self.vae_features_extractor_kwargs)
+        self.wyner_feature_extractor: WynerInterface = self.wyner_features_extractor_class(**self.wyner_features_extractor_kwargs)
         super().__init__(
             observation_space,
             action_space,
@@ -139,7 +140,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         s_t: th.Tensor,
         memory: th.Tensor,
         deterministic: bool = False
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
 
@@ -185,10 +186,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor
-    ) -> Distribution:
-        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory)
+    ) -> Tuple[Distribution, th.Tensor]:
+        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
         latent_pi = self.mlp_extractor.forward_actor(features)
-        return self._get_action_dist_from_latent(latent_pi)
+        return self._get_action_dist_from_latent(latent_pi), memory
 
     def predict_values(
         self,
@@ -209,13 +210,13 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         memory: th.Tensor,
         action: th.Tensor
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory)
         latent_vf = self.mlp_extractor.forward_critic(features)
         values = self.value_net(latent_vf)
         latent_pi = self.mlp_extractor.forward_actor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(action)
-        return values, log_prob, distribution.entropy(), memory
+        return values, log_prob, distribution.entropy()
     
     def predict(
         self,
@@ -243,9 +244,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1 = th.as_tensor(a_tm1, device=s_tm1.device)
 
         with th.no_grad():
-            features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
-            latent_pi = self.mlp_extractor.forward_actor(features)
-            distribution = self._get_action_dist_from_latent(latent_pi)
+            distribution, memory = self.get_distribution(s_tm1, a_tm1, s_t, memory)
             actions = distribution.get_actions(deterministic=deterministic)
         
         actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]

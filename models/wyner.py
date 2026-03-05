@@ -6,10 +6,10 @@ from typing import Optional, List, Tuple
 class WynerOutput:
     def __init__(
         self,
-        recon: th.Tensor,
-        recon_next: th.Tensor,
         w: th.Tensor,
         logvar: th.Tensor,
+        recon: th.Tensor,
+        recon_next: Optional[th.Tensor] = None,
     ):
         self.recon = recon
         self.recon_next = recon_next
@@ -21,13 +21,15 @@ class WynerOutput:
 class WynerLoss:
     def __init__(
         self,
-        recon_loss: th.Tensor,
-        recon_next_loss: th.Tensor,
         kl_loss: th.Tensor,
+        recon_loss: Optional[th.Tensor] = None,
+        kl_next_loss: Optional[th.Tensor] = None,
+        recon_next_loss: Optional[th.Tensor] = None,
     ):
         self.recon_loss = recon_loss
         self.recon_next_loss = recon_next_loss
         self.kl_loss = kl_loss
+        self.kl_next_loss = kl_next_loss
 
 @th.jit.interface
 class WynerInterface:
@@ -37,8 +39,8 @@ class WynerInterface:
     def decode(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
         pass
 
-    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: th.Tensor, skips: Optional[List[th.Tensor]]) -> WynerOutput:
+    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor], skips: Optional[List[th.Tensor]]) -> WynerOutput:
         pass
 
-    def loss(self, output: WynerOutput, recon_target: th.Tensor, recon_next_target: th.Tensor) -> WynerLoss:
+    def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor], recon_next_target: Optional[th.Tensor]) -> WynerLoss:
         pass
