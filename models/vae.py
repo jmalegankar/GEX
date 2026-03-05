@@ -4,10 +4,10 @@ import torch.nn.functional as F
 
 from typing import Optional, List, Tuple
 
-from utils import _sc_kl_uniform, _uniformity_loss, _sc_sample
-from embeddings import EmbeddingInterface
-from config import SCVAEConfig
-from encoders import ConvEncoder
+from .utils import sc_kl_uniform, uniformity_loss, sc_sample
+from .embeddings import EmbeddingInterface
+from .config import SCVAEConfig
+from .encoders import ConvEncoder
 
 
 @th.jit.script
@@ -190,7 +190,7 @@ class TransitionSCVAE(nn.Module):
 
         mu, rho, skips = self.encode(s_t, a_t, s_next)
 
-        z = _sc_sample(mu, rho) if self.training else mu
+        z = sc_sample(mu, rho) if self.training else mu
 
         recon        = self.decode(z, skips)
         recon_target = self._build_target(s_t, a_t, s_next)
@@ -201,13 +201,12 @@ class TransitionSCVAE(nn.Module):
 
         l_recon = F.mse_loss(out.recon, out.recon_target)
 
-        l_kl = _sc_kl_uniform(
+        l_kl = sc_kl_uniform(
             out.rho,
             self.latent_dim,
-            n_quad_points=self.cfg.kl_quad_points,
         ).mean()
 
-        l_uniform = _uniformity_loss(
+        l_uniform = uniformity_loss(
             out.mu,
             t=self.cfg.uniformity_t,
         )
