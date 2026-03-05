@@ -4,16 +4,18 @@ import numpy as np
 import torch as th
 import torch.nn as nn
 from gymnasium import spaces
+from stable_baselines3.common.preprocessing import preprocess_obs
 from stable_baselines3.common.distributions import Distribution
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 
+
 from typing import Any, Optional, Type, Union, Tuple
 
 
-from models.vae import VAEInterface, VAEOutput, VAELoss
-from models.wyner import WynerInterface, WynerOutput, WynerLoss
+from models.vae import VAEInterface
+from models.wyner import WynerInterface
 
 class HSWVIMEFeaturesExtractor(nn.Module):
     """
@@ -24,20 +26,23 @@ class HSWVIMEFeaturesExtractor(nn.Module):
         This corresponds to the number of units for the last layer.
     """
 
-    def __init__(
-            self,
-            transition_vae: VAEInterface,
-            wyner: WynerInterface,
-            features_dim: int = 256,
-        ):
+    def __init__(self, wyner_dim: int, mu_dim: int):
         super().__init__()
-        self.transition_vae = transition_vae
-        self.wyner = wyner
-        self.features_dim = features_dim
-
-    def forward(self, s_tm1: th.Tensor, a_tm1: th.Tensor, s_t: th.Tensor) -> Tuple[VAEOutput, WynerOutput, th.Tensor]:
-        raise NotImplementedError("HSWVIME features extractor is not implemented yet.")
-
+        self._features_dim = wyner_dim + mu_dim
+        self.wyner_dim = wyner_dim
+        self.mu_dim = mu_dim
+        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True, kdim=wyner_dim, vdim=wyner_dim)
+    
+    @property
+    def features_dim(self) -> int:
+        return self._features_dim
+        
+    @th.jit.export
+    def forward(self, wyner_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
+        mu_features = mu_features.view(-1, 1, self.mu_dim) # Make it (batch_size, 1, mu_dim)
+        attn_output, _ = self.attn(mu_features, wyner_features, wyner_features, need_weights = False) # Query is mu, key and value are wyner
+        x = th.cat((mu_features, attn_output), dim=-1).squeeze(1) # Concatenate along the feature dimension
+        return x
 
 class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
     """
@@ -86,11 +91,27 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         squash_output: bool = False,
         features_extractor_class: type[HSWVIMEFeaturesExtractor] = HSWVIMEFeaturesExtractor,
         features_extractor_kwargs: Optional[dict[str, Any]] = None,
+        vae_features_extractor_class: VAEInterface = None,
+        vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
+        wyner_features_extractor_class: WynerInterface = None,
+        wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
     ):
+        assert share_features_extractor, "HSWVIME does not support separate feature extractors for policy and value networks"
+        self.vae_features_extractor_class = vae_features_extractor_class
+        self.vae_features_extractor_kwargs = vae_features_extractor_kwargs
+        self.wyner_features_extractor_class = wyner_features_extractor_class
+        self.wyner_features_extractor_kwargs = wyner_features_extractor_kwargs
+        if vae_features_extractor_kwargs is None:
+            self.vae_features_extractor_kwargs = {}
+        if wyner_features_extractor_kwargs is None:
+            self.wyner_features_extractor_kwargs = {}
+        
+        self.vae_feature_extractor = self.vae_features_extractor_class(**self.vae_features_extractor_kwargs)
+        self.wyner_feature_extractor = self.wyner_features_extractor_class(**self.wyner_features_extractor_kwargs)
         super().__init__(
             observation_space,
             action_space,
@@ -110,3 +131,137 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
         )
+
+    def forward(
+        self,
+        s_tm1: th.Tensor,
+        a_tm1: th.Tensor,
+        s_t: th.Tensor,
+        memory: th.Tensor,
+        deterministic: bool = False
+    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Forward pass in all the networks (actor and critic)
+
+        :param s_tm1: Previous state
+        :param a_tm1: Previous action
+        :param s_t: Current state
+        :param deterministic: Whether to sample or use deterministic actions
+        :return: action, value and log probability of the action
+        """
+        # Preprocess the observation if needed
+        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        if self.share_features_extractor:
+            latent_pi, latent_vf = self.mlp_extractor(features)
+        else:
+            pi_features, vf_features = features
+            latent_pi = self.mlp_extractor.forward_actor(pi_features)
+            latent_vf = self.mlp_extractor.forward_critic(vf_features)
+        # Evaluate the values for the given observations
+        values = self.value_net(latent_vf)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        actions = distribution.get_actions(deterministic=deterministic)
+        log_prob = distribution.log_prob(actions)
+        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
+        return actions, memory, values, log_prob
+    
+    def extract_features(
+        self,
+        s_tm1: th.Tensor,
+        a_tm1: th.Tensor,
+        s_t: th.Tensor,
+        memory: th.Tensor
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
+        s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
+        mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
+        memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips)
+        features = self.feature_extractor(memory, mu)
+        return features, memory
+    
+    def get_distribution(
+        self,
+        s_tm1: th.Tensor,
+        a_tm1: th.Tensor,
+        s_t: th.Tensor,
+        memory: th.Tensor
+    ) -> Distribution:
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        latent_pi = self.mlp_extractor.forward_actor(features)
+        return self._get_action_dist_from_latent(latent_pi)
+
+    def get_value(
+        self,
+        s_tm1: th.Tensor,
+        a_tm1: th.Tensor,
+        s_t: th.Tensor,
+        memory: th.Tensor
+    ) -> th.Tensor:
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        latent_vf = self.mlp_extractor.forward_critic(features)
+        return self.value_net(latent_vf)
+
+    def evaluate_actions(
+        self,
+        s_tm1: th.Tensor,
+        a_tm1: th.Tensor,
+        s_t: th.Tensor,
+        memory: th.Tensor,
+        action: th.Tensor
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        latent_vf = self.mlp_extractor.forward_critic(features)
+        values = self.value_net(latent_vf)
+        latent_pi = self.mlp_extractor.forward_actor(features)
+        distribution = self._get_action_dist_from_latent(latent_pi)
+        log_prob = distribution.log_prob(action)
+        return values, log_prob, distribution.entropy(), memory
+    
+    def predict(
+        self,
+        s_tm1: th.Tensor,
+        a_tm1: th.Tensor,
+        s_t: th.Tensor,
+        memory: th.Tensor,
+        deterministic: bool = False
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        self.set_training_mode(False)
+
+        # Check for common mistake that the user does not mix Gym/VecEnv API
+        # Tuple obs are not supported by SB3, so we can safely do that check
+        if isinstance(s_tm1, tuple) and len(s_tm1) == 2 and isinstance(s_tm1[1], dict):
+            raise ValueError(
+                "You have passed a tuple to the predict() function instead of a Numpy array or a Dict. "
+                "You are probably mixing Gym API with SB3 VecEnv API: `obs, info = env.reset()` (Gym) "
+                "vs `obs = vec_env.reset()` (SB3 VecEnv). "
+                "See related issue https://github.com/DLR-RM/stable-baselines3/issues/1694 "
+                "and documentation for more information: https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html#vecenv-api-vs-gym-api"
+            )
+
+        s_tm1, vectorized_env = self.obs_to_tensor(s_tm1)
+        s_t, _ = self.obs_to_tensor(s_t)
+        a_tm1 = th.as_tensor(a_tm1, device=s_tm1.device)
+
+        with th.no_grad():
+            features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+            latent_pi = self.mlp_extractor.forward_actor(features)
+            distribution = self._get_action_dist_from_latent(latent_pi)
+            actions = distribution.get_actions(deterministic=deterministic)
+        
+        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
+
+        if isinstance(self.action_space, spaces.Box):
+            if self.squash_output:
+                # Rescale to proper domain when using squashing
+                actions = self.unscale_action(actions)  # type: ignore[assignment, arg-type]
+            else:
+                # Actions could be on arbitrary scale, so clip the actions to avoid
+                # out of bound error (e.g. if sampling from a Gaussian distribution)
+                actions = np.clip(actions, self.action_space.low, self.action_space.high)  # type: ignore[assignment, arg-type]
+
+        # Remove batch dimension if needed
+        if not vectorized_env:
+            assert isinstance(actions, np.ndarray)
+            actions = actions.squeeze(axis=0)  # type: ignore[assignment]
+
+        return actions, memory  # type: ignore[return-value]
