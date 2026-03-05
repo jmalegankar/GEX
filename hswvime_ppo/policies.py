@@ -190,7 +190,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         latent_pi = self.mlp_extractor.forward_actor(features)
         return self._get_action_dist_from_latent(latent_pi)
 
-    def get_value(
+    def predict_values(
         self,
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
