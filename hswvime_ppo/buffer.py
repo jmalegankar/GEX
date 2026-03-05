@@ -50,7 +50,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         n_envs: int = 1,
-        memory_shape: Tuple[int, ...] = (64,),
+        memory_shape: Tuple[int, ...] = (1, 64),
     ):
         self.memory_shape = memory_shape
 
