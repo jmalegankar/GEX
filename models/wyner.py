@@ -24,13 +24,10 @@ class WynerLoss:
         recon_loss: th.Tensor,
         recon_next_loss: th.Tensor,
         kl_loss: th.Tensor,
-        kl_next_loss: th.Tensor,
     ):
         self.recon_loss = recon_loss
         self.recon_next_loss = recon_next_loss
         self.kl_loss = kl_loss
-        self.kl_next_loss = kl_next_loss
-
 
 @th.jit.interface
 class WynerInterface:
@@ -40,7 +37,7 @@ class WynerInterface:
     def decode(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
         pass
 
-    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: th.Tensor) -> WynerOutput:
+    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: th.Tensor, skips: Optional[List[th.Tensor]]) -> WynerOutput:
         pass
 
     def loss(self, output: WynerOutput, recon_target: th.Tensor, recon_next_target: th.Tensor) -> WynerLoss:
