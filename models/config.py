@@ -36,3 +36,8 @@ class SCVAEConfig:
     kl_warmup_epochs: int        = 0     # beta=0 for this many epochs
     kl_ramp_epochs:   int        = 0     # linear ramp 0 → beta_target
     beta_target:      float      = 0.05  # final KL weight after ramp
+
+
+@dataclass
+class WynerVAEConfig:
+    pass

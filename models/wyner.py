@@ -1,4 +1,5 @@
 import torch as th
+import torch.nn as nn
 
 from typing import Optional, List, Tuple
 
@@ -44,3 +45,10 @@ class WynerInterface:
 
     def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor], recon_next_target: Optional[th.Tensor]) -> WynerLoss:
         pass
+
+
+class WynerVAE(nn.Module):
+    def __init__(
+        self
+    ):
+        super().__init__()
