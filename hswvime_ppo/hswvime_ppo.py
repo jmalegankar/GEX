@@ -3,6 +3,7 @@ from typing import Any, ClassVar, TypeVar
 
 import numpy as np
 import torch as th
+import torch.nn.functional as F
 from gymnasium import spaces
 
 from stable_baselines3.common.callbacks import BaseCallback
@@ -299,6 +300,7 @@ class HSWVimePPO(PPO):
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
+        vae_losses, wyner_losses = [], []
 
         continue_training = True
         # train for n_epochs epochs
@@ -311,7 +313,13 @@ class HSWVimePPO(PPO):
                     # Convert discrete action from float to long
                     actions = rollout_data.actions.long().flatten()
 
-                values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
+                values, log_prob, entropy, _ = self.policy.evaluate_actions(
+                    rollout_data.prev_observations,   # s_{t-1}
+                    rollout_data.prev_actions,        # a_{t-1}
+                    rollout_data.observations,        # s_t
+                    rollout_data.memories,            # memory at t
+                    actions,
+                )
                 values = values.flatten()
                 # Normalize advantage
                 advantages = rollout_data.advantages
@@ -354,7 +362,49 @@ class HSWVimePPO(PPO):
 
                 entropy_losses.append(entropy_loss.item())
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                vae_t = self.policy.vae_feature_extractor(
+                    rollout_data.prev_observations,
+                    rollout_data.prev_actions,
+                    rollout_data.observations,
+                )
+
+                vae_tp1 = self.policy.vae_feature_extractor(
+                    rollout_data.observations,
+                    actions.float(),
+                    rollout_data.next_observations,
+                )
+
+                vae_loss_obj = self.policy.vae_feature_extractor.loss(vae_t)
+
+                vae_loss = (
+                    self.vae_recon_coef * vae_loss_obj.recon_loss
+                    + self.vae_kl_coef  * vae_loss_obj.kl_loss
+                )
+
+                vae_losses.append(vae_loss.item())
+
+                wyner_out = self.policy.wyner_feature_extractor(
+                    rollout_data.memories,
+                    vae_t.mu,
+                    vae_tp1.mu,
+                    vae_t.skips,
+                )
+                wyner_loss_obj = self.policy.wyner_feature_extractor.loss(
+                    wyner_out,
+                    recon_target=vae_t.recon_target,
+                    recon_next_target=vae_tp1.recon_target,
+                )
+
+                wyner_loss = (
+                    self.wyner_recon_coef * wyner_loss_obj.recon_loss
+                    + self.wyner_kl_coef * wyner_loss_obj.kl_loss
+                )
+
+                wyner_losses.append(wyner_loss.item())
+
+
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + vae_loss + wyner_loss
 
                 # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
@@ -388,6 +438,8 @@ class HSWVimePPO(PPO):
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
+        self.logger.record("train/vae_loss", np.mean(vae_losses))
+        self.logger.record("train/wyner_loss", np.mean(wyner_losses))
         self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
