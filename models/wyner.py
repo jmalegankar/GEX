@@ -49,6 +49,53 @@ class WynerInterface:
 
 class WynerVAE(nn.Module):
     def __init__(
-        self
+        self,
+        memory_dim: int = 64,
+        mu_dim: int = 32,
+        wyner_latent_dim: int = 32,
+        recon_dim: int = 128,
+        hidden_dim: int = 128,
     ):
         super().__init__()
+        
+        self.memory_dim = memory_dim
+        self.mu_dim = mu_dim
+        self.wyner_latent_dim = wyner_latent_dim
+        self.recon_dim = recon_dim
+
+        #gru for encoding (w, mu) into memory
+        self.gru = nn.GRUCell(input_size=mu_dim, hidden_size=memory_dim)
+
+        # linear layers for mapping memory to Wyner latent space (w, logvar)
+        self.fc_mu = nn.Linear(memory_dim, wyner_latent_dim)
+        self.fc_logvar = nn.Linear(memory_dim, wyner_latent_dim)
+
+        # decoder for reconstructing from Wyner latent space + mu
+        self.decoder = nn.Sequential(
+            nn.Linear(wyner_latent_dim + mu_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, recon_dim),
+        )
+    
+    def _encode_internal(self, w: th.Tensor, mu: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+
+        orig_shape = w.shape
+        w_flat = w.reshape(w.size(0), -1)          # (B, memory_dim)
+
+        h = self.gru(mu, w_flat)                   # (B, memory_dim)
+
+        z_mu = self.fc_mu(h)                       # (B, wyner_latent_dim)
+        z_logvar = self.fc_logvar(h)               # (B, wyner_latent_dim)
+
+        new_memory = h.view(orig_shape)            # restore (B, 1, memory_dim)
+        return new_memory, z_mu, z_logvar
+
+    def encode(self, w: th.Tensor, mu: th.Tensor, skips: Optional[List[th.Tensor]] = None) -> Tuple[th.Tensor, th.Tensor]:
+        new_memory, z_mu, z_logvar = self._encode_internal(w, mu)
+        return new_memory, z_logvar
+    
+    def decode(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
+        return self.decoder(th.cat([z, mu], dim=-1))
+    
