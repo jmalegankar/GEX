@@ -89,7 +89,7 @@ class WynerVAE(nn.Module):
         z_mu = self.fc_mu(h)                       # (B, wyner_latent_dim)
         z_logvar = self.fc_logvar(h)               # (B, wyner_latent_dim)
 
-        new_memory = h.view(orig_shape)            # restore (B, 1, memory_dim)
+        new_memory = h.view(orig_shape)            # (B, 1, memory_dim)
         return new_memory, z_mu, z_logvar
 
     def encode(self, w: th.Tensor, mu: th.Tensor, skips: Optional[List[th.Tensor]] = None) -> Tuple[th.Tensor, th.Tensor]:
@@ -98,4 +98,18 @@ class WynerVAE(nn.Module):
     
     def decode(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
         return self.decoder(th.cat([z, mu], dim=-1))
+    
+    # i think we need a regular kl loss helper func 
+    # and reparameterization helper func for sampling z from (mu, logvar) during training
+    def forward():
+        pass
+    
+    # do we need separate loss for single step in for rollout?
+    # or just 
+    # kl = ...
+    # kl_next = ...
+    # recon = ...
+    # recon_next = ...
+    def loss():
+        pass
     
