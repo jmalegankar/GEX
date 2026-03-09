@@ -215,6 +215,8 @@ class HSWVimePPO(PPO):
                 intrinsic_rewards = self.intrinsic_scale * (wyner_loss.kl_loss)
                 intrinsic_rewards = intrinsic_rewards.view(-1).cpu().numpy()
 
+            assert rewards.shape == intrinsic_rewards.shape == (self.n_envs,), f"Reward shape mismatch: {rewards.shape} vs {intrinsic_rewards.shape}"
+
 
             self.num_timesteps += env.num_envs
 
