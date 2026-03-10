@@ -8,7 +8,7 @@ from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper
 from models.embeddings import CategoricalGridWithDirEmbedding
 from models.config import SCVAEConfig
 from models.vae import TransitionSCVAE
-from models.wyner import WynerVAE
+from models.wyner import WynerVAE, WynerIndependentVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
@@ -104,6 +104,8 @@ def parse_args():
                    help="Grid size (only used for door_button).")
     p.add_argument("--max_steps", type=int, default=200,
                    help="Max steps per episode.")
+    
+    p.add_argument("--render", action="store_true", help="Render the environment during training.")
 
     # Training 
     p.add_argument("--total_timesteps", type=int, default=500_000)
@@ -150,7 +152,7 @@ def main():
     args = parse_args()
 
     # 1. Build env factory
-    env_kwargs = {"max_steps": args.max_steps}
+    env_kwargs = {"max_steps": args.max_steps, "render_mode": "human" if args.render else None}
     if args.env == "door_button":
         env_kwargs["size"] = args.env_size
 
