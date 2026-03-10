@@ -152,7 +152,6 @@ class WynerVAE(nn.Module):
         return WynerLoss(kl_loss=kl_loss, recon_loss=recon_loss, recon_next_loss=recon_next_loss)
 
 class WynerIndependentVAE(nn.Module):
-class WynerVAE(nn.Module):
     def __init__(
         self,
         recon_dim: int,
