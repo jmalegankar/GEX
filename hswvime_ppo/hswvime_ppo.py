@@ -299,6 +299,10 @@ class HSWVimePPO(PPO):
         pg_losses, value_losses = [], []
         clip_fractions = []
         vae_losses, wyner_losses = [], []
+        vae_recon_losses, vae_kl_losses = [], []
+        wyner_recon_losses, wyner_kl_losses, wyner_recon_next_losses = [], [], []
+        grad_norms = []
+        all_approx_kl_divs = []
 
         continue_training = True
         # train for n_epochs epochs
@@ -381,6 +385,8 @@ class HSWVimePPO(PPO):
                 )
 
                 vae_losses.append(vae_loss.item())
+                vae_recon_losses.append(vae_loss_obj.recon_loss.item())
+                vae_kl_losses.append(vae_loss_obj.kl_loss.item())
 
                 wyner_out = self.policy.wyner_feature_extractor.forward(
                     rollout_data.memories,
@@ -400,7 +406,9 @@ class HSWVimePPO(PPO):
                 )
 
                 wyner_losses.append(wyner_loss.item())
-
+                wyner_recon_losses.append(wyner_loss_obj.recon_loss.mean().item())
+                wyner_kl_losses.append(wyner_loss_obj.kl_loss.mean().item())
+                wyner_recon_next_losses.append(wyner_loss_obj.recon_next_loss.mean().item())
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + vae_loss + wyner_loss
 
@@ -412,6 +420,7 @@ class HSWVimePPO(PPO):
                     log_ratio = log_prob - rollout_data.old_log_prob
                     approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
                     approx_kl_divs.append(approx_kl_div)
+                    all_approx_kl_divs.append(approx_kl_div)
 
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
                     continue_training = False
@@ -423,7 +432,8 @@ class HSWVimePPO(PPO):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
                 # Clip grad norm
-                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norm = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                grad_norms.append(grad_norm.item())
                 self.policy.optimizer.step()
 
             self._n_updates += 1
@@ -433,15 +443,25 @@ class HSWVimePPO(PPO):
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
         # Logs
+        self.logger.record("rewards/intrinsic_reward_mean", self.rollout_buffer.intrinsic_rewards.mean())
+        self.logger.record("rewards/intrinsic_reward_std", self.rollout_buffer.intrinsic_rewards.std())
+        self.logger.record("rewards/extrinsic_reward_mean", self.rollout_buffer.rewards.mean())
+        self.logger.record("rewards/extrinsic_reward_std", self.rollout_buffer.rewards.std())
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("train/vae_loss", np.mean(vae_losses))
-        self.logger.record("train/wyner_loss", np.mean(wyner_losses))
-        self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        self.logger.record("vae/vae_loss", np.mean(vae_losses))
+        self.logger.record("vae/vae_recon_loss", np.mean(vae_recon_losses))
+        self.logger.record("vae/vae_kl_loss", np.mean(vae_kl_losses))
+        self.logger.record("wyner/wyner_loss", np.mean(wyner_losses))
+        self.logger.record("wyner/wyner_recon_loss", np.mean(wyner_recon_losses))
+        self.logger.record("wyner/wyner_kl_loss", np.mean(wyner_kl_losses))
+        self.logger.record("wyner/wyner_recon_next_loss", np.mean(wyner_recon_next_losses))
+        self.logger.record("train/approx_kl", np.mean(all_approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/grad_norm", np.mean(grad_norms))
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
