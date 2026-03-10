@@ -152,3 +152,60 @@ class VectorToMapEmbedding(nn.Module):
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         x = self.proj(obs.float())
         return x.unsqueeze(-1).unsqueeze(-1)
+
+
+# ============================================================
+# 4) Categorical grid + direction embedding (DoorButtonEnv)
+# ============================================================
+
+# Input: (B, H, W, 4) int tensor — channels 0-2 are (object_type, color, state),
+#        channel 3 is the agent's direction (0-3), constant across all cells.
+class CategoricalGridWithDirEmbedding(nn.Module):
+    def __init__(
+        self,
+        n_object_types: int,
+        n_colors: int,
+        n_states: int,
+        obs_h: int,
+        obs_w: int,
+        embed_per_channel: int = 4,
+        n_dirs: int = 4,
+        dir_embed_dim: int = 4,
+    ):
+        super().__init__()
+
+        e = embed_per_channel
+        self.dir_embed_dim = dir_embed_dim
+
+        self.obj = nn.Embedding(n_object_types, e)
+        self.col = nn.Embedding(n_colors, e)
+        self.sta = nn.Embedding(n_states, e)
+        self.dir = nn.Embedding(n_dirs, dir_embed_dim)
+
+        out_ch = 3 * e + dir_embed_dim
+        self._meta = EmbeddingMeta(out_ch, obs_h, obs_w, True)
+
+    def meta(self) -> EmbeddingMeta:
+        return self._meta
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        obs = obs.long()                              # (B, H, W, 4)
+
+        # Embed the three image channels → each (B, H, W, e)
+        img_emb = torch.cat(
+            [
+                self.obj(obs[..., 0]),
+                self.col(obs[..., 1]),
+                self.sta(obs[..., 2]),
+            ],
+            dim=-1,
+        )                                             # (B, H, W, 3*e)
+        img_feat = img_emb.permute(0, 3, 1, 2).contiguous().float()  # (B, 3*e, H, W)
+
+        # Direction is constant per sample — read from any cell (0, 0)
+        direction = obs[:, 0, 0, 3]                  # (B,)
+        dir_emb = self.dir(direction).float()         # (B, dir_embed_dim)
+        H, W = obs.shape[1], obs.shape[2]
+        dir_feat = dir_emb[:, :, None, None].expand(-1, -1, H, W)  # (B, dir_embed_dim, H, W)
+
+        return torch.cat([img_feat, dir_feat], dim=1)  # (B, 3*e + dir_embed_dim, H, W)
