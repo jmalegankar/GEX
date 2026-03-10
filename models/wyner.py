@@ -101,6 +101,10 @@ class WynerVAE(nn.Module):
         self.mu_dim = mu_dim
         self.recon_dim = recon_dim
 
+        # joint encoder: separate projections summed -> GRU input
+        self.proj_t = nn.Linear(mu_dim, mu_dim)
+        self.proj_tp1 = nn.Linear(mu_dim, mu_dim)
+
         if self.state_tokens == 0 and self.latent_tokens == 1:
             self.gru = nn.GRUCell(input_size=mu_dim, hidden_size=latent_dim)
         else:
@@ -110,7 +114,14 @@ class WynerVAE(nn.Module):
         self.fc_logvar = nn.Linear(self.latent_dim, self.latent_dim)
         nn.init.zeros_(self.fc_logvar.bias)
 
-        self.decoder = WynerDecoder(
+        self.decoder_t = WynerDecoder(
+            latent_dim=self.latent_dim,
+            latent_tokens=self.latent_tokens,
+            mu_dim=self.mu_dim,
+            recon_dim=self.recon_dim,
+            decode_hidden=decode_hidden,
+        )
+        self.decoder_tp1 = WynerDecoder(
             latent_dim=self.latent_dim,
             latent_tokens=self.latent_tokens,
             mu_dim=self.mu_dim,
@@ -118,24 +129,57 @@ class WynerVAE(nn.Module):
             decode_hidden=decode_hidden,
         )
     
+    def _gru_step(
+        self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None,
+    ) -> th.Tensor:
+        # project mu and optionally mu_next, sum, and run GRU.
+        gru_input = self.proj_t(mu)
+        if mu_next is not None:
+            gru_input = gru_input + self.proj_tp1(mu_next)
+        h = self.gru(gru_input, w.squeeze(1))
+        return h
+    
     def encode(self, w: th.Tensor, mu: th.Tensor, skips: Optional[List[th.Tensor]] = None) -> Tuple[th.Tensor, th.Tensor]:
-        h = self.gru(mu, w.squeeze(1))
+        gru_input = self._gru_step(w, mu, None)
+        h = self.gru(gru_input, w.squeeze(1))
         z_mu = self.fc_mean(h)
         z_logvar = self.fc_logvar(h)
         return z_mu, z_logvar
     
     def decode(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
+        # i think just z is better
         return self.decoder(z, mu)
+
     
+    # def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None) -> WynerOutput:
+    #     z_mu, z_logvar = self.encode(w, mu, skips)
+
+    #     std = th.exp(0.5 * z_logvar)
+    #     eps = th.randn_like(std)
+    #     z = z_mu + eps * std
+
+    #     recon = self.decode(z, mu)
+    #     recon_next = self.decode(z, mu_next) if mu_next is not None else None
+    #     return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next)
     def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None) -> WynerOutput:
-        z_mu, z_logvar = self.encode(w, mu, skips)
-        std = th.exp(0.5 * z_logvar)
-        eps = th.randn_like(std)
-        z = z_mu + eps * std
-        recon = self.decode(z, mu)
-        recon_next = self.decode(z, mu_next) if mu_next is not None else None
+        h = self._gru_step(w, mu, mu_next)
+        z_mu = self.fc_mean(h)
+        z_logvar = self.fc_logvar(h)
+        
+        # Reparameterize
+        if self.training:
+            std = th.exp(0.5 * z_logvar)
+            z = z_mu + std * th.randn_like(std)
+        else:
+            z = z_mu
+
+        
+        recon = self.decoder_t(z)
+        recon_next = self.decoder_tp1(z) if mu_next is not None else None
+
         return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next)
-    
+
+
     def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor] = None, recon_next_target: Optional[th.Tensor] = None) -> WynerLoss:
         kl_loss = -0.5 * th.sum(1 + output.logvar - output.w.pow(2) - output.logvar.exp(), dim=-1)
 

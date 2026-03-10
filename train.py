@@ -11,6 +11,7 @@ from models.wyner import WynerVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
+import minigrid
 
 #Vocabulary sizes shared by both multigrid and minigrid
 N_OBJECT_TYPES = 12  
