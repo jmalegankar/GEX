@@ -15,12 +15,12 @@ def _mobius_add(a: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     ax   = (a * x).sum(-1, keepdim=True)
     num  = (1 + 2 * ax + x_sq) * a + (1 - a_sq) * x
     den  = 1 + 2 * ax + a_sq * x_sq
-    return F.normalize(num / (den + 1e-8), p=2, dim=-1)
+    return F.normalize(num / (den + 1e-8), p=2.0, dim=-1)
 
 
 @torch.jit.script
 def sc_sample(mu: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
-    xi = F.normalize(torch.randn_like(mu), p=2, dim=-1)
+    xi = F.normalize(torch.randn_like(mu), p=2.0, dim=-1)
     return _mobius_add(rho * mu, xi)
 
 
@@ -53,13 +53,14 @@ def _gauss_legendre_01(n: int, device: torch.device, dtype: torch.dtype) -> Tupl
     return t, w
 
 _LEGENDRE_POINTS: int = 64  # default for KL quadrature branch
-_LEGENDRE_TENSORS = _gauss_legendre_01(_LEGENDRE_POINTS, torch.device('cpu'), torch.float32)  # cached on CPU, moved to target device in function
+_LEGENDRE_TENSORS: Tuple[torch.Tensor, torch.Tensor] = _gauss_legendre_01(_LEGENDRE_POINTS, torch.device('cpu'), torch.float32)  # cached on CPU, moved to target device in function
 
 
 @torch.jit.script
 def _sc_kl_quadrature(
     rho: torch.Tensor,
     dim: int,
+    _tl: Tuple[torch.Tensor, torch.Tensor] = _LEGENDRE_TENSORS
 ) -> torch.Tensor:
     """
     Proposition 1 (paper §3.2.2): quadrature-based KL for ρ ≤ 0.9.
@@ -78,7 +79,7 @@ def _sc_kl_quadrature(
     d_minus_1     = float(dim - 1)
     alpha         = d_minus_1 / 2.0
 
-    t_gl, w_gl = _LEGENDRE_TENSORS
+    t_gl, w_gl = _tl
     if t_gl.device != device or t_gl.dtype != dtype:
         t_gl = t_gl.to(device=device, dtype=dtype)
         w_gl = w_gl.to(device=device, dtype=dtype)
@@ -109,7 +110,7 @@ def _sc_kl_quadrature(
 _RHO_ASYMP = 0.9
 
 @torch.jit.script
-def sc_kl_uniform(rho: torch.Tensor, dim: int) -> torch.Tensor:
+def sc_kl_uniform(rho: torch.Tensor, dim: int, _rho_asymptotic: float = _RHO_ASYMP) -> torch.Tensor:
     """
     KL( spCauchy_d(·|μ,ρ) ‖ Uniform(S^{d-1}) )
 
@@ -132,7 +133,7 @@ def sc_kl_uniform(rho: torch.Tensor, dim: int) -> torch.Tensor:
         rho = rho.unsqueeze(-1)
     rho = rho.clamp(0.0, 1.0 - 1e-7)
 
-    high_rho = rho > _RHO_ASYMP   # (B,1)
+    high_rho = rho > _rho_asymptotic   # (B,1)
     kl       = torch.zeros_like(rho)
 
     # ── Branch A: quadrature (ρ ≤ 0.9) ──────────────────────────

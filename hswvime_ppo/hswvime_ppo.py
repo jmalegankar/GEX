@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Any, ClassVar, TypeVar
+from typing import Any, TypeVar
 
 import numpy as np
 import torch as th
@@ -7,9 +7,8 @@ import torch.nn.functional as F
 from gymnasium import spaces
 
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.policies import BasePolicy
-from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import FloatSchedule, explained_variance, obs_as_tensor
+from stable_baselines3.common.type_aliases import GymEnv, Schedule
+from stable_baselines3.common.utils import explained_variance, obs_as_tensor
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3 import PPO
 
@@ -17,11 +16,11 @@ from .buffer import TransitionRolloutBuffer
 from .policies import HSWVIMEActorCriticPolicy
 
 
-from models.vae import VAEInterface, VAEOutput, VAELoss
-from models.wyner import WynerInterface, WynerOutput, WynerLoss
+from models.vae import VAEInterface, TransitionSCVAE
+from models.wyner import WynerInterface, WynerLoss, WynerVAE
 
 
-from typing import Optional, Tuple, Union, Type, Any
+from typing import Optional, Tuple, Union, Any
 
 SelfHSWVimePPO = TypeVar("SelfHSWVimePPO", bound="HSWVimePPO")
 
@@ -64,9 +63,9 @@ class HSWVimePPO(PPO):
         seed: Optional[int] = None,
         device: Union[th.device, str] = "auto",
         _init_setup_model: bool = True,
-        vae_features_extractor_class: VAEInterface  = None,
+        vae_features_extractor_class: VAEInterface  = TransitionSCVAE,
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        wyner_features_extractor_class: WynerInterface = None,
+        wyner_features_extractor_class: WynerInterface = WynerVAE,
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
     ):
         policy_kwargs = policy_kwargs or {}
@@ -215,6 +214,8 @@ class HSWVimePPO(PPO):
                 )
                 intrinsic_rewards = self.intrinsic_scale * (wyner_loss.kl_loss)
                 intrinsic_rewards = intrinsic_rewards.view(-1).cpu().numpy()
+
+            assert rewards.shape == intrinsic_rewards.shape == (self.n_envs,), f"Reward shape mismatch: {rewards.shape} vs {intrinsic_rewards.shape}"
 
 
             self.num_timesteps += env.num_envs
@@ -395,7 +396,7 @@ class HSWVimePPO(PPO):
 
                 wyner_loss = (
                     self.wyner_recon_coef * (wyner_loss_obj.recon_loss + wyner_loss_obj.recon_next_loss)
-                    + self.wyner_kl_coef * (wyner_loss_obj.kl_loss + wyner_loss_obj.kl_next_loss)
+                    + self.wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
                 )
 
                 wyner_losses.append(wyner_loss.item())
