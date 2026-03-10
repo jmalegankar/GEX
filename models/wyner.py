@@ -151,6 +151,37 @@ class WynerVAE(nn.Module):
 
         return WynerLoss(kl_loss=kl_loss, recon_loss=recon_loss, recon_next_loss=recon_next_loss)
 
+class WynerIndependentDecoder(nn.Module):
+    def __init__(
+        self,
+        latent_dim: int,
+        latent_tokens: int,
+        recon_dim: int,
+        decode_hidden: int = 128,
+    ):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.latent_tokens = latent_tokens
+        self.recon_dim = recon_dim
+        self.decode_hidden = decode_hidden
+
+        self.proj = nn.Linear(self.latent_dim, self.decode_hidden)
+        
+        self.fc1 = nn.Linear(self.decode_hidden * self.latent_tokens, self.decode_hidden)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(self.decode_hidden, self.decode_hidden)
+        self.fc_out = nn.Linear(self.decode_hidden, self.recon_dim)
+    
+    def forward(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
+        z_proj = self.proj(z)
+        z_proj = z_proj.view(z_proj.size(0), self.latent_tokens * self.decode_hidden)
+        x = self.fc1(z_proj)
+        x = self.relu(x)
+        x = self.fc2(x)
+        x = self.relu(x)
+        recon = self.fc_out(x)
+        return recon
+
 class WynerIndependentVAE(nn.Module):
     def __init__(
         self,
@@ -185,17 +216,15 @@ class WynerIndependentVAE(nn.Module):
         self.fc_logvar = nn.Linear(self.latent_dim, self.latent_dim)
         nn.init.zeros_(self.fc_logvar.bias)
 
-        self.decoder_t = WynerDecoder(
+        self.decoder_t = WynerIndependentDecoder(
             latent_dim=self.latent_dim,
             latent_tokens=self.latent_tokens,
-            mu_dim=self.mu_dim,
             recon_dim=self.recon_dim,
             decode_hidden=decode_hidden,
         )
-        self.decoder_tp1 = WynerDecoder(
+        self.decoder_tp1 = WynerIndependentDecoder(
             latent_dim=self.latent_dim,
             latent_tokens=self.latent_tokens,
-            mu_dim=self.mu_dim,
             recon_dim=self.recon_dim,
             decode_hidden=decode_hidden,
         )
@@ -217,7 +246,7 @@ class WynerIndependentVAE(nn.Module):
         return z_mu, z_logvar
     
     def decode(self, z: th.Tensor, mu: th.Tensor) -> th.Tensor:
-        recon = self.decoder_t(z)
+        recon = self.decoder_t(z, mu)
         return recon
     
     def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None) -> WynerOutput:
@@ -225,8 +254,8 @@ class WynerIndependentVAE(nn.Module):
         std = th.exp(0.5 * z_logvar)
         eps = th.randn_like(std)
         z = z_mu + eps * std
-        recon = self.decoder_t(z)
-        recon_next = self.decoder_tp1(z) if mu_next is not None else None
+        recon = self.decoder_t(z, mu)
+        recon_next = self.decoder_tp1(z, mu_next) if mu_next is not None else None
         return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next)
     
     def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor] = None, recon_next_target: Optional[th.Tensor] = None) -> WynerLoss:
