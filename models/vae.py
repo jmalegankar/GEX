@@ -127,7 +127,10 @@ class TransitionSCVAE(nn.Module):
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         h_s   = self.conv(self._embed(s_t))
         h_sn  = self.conv(self._embed(s_next))
-        a_emb = self.action_embed(a_t)
+        a = a_t.float()
+        if a.dim() == 1:
+            a = a.unsqueeze(-1)  # (B,) → (B, 1) for Discrete actions
+        a_emb = self.action_embed(a)
         return h_s, a_emb, h_sn
 
     def _build_target(

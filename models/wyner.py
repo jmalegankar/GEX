@@ -134,7 +134,7 @@ class WynerVAE(nn.Module):
         z = z_mu + eps * std
         recon = self.decode(z, mu)
         recon_next = self.decode(z, mu_next) if mu_next is not None else None
-        return WynerOutput(w=w, logvar=z_logvar, recon=recon, recon_next=recon_next)
+        return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next)
     
     def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor] = None, recon_next_target: Optional[th.Tensor] = None) -> WynerLoss:
         kl_loss = -0.5 * th.sum(1 + output.logvar - output.w.pow(2) - output.logvar.exp(), dim=-1)

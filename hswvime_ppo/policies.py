@@ -27,9 +27,9 @@ class HSWVIMEFeaturesExtractor(nn.Module):
         This corresponds to the number of units for the last layer.
     """
 
-    def __init__(self, wyner_dim: int, mu_dim: int):
+    def __init__(self, observation_space=None, *, wyner_dim: int, mu_dim: int):
         super().__init__()
-        self._features_dim = wyner_dim + mu_dim
+        self._features_dim = 2 * mu_dim  # attn_output(mu_dim) concat mu(mu_dim)
         self.wyner_dim = wyner_dim
         self.mu_dim = mu_dim
         self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True, kdim=wyner_dim, vdim=wyner_dim)
@@ -102,17 +102,13 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         optimizer_kwargs: Optional[dict[str, Any]] = None,
     ):
         assert share_features_extractor, "HSWVIME does not support separate feature extractors for policy and value networks"
+        # Store as plain attrs before super().__init__() — nn.Module is not yet
+        # initialised so we cannot assign nn.Module instances yet.
         self.vae_features_extractor_class = vae_features_extractor_class
-        self.vae_features_extractor_kwargs = vae_features_extractor_kwargs
+        self.vae_features_extractor_kwargs = vae_features_extractor_kwargs or {}
         self.wyner_features_extractor_class = wyner_features_extractor_class
-        self.wyner_features_extractor_kwargs = wyner_features_extractor_kwargs
-        if vae_features_extractor_kwargs is None:
-            self.vae_features_extractor_kwargs = {}
-        if wyner_features_extractor_kwargs is None:
-            self.wyner_features_extractor_kwargs = {}
-        
-        self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(**self.vae_features_extractor_kwargs)
-        self.wyner_feature_extractor: WynerInterface = self.wyner_features_extractor_class(**self.wyner_features_extractor_kwargs)
+        self.wyner_features_extractor_kwargs = wyner_features_extractor_kwargs or {}
+
         super().__init__(
             observation_space,
             action_space,
@@ -132,6 +128,9 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
         )
+        # Now that nn.Module.__init__() has run we can register submodules.
+        self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(**self.vae_features_extractor_kwargs)
+        self.wyner_feature_extractor: WynerInterface = self.wyner_features_extractor_class(**self.wyner_features_extractor_kwargs)
 
     def forward(
         self,
@@ -176,9 +175,11 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
         s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
         mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips)
-        features = self.feature_extractor(memory, mu)
-        return features, memory
+        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips)
+        # encode returns (B, latent_dim); restore the seq dim for storage and MHA
+        new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
+        features = self.features_extractor(new_memory, mu)
+        return features, new_memory
     
     def get_distribution(
         self,
@@ -210,13 +211,13 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         memory: th.Tensor,
         action: th.Tensor
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
         latent_vf = self.mlp_extractor.forward_critic(features)
         values = self.value_net(latent_vf)
         latent_pi = self.mlp_extractor.forward_actor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(action)
-        return values, log_prob, distribution.entropy()
+        return values, log_prob, distribution.entropy(), new_memory
     
     def predict(
         self,

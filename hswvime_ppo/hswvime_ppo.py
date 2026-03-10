@@ -395,7 +395,7 @@ class HSWVimePPO(PPO):
                 )
 
                 wyner_loss = (
-                    self.wyner_recon_coef * (wyner_loss_obj.recon_loss + wyner_loss_obj.recon_next_loss)
+                    self.wyner_recon_coef * (wyner_loss_obj.recon_loss.mean() + wyner_loss_obj.recon_next_loss.mean())
                     + self.wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
                 )
 
