@@ -44,17 +44,19 @@ N_STATES       = 3
 N_DIRS         = 4   
 
 
-def make_env_fn(env_name: str, view_size: int, env_kwargs: dict, render_mode: str = None):
+def make_env_fn(env_name: str, view_size: int, env_kwargs: dict):
     """Returns a callable that constructs one instance of the requested env."""
     if env_name == "door_button":
         def _fn():
             kwargs = dict(size=env_kwargs.get("size", 10), view_size=view_size, max_steps=env_kwargs.get("max_steps", 200))
+            render_mode = env_kwargs.get("render_mode", None)
             if render_mode is not None:
                 kwargs["render_mode"] = render_mode
             return DoorButtonTrainingWrapper(**kwargs)
     else:
         def _fn():
-            return MiniGridTrainingWrapper(gymnasium.make(env_name, render_mode=render_mode, **env_kwargs))
+            env_kwargs['agent_view_size'] = view_size
+            return MiniGridTrainingWrapper(gymnasium.make(env_name, **env_kwargs))
     return _fn
 
 
@@ -241,7 +243,7 @@ def main():
                 latent_dim=args.vae_latent_dim,
             ),
         },
-        wyner_features_extractor_class=WynerVAE,
+        wyner_features_extractor_class=WynerIndependentVAE,
         wyner_features_extractor_kwargs={
             "recon_dim":      recon_dim,
             "mu_dim":         args.vae_latent_dim,
