@@ -128,29 +128,15 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
             optimizer_class,
             optimizer_kwargs,
         )
-    def _build(self, lr_schedule: Schedule) -> None:
-        # build PPO networks + self.optimizer.
-        # at this point vae_feature_extractor / wyner_feature_extractor are not yet submodules,
-        # so self.optimizer correctly covers PPO params only.
-        super()._build(lr_schedule)
-
-        # register VAE and Wyner now , they become proper nn.Module submodules.
-        self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(
+    
+    def make_features_extractor(self):
+        self.vae_feature_extractor = self.vae_features_extractor_class(
             **self.vae_features_extractor_kwargs
         )
-        self.wyner_feature_extractor: WynerInterface = self.wyner_features_extractor_class(
+        self.wyner_feature_extractor = self.wyner_features_extractor_class(
             **self.wyner_features_extractor_kwargs
         )
-
-        # dedicated optimizer so their grads are zeroed and stepped independently.
-        #  TODO: expose aux_learning_rate param (e.g. 1e-3) VAE/Wyner benefit from
-        #  a higher LR than PPO since they do stable reconstruction, not noisy policy grad.
-        self.aux_optimizer = self.optimizer_class(
-            list(self.vae_feature_extractor.parameters()) +
-            list(self.wyner_feature_extractor.parameters()),
-            lr=lr_schedule(1),
-            **self.optimizer_kwargs,
-        )
+        return super().make_features_extractor()
 
     def forward(
         self,
