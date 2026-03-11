@@ -464,7 +464,6 @@ class HSWVimePPO(PPO):
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
-                self.policy.aux_optimizer.zero_grad()
                 loss.backward()
 
                 ppo_params = (list(self.policy.mlp_extractor.parameters()) +
@@ -483,7 +482,6 @@ class HSWVimePPO(PPO):
                 grad_norms.append(grad_norm.item())
 
                 self.policy.optimizer.step()
-                self.policy.aux_optimizer.step()
 
             self._n_updates += 1
             if not continue_training:
