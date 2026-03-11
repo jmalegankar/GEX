@@ -32,6 +32,9 @@ class SCVAEConfig:
     batch_size:       int        = 256
     epochs:           int        = 100
 
+    # ── Free bits ──────────────────────────────────────────────────
+    free_bits:        float      = 0.5   # min KL per sample (nats); 0 disables
+
     # ── KL annealing ───────────────────────────────────────────────
     kl_warmup_epochs: int        = 0     # beta=0 for this many epochs
     kl_ramp_epochs:   int        = 0     # linear ramp 0 → beta_target

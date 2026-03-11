@@ -90,6 +90,7 @@ class WynerVAE(nn.Module):
         decode_hidden: int = 128,
         state_dim: int = 0,
         state_tokens: int = 0,
+        free_bits: float = 0.5,
     ):
         super().__init__()
         assert latent_tokens >= 1, "Latent tokens must be at least 1."
@@ -100,12 +101,13 @@ class WynerVAE(nn.Module):
 
         self.mu_dim = mu_dim
         self.recon_dim = recon_dim
+        self.free_bits = free_bits
 
         if self.state_tokens == 0 and self.latent_tokens == 1:
             self.gru = nn.GRUCell(input_size=mu_dim, hidden_size=latent_dim)
         else:
             raise NotImplementedError("Only single token encoding/decoding is implemented for now.")
-        
+
         self.fc_mean = nn.Linear(self.latent_dim, self.latent_dim)
         self.fc_logvar = nn.Linear(self.latent_dim, self.latent_dim)
         nn.init.zeros_(self.fc_logvar.bias)
@@ -137,13 +139,14 @@ class WynerVAE(nn.Module):
         return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next)
     
     def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor] = None, recon_next_target: Optional[th.Tensor] = None) -> WynerLoss:
-        kl_loss = -0.5 * th.sum(1 + output.logvar - output.w.pow(2) - output.logvar.exp(), dim=-1)
+        kl_per_dim = -0.5 * (1 + output.logvar - output.w.pow(2) - output.logvar.exp())
+        kl_loss = kl_per_dim.clamp_min(self.free_bits).sum(dim=-1)
 
         if recon_target is not None:
             recon_loss = nn.functional.mse_loss(output.recon, recon_target, reduction='none').mean(dim=-1)
         else:
             recon_loss = None
-        
+
         if recon_next_target is not None and output.recon_next is not None:
             recon_next_loss = nn.functional.mse_loss(output.recon_next, recon_next_target, reduction='none').mean(dim=-1)
         else:
@@ -192,6 +195,7 @@ class WynerIndependentVAE(nn.Module):
         decode_hidden: int = 128,
         state_dim: int = 0,
         state_tokens: int = 0,
+        free_bits: float = 0.5,
     ):
         super().__init__()
         assert latent_tokens >= 1, "Latent tokens must be at least 1."
@@ -202,6 +206,7 @@ class WynerIndependentVAE(nn.Module):
 
         self.mu_dim = mu_dim
         self.recon_dim = recon_dim
+        self.free_bits = free_bits
 
         # joint encoder: separate projections summed -> GRU input
         self.proj_t = nn.Linear(mu_dim, mu_dim)
@@ -259,13 +264,14 @@ class WynerIndependentVAE(nn.Module):
         return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next)
     
     def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor] = None, recon_next_target: Optional[th.Tensor] = None) -> WynerLoss:
-        kl_loss = -0.5 * th.sum(1 + output.logvar - output.w.pow(2) - output.logvar.exp(), dim=-1)
+        kl_per_dim = -0.5 * (1 + output.logvar - output.w.pow(2) - output.logvar.exp())
+        kl_loss = kl_per_dim.clamp_min(self.free_bits).sum(dim=-1)
 
         if recon_target is not None:
             recon_loss = nn.functional.mse_loss(output.recon, recon_target, reduction='none').mean(dim=-1)
         else:
             recon_loss = None
-        
+
         if recon_next_target is not None and output.recon_next is not None:
             recon_next_loss = nn.functional.mse_loss(output.recon_next, recon_next_target, reduction='none').mean(dim=-1)
         else:
