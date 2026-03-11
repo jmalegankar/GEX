@@ -18,6 +18,7 @@ from .policies import HSWVIMEActorCriticPolicy
 
 from models.vae import VAEInterface, TransitionSCVAE
 from models.wyner import WynerInterface, WynerLoss, WynerVAE
+from models.episodic_memory import EpisodicMemoryInterface, BatchedNoveltyMemory
 
 
 from typing import Optional, Tuple, Union, Any
@@ -67,6 +68,9 @@ class HSWVimePPO(PPO):
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         wyner_features_extractor_class: WynerInterface = WynerVAE,
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
+        episodic_memory_class: type = BatchedNoveltyMemory,
+        episodic_memory_kwargs: Optional[dict[str, Any]] = None,
+        aux_max_grad_norm: float = 5.0,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"] = vae_features_extractor_class
@@ -117,6 +121,13 @@ class HSWVimePPO(PPO):
 
         self.null_action = null_action
 
+        self.episodic_memory_class = episodic_memory_class
+        self.episodic_memory_kwargs = episodic_memory_kwargs or {}
+        self._episodic_memory: Optional[EpisodicMemoryInterface] = None
+
+        self.aux_max_grad_norm = aux_max_grad_norm
+        # TODO: add aux_learning_rate param and forward via policy_kwargs when ready
+
         self._last_memory = None
         self._prev_last_obs = None
         self._prev_action = None
@@ -139,6 +150,12 @@ class HSWVimePPO(PPO):
         self._last_memory = th.zeros((self.n_envs, *self.memory_shape), device=self.device)
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
+
+        self._episodic_memory = self.episodic_memory_class(
+            n_envs=self.n_envs,
+            **self.episodic_memory_kwargs,
+        )
+
         return ret
 
     def collect_rollouts(
@@ -170,6 +187,9 @@ class HSWVimePPO(PPO):
 
         n_steps = 0
         rollout_buffer.reset()
+        _wyner_kl_log: list[float] = []
+        _episodic_novel_log: list[float] = []
+
         # Sample new weights for the state dependent exploration
         if self.use_sde:
             self.policy.reset_noise(env.num_envs)
@@ -212,8 +232,14 @@ class HSWVimePPO(PPO):
                 wyner_loss: WynerLoss = self.policy.wyner_feature_extractor.loss(
                     self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips),
                 )
-                intrinsic_rewards = self.intrinsic_scale * (wyner_loss.kl_loss)
-                intrinsic_rewards = intrinsic_rewards.view(-1).cpu().numpy()
+                wyner_kl = wyner_loss.kl_loss.view(-1).cpu()  # (n_envs,)
+
+                # Episodic bonus: 1.0 if hash bucket is novel this episode, else 0.0
+                episodic_bonus = self._episodic_memory.query_and_add(vae_tp1.mu)  # (n_envs,)
+
+                intrinsic_rewards = self.intrinsic_scale * (wyner_kl * episodic_bonus).numpy()
+                _wyner_kl_log.append(wyner_kl.mean().item())
+                _episodic_novel_log.append(episodic_bonus.mean().item())
 
             assert rewards.shape == intrinsic_rewards.shape == (self.n_envs,), f"Reward shape mismatch: {rewards.shape} vs {intrinsic_rewards.shape}"
 
@@ -268,12 +294,19 @@ class HSWVimePPO(PPO):
             self._last_memory.copy_(memory)  # type: ignore[call-overload]
             del memory
 
+            # Reset episodic memory for finished episodes
+            if dones.any():
+                self._episodic_memory.reset_envs(th.from_numpy(dones))
+
         with th.no_grad():
             # Compute value for the last timestep
             values = self.policy.predict_values(s_t, a_t, s_tp1, self._last_memory)  # type: ignore[arg-type]
             values = values.view(-1).cpu().numpy()
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
+
+        self.logger.record("intrinsic/wyner_kl_mean", np.mean(_wyner_kl_log))
+        self.logger.record("intrinsic/episodic_novel_frac", np.mean(_episodic_novel_log))
 
         callback.update_locals(locals())
 
@@ -412,7 +445,8 @@ class HSWVimePPO(PPO):
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + vae_loss + wyner_loss
 
-                # Calculate approximate form of reverse KL Divergence for early stopping
+
+                                # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html
@@ -430,11 +464,26 @@ class HSWVimePPO(PPO):
 
                 # Optimization step
                 self.policy.optimizer.zero_grad()
+                self.policy.aux_optimizer.zero_grad()
                 loss.backward()
-                # Clip grad norm
-                grad_norm = th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+
+                ppo_params = (list(self.policy.mlp_extractor.parameters()) +
+                              list(self.policy.value_net.parameters()) +
+                              list(self.policy.action_net.parameters()))
+                vae_params = list(self.policy.vae_feature_extractor.parameters())
+                wyner_params = list(self.policy.wyner_feature_extractor.parameters())
+
+                for name, params in [("ppo", ppo_params), ("vae", vae_params), ("wyner", wyner_params)]:
+                    total = th.nn.utils.clip_grad_norm_(params, float("inf"))  # measure only
+                    self.logger.record(f"debug/{name}_grad_norm", total.item())
+
+                # Independent clipping: PPO and aux models clip against their own norms
+                grad_norm = th.nn.utils.clip_grad_norm_(ppo_params, self.max_grad_norm)
+                th.nn.utils.clip_grad_norm_(vae_params + wyner_params, self.aux_max_grad_norm)
                 grad_norms.append(grad_norm.item())
+
                 self.policy.optimizer.step()
+                self.policy.aux_optimizer.step()
 
             self._n_updates += 1
             if not continue_training:

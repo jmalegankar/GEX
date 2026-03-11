@@ -7,6 +7,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper
 from models.embeddings import CategoricalGridWithDirEmbedding
 from models.config import SCVAEConfig
+from models.episodic_memory import BatchedNoveltyMemory
 from models.vae import TransitionSCVAE
 from models.wyner import WynerVAE, WynerIndependentVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
@@ -250,6 +251,11 @@ def main():
             "latent_dim":     args.wyner_latent_dim,
             "latent_tokens":  1,
             "decode_hidden":  args.wyner_decode_hidden,
+        },
+        episodic_memory_class=BatchedNoveltyMemory,
+        episodic_memory_kwargs={
+            "input_dim": args.vae_latent_dim,
+            "hash_dim": 63,  # Max hash_dim for safe int64 bit-packing
         },
         tensorboard_log=args.tensorboard_log,
         verbose=args.verbose,
