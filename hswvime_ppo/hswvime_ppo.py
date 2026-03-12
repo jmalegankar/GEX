@@ -70,7 +70,7 @@ class HSWVimePPO(PPO):
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         episodic_memory_class: type = BatchedNoveltyMemory,
         episodic_memory_kwargs: Optional[dict[str, Any]] = None,
-        aux_max_grad_norm: float = 5.0,
+        aux_max_grad_norm: float = 0.5,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"] = vae_features_extractor_class
@@ -446,7 +446,7 @@ class HSWVimePPO(PPO):
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + vae_loss + wyner_loss
 
 
-                                # Calculate approximate form of reverse KL Divergence for early stopping
+                # Calculate approximate form of reverse KL Divergence for early stopping
                 # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
                 # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
                 # and Schulman blog: http://joschu.net/blog/kl-approx.html

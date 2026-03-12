@@ -15,8 +15,8 @@ from typing import Any, Optional, Union, Tuple
 import typing
 
 
-from models.vae import VAEInterface
-from models.wyner import WynerInterface
+from models.vae import VAEInterface, TransitionSCVAE
+from models.wyner import WynerInterface, WynerVAE
 
 class HSWVIMEFeaturesExtractor(nn.Module):
     """
@@ -92,9 +92,9 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         squash_output: bool = False,
         features_extractor_class: type[HSWVIMEFeaturesExtractor] = HSWVIMEFeaturesExtractor,
         features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        vae_features_extractor_class: VAEInterface = None,
+        vae_features_extractor_class: VAEInterface = TransitionSCVAE,
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        wyner_features_extractor_class: WynerInterface = None,
+        wyner_features_extractor_class: WynerInterface = WynerVAE,
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
