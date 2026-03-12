@@ -72,7 +72,7 @@ class HSWVimePPO(PPO):
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         episodic_memory_class: type = BatchedNoveltyMemory,
         episodic_memory_kwargs: Optional[dict[str, Any]] = None,
-        aux_max_grad_norm: float = 5.0,
+        aux_max_grad_norm: float = .5,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"] = vae_features_extractor_class
@@ -235,6 +235,9 @@ class HSWVimePPO(PPO):
                 vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
                 wyner_loss: WynerLoss = self.policy.wyner_feature_extractor.loss(
                     self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips),
+                    recon_target=None,
+                    recon_next_target=None,
+                    w_prev=memory,        # memory is (B, 1, latent_dim); squeezed inside loss()
                 )
                 wyner_kl = wyner_loss.kl_loss.view(-1).cpu()  # (n_envs,)
 
@@ -443,6 +446,7 @@ class HSWVimePPO(PPO):
                     wyner_out,
                     recon_target=vae_t.recon_target,
                     recon_next_target=vae_tp1.recon_target,
+                    w_prev=rollout_data.memories,   # (B, 1, latent_dim); squeezed inside loss()
                 )
 
                 wyner_loss = (

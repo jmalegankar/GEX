@@ -112,23 +112,23 @@ def parse_args():
 
     # Training 
     p.add_argument("--total_timesteps", type=int, default=500_000)
-    p.add_argument("--n_envs",          type=int, default=4)
-    p.add_argument("--n_steps",         type=int, default=512,
+    p.add_argument("--n_envs",          type=int, default=8)
+    p.add_argument("--n_steps",         type=int, default=1024,
                    help="Steps per env per rollout (total = n_steps * n_envs).")
-    p.add_argument("--batch_size",      type=int, default=256)
-    p.add_argument("--n_epochs",        type=int, default=4)
+    p.add_argument("--batch_size",      type=int, default=512)
+    p.add_argument("--n_epochs",        type=int, default=2)
     p.add_argument("--lr",              type=float, default=3e-4)
     p.add_argument("--gamma",           type=float, default=0.99)
     p.add_argument("--gae_lambda",      type=float, default=0.95)
-    p.add_argument("--ent_coef",        type=float, default=0.01)
+    p.add_argument("--ent_coef",        type=float, default=0.02)
     p.add_argument("--seed",            type=int,   default=0)
     p.add_argument("--device",          type=str,   default="auto")
 
     # Loss coefficients 
     p.add_argument("--vae_recon_coef",  type=float, default=1.0)
-    p.add_argument("--vae_kl_coef",     type=float, default=0.01)
+    p.add_argument("--vae_kl_coef",     type=float, default=0.1)
     p.add_argument("--wyner_recon_coef",type=float, default=1.0)
-    p.add_argument("--wyner_kl_coef",   type=float, default=0.01)
+    p.add_argument("--wyner_kl_coef",   type=float, default=0.1)
     p.add_argument("--intrinsic_scale", type=float, default=1.0)
 
     # Model architecture 
@@ -255,7 +255,7 @@ def main():
         episodic_memory_class=BatchedNoveltyMemory,
         episodic_memory_kwargs={
             "input_dim": args.vae_latent_dim,
-            "hash_dim": 63,  # Max hash_dim for safe int64 bit-packing
+            "hash_dim": 8,
         },
         tensorboard_log=args.tensorboard_log,
         verbose=args.verbose,
