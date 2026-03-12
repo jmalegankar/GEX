@@ -9,73 +9,50 @@ from stable_baselines3.common.distributions import Distribution
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import Schedule
 
-
 from typing import Any, Optional, Union, Tuple
 
-import typing
-
-
 from models.vae import VAEInterface, TransitionSCVAE
-from models.wyner import WynerInterface, WynerVAE
+from models.wyner import WynerVAE
+
 
 class HSWVIMEFeaturesExtractor(nn.Module):
     """
-    HSWVIME features extractor.
+    Policy feature extractor.
 
-    :param observation_space: The observation space
-    :param features_dim: The number of features extracted.
-        This corresponds to the number of units for the last layer.
+    Concatenates the Wyner latent z_t (common cause of past/future) with
+    the current SCVAE latent mu_t (immediate observation encoding).
+
+        features_t = concat( sg(z_t), sg(mu_t) )   shape: (B, wyner_dim + mu_dim)
+
+    Both inputs are stop-gradiented before concatenation. The policy MLP
+    trains on these features via PPO loss, but PPO gradients must not reach
+    the WynerVAE or SCVAE — those are updated by their own dedicated losses.
+
+    Why not attention here:
+        The old MHA attended mu_t over the Wyner latent, trying to extract
+        memory-like context from w_t. That role is now properly handled by
+        h_slow inside the WynerVAE. z_t IS the distilled common-cause
+        representation; concatenating it with mu_t gives the policy both
+        "what is happening now" (mu_t) and "what is causally happening"
+        (z_t, which was forced to explain both past and future).
     """
 
     def __init__(self, observation_space=None, *, wyner_dim: int, mu_dim: int):
         super().__init__()
-        self._features_dim = 2 * mu_dim  # attn_output(mu_dim) concat mu(mu_dim)
+        self._features_dim = wyner_dim + mu_dim
         self.wyner_dim = wyner_dim
         self.mu_dim = mu_dim
-        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True, kdim=wyner_dim, vdim=wyner_dim)
-    
+
     @property
     def features_dim(self) -> int:
         return self._features_dim
-        
-    @th.jit.export
-    def forward(self, wyner_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
-        mu_features = mu_features.view(-1, 1, self.mu_dim) # Make it (batch_size, 1, mu_dim)
-        attn_output, _ = self.attn(mu_features, wyner_features, wyner_features, need_weights = False) # Query is mu, key and value are wyner
-        x = th.cat((mu_features, attn_output), dim=-1).squeeze(1) # Concatenate along the feature dimension
-        return x
+
+    def forward(self, z_t: th.Tensor, mu_t: th.Tensor) -> th.Tensor:
+        # Both already detached by extract_features — assert defensively
+        return th.cat([z_t, mu_t], dim=-1)   # (B, wyner_dim + mu_dim)
+
 
 class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
-    """
-    Policy class for actor-critic algorithms (has both policy and value prediction).
-    Used by A2C, PPO and the likes.
-
-    :param observation_space: Observation space
-    :param action_space: Action space
-    :param lr_schedule: Learning rate schedule (could be constant)
-    :param net_arch: The specification of the policy and value networks.
-    :param activation_fn: Activation function
-    :param ortho_init: Whether to use or not orthogonal initialization
-    :param use_sde: Whether to use State Dependent Exploration or not
-    :param log_std_init: Initial value for the log standard deviation
-    :param full_std: Whether to use (n_features x n_actions) parameters
-        for the std instead of only (n_features,) when using gSDE
-    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
-        a positive standard deviation (cf paper). It allows to keep variance
-        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
-    :param squash_output: Whether to squash the output using a tanh function,
-        this allows to ensure boundaries when using gSDE.
-    :param features_extractor_class: Features extractor to use.
-    :param features_extractor_kwargs: Keyword arguments
-        to pass to the features extractor.
-    :param share_features_extractor: If True, the features extractor is shared between the policy and value networks.
-    :param normalize_images: Whether to normalize images or not,
-         dividing by 255.0 (True by default)
-    :param optimizer_class: The optimizer to use,
-        ``th.optim.Adam`` by default
-    :param optimizer_kwargs: Additional keyword arguments,
-        excluding the learning rate, to pass to the optimizer
-    """
 
     def __init__(
         self,
@@ -94,41 +71,30 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         features_extractor_kwargs: Optional[dict[str, Any]] = None,
         vae_features_extractor_class: VAEInterface = TransitionSCVAE,
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        wyner_features_extractor_class: WynerInterface = WynerVAE,
+        wyner_features_extractor_class = WynerVAE,
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
     ):
-        assert share_features_extractor, "HSWVIME does not support separate feature extractors for policy and value networks"
-        # Store as plain attrs before super().__init__() — nn.Module is not yet
-        # initialised so we cannot assign nn.Module instances yet.
-        self.vae_features_extractor_class = vae_features_extractor_class
+        assert share_features_extractor, \
+            "HSWVIME does not support separate feature extractors for policy and value networks"
+
+        self.vae_features_extractor_class  = vae_features_extractor_class
         self.vae_features_extractor_kwargs = vae_features_extractor_kwargs or {}
-        self.wyner_features_extractor_class = wyner_features_extractor_class
+        self.wyner_features_extractor_class  = wyner_features_extractor_class
         self.wyner_features_extractor_kwargs = wyner_features_extractor_kwargs or {}
 
         super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            net_arch,
-            activation_fn,
-            ortho_init,
-            use_sde,
-            log_std_init,
-            full_std,
-            use_expln,
-            squash_output,
-            features_extractor_class,
-            features_extractor_kwargs,
-            share_features_extractor,
-            normalize_images,
-            optimizer_class,
-            optimizer_kwargs,
+            observation_space, action_space, lr_schedule,
+            net_arch, activation_fn, ortho_init, use_sde, log_std_init,
+            full_std, use_expln, squash_output,
+            features_extractor_class, features_extractor_kwargs,
+            share_features_extractor, normalize_images,
+            optimizer_class, optimizer_kwargs,
         )
-    
+
     def make_features_extractor(self):
         self.vae_feature_extractor = self.vae_features_extractor_class(
             **self.vae_features_extractor_kwargs
@@ -138,136 +104,126 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         )
         return super().make_features_extractor()
 
+    # ── Core feature extraction ──────────────────────────────────────────────
+
+    def extract_features(
+        self,
+        s_tm1:  th.Tensor,   # (B, *obs_shape)  previous obs
+        a_tm1:  th.Tensor,   # (B, act_dim)     previous action
+        s_t:    th.Tensor,   # (B, *obs_shape)  current obs
+        h_prev: th.Tensor,   # (B, context_dim) WynerVAE slow-path hidden state h_{t-1}
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Returns (features, h_t).
+
+        features = concat(sg(z_t), sg(mu_t))   — detached; PPO does not touch SCVAE/WynerVAE
+        h_t      = updated slow-path hidden state; stored in buffer as memory for next step
+
+        Gradient isolation:
+          - SCVAE is trained only by its own VAE loss (computed in train())
+          - WynerVAE is trained only by its own Wyner loss (computed in train())
+          - PPO loss sees only detached features
+        """
+        s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
+        s_t   = preprocess_obs(s_t,   self.observation_space, normalize_images=self.normalize_images)
+
+        # SCVAE encode: mu_t is the spherical Cauchy latent for the (t-1 → t) transition
+        mu_t, _, _ = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
+
+        # WynerVAE rollout: sample z_t from prior (mu_{t+1} unavailable at act time),
+        # update slow-path context.
+        # h_prev = h_{t-1}; h_t will be stored in buffer for next step.
+        z_t, h_t = self.wyner_feature_extractor.forward_rollout(mu_t, h_prev)
+
+        # Detach both before the policy MLP — PPO gradient stops here
+        features = self.features_extractor(z_t.detach(), mu_t.detach())
+        return features, h_t
+
+    # ── Policy interface ─────────────────────────────────────────────────────
+
     def forward(
         self,
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        deterministic: bool = False
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        """
-        Forward pass in all the networks (actor and critic)
-
-        :param s_tm1: Previous state
-        :param a_tm1: Previous action
-        :param s_t: Current state
-        :param deterministic: Whether to sample or use deterministic actions
-        :return: action, value and log probability of the action
-        """
-        # Preprocess the observation if needed
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
-        if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        # Evaluate the values for the given observations
-        values = self.value_net(latent_vf)
+        s_t:   th.Tensor,
+        h_prev: th.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        """Returns (actions, h_t, values, log_probs)."""
+        features, h_t = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
+        latent_pi, latent_vf = self.mlp_extractor(features)
+        values       = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
-        actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
-        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
-        return actions, memory, values, log_prob
-    
-    def extract_features(
-        self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor
-    ) -> Tuple[th.Tensor, th.Tensor]:
-        s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
-        s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
-        mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips)
-        # encode returns (B, latent_dim); restore the seq dim for storage and MHA
-        new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
-        features = self.features_extractor(new_memory, mu)
-        return features, new_memory
-    
+        actions      = distribution.get_actions(deterministic=deterministic)
+        log_prob     = distribution.log_prob(actions)
+        actions      = actions.reshape((-1, *self.action_space.shape))
+        return actions, h_t, values, log_prob
+
     def get_distribution(
         self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor
+        s_tm1: th.Tensor, a_tm1: th.Tensor,
+        s_t: th.Tensor, h_prev: th.Tensor,
     ) -> Tuple[Distribution, th.Tensor]:
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, h_t = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
         latent_pi = self.mlp_extractor.forward_actor(features)
-        return self._get_action_dist_from_latent(latent_pi), memory
+        return self._get_action_dist_from_latent(latent_pi), h_t
 
     def predict_values(
         self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor
+        s_tm1: th.Tensor, a_tm1: th.Tensor,
+        s_t: th.Tensor, h_prev: th.Tensor,
     ) -> th.Tensor:
-        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
         latent_vf = self.mlp_extractor.forward_critic(features)
         return self.value_net(latent_vf)
 
     def evaluate_actions(
         self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        action: th.Tensor
+        s_tm1:  th.Tensor,
+        a_tm1:  th.Tensor,
+        s_t:    th.Tensor,
+        h_prev: th.Tensor,
+        action: th.Tensor,
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
-        latent_vf = self.mlp_extractor.forward_critic(features)
-        values = self.value_net(latent_vf)
-        latent_pi = self.mlp_extractor.forward_actor(features)
+        features, h_t = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
+        latent_vf    = self.mlp_extractor.forward_critic(features)
+        values       = self.value_net(latent_vf)
+        latent_pi    = self.mlp_extractor.forward_actor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
-        log_prob = distribution.log_prob(action)
-        return values, log_prob, distribution.entropy(), new_memory
-    
+        log_prob     = distribution.log_prob(action)
+        return values, log_prob, distribution.entropy(), h_t
+
     def predict(
         self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        deterministic: bool = False
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+        s_tm1: th.Tensor, a_tm1: th.Tensor,
+        s_t: th.Tensor, h_prev: th.Tensor,
+        deterministic: bool = False,
+    ) -> Tuple[th.Tensor, th.Tensor]:
         self.set_training_mode(False)
 
-        # Check for common mistake that the user does not mix Gym/VecEnv API
-        # Tuple obs are not supported by SB3, so we can safely do that check
         if isinstance(s_tm1, tuple) and len(s_tm1) == 2 and isinstance(s_tm1[1], dict):
             raise ValueError(
-                "You have passed a tuple to the predict() function instead of a Numpy array or a Dict. "
-                "You are probably mixing Gym API with SB3 VecEnv API: `obs, info = env.reset()` (Gym) "
-                "vs `obs = vec_env.reset()` (SB3 VecEnv). "
-                "See related issue https://github.com/DLR-RM/stable-baselines3/issues/1694 "
-                "and documentation for more information: https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html#vecenv-api-vs-gym-api"
+                "You have passed a tuple to predict() instead of an array. "
+                "You are likely mixing Gym API with SB3 VecEnv API."
             )
 
         s_tm1, vectorized_env = self.obs_to_tensor(s_tm1)
-        s_t, _ = self.obs_to_tensor(s_t)
-        a_tm1 = th.as_tensor(a_tm1, device=s_tm1.device)
+        s_t, _  = self.obs_to_tensor(s_t)
+        a_tm1   = th.as_tensor(a_tm1, device=s_tm1.device)
 
         with th.no_grad():
-            distribution, memory = self.get_distribution(s_tm1, a_tm1, s_t, memory)
+            distribution, h_t = self.get_distribution(s_tm1, a_tm1, s_t, h_prev)
             actions = distribution.get_actions(deterministic=deterministic)
-        
-        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
+
+        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))
 
         if isinstance(self.action_space, spaces.Box):
             if self.squash_output:
-                # Rescale to proper domain when using squashing
-                actions = self.unscale_action(actions)  # type: ignore[assignment, arg-type]
+                actions = self.unscale_action(actions)
             else:
-                # Actions could be on arbitrary scale, so clip the actions to avoid
-                # out of bound error (e.g. if sampling from a Gaussian distribution)
-                actions = np.clip(actions, self.action_space.low, self.action_space.high)  # type: ignore[assignment, arg-type]
+                actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
-        # Remove batch dimension if needed
         if not vectorized_env:
-            assert isinstance(actions, np.ndarray)
-            actions = actions.squeeze(axis=0)  # type: ignore[assignment]
+            actions = actions.squeeze(axis=0)
 
-        return actions, memory  # type: ignore[return-value]
+        return actions, h_t
