@@ -207,7 +207,7 @@ class TransitionSCVAE(nn.Module):
         l_kl = sc_kl_uniform(
             out.rho,
             self.latent_dim,
-        ).mean()
+        ).clamp_min(self.cfg.free_bits).mean()
 
         l_uniform = uniformity_loss(
             out.mu,

@@ -47,8 +47,10 @@ class HSWVimePPO(PPO):
         vf_coef: float = 0.5,
         vae_recon_coef: float = 1.0,
         wyner_recon_coef: float = 1.0,
-        vae_kl_coef: float = 0.01,
-        wyner_kl_coef: float = 0.01,
+        vae_kl_coef: float = 0.1,
+        wyner_kl_coef: float = 0.1,
+        kl_use_schedule: bool = False,
+        kl_anneal_steps: int = 50_000,
         intrinsic_scale: float = 1.0,
         max_grad_norm: float = 0.5,
         use_sde: bool = False,
@@ -114,6 +116,8 @@ class HSWVimePPO(PPO):
         self.wyner_recon_coef = wyner_recon_coef
         self.vae_kl_coef = vae_kl_coef
         self.wyner_kl_coef = wyner_kl_coef
+        self.kl_use_schedule = kl_use_schedule
+        self.kl_anneal_steps = kl_anneal_steps
 
         self.intrinsic_scale = intrinsic_scale
 
@@ -231,6 +235,9 @@ class HSWVimePPO(PPO):
                 vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
                 wyner_loss: WynerLoss = self.policy.wyner_feature_extractor.loss(
                     self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips),
+                    recon_target=None,
+                    recon_next_target=None,
+                    w_prev=memory,        # memory is (B, 1, latent_dim); squeezed inside loss()
                 )
                 wyner_kl = wyner_loss.kl_loss.view(-1).cpu()  # (n_envs,)
 
@@ -328,6 +335,14 @@ class HSWVimePPO(PPO):
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)  # type: ignore[operator]
 
+        if self.kl_use_schedule:
+            kl_progress = min(self.num_timesteps / max(self.kl_anneal_steps, 1), 1.0)
+            effective_vae_kl_coef = self.vae_kl_coef * kl_progress
+            effective_wyner_kl_coef = self.wyner_kl_coef * kl_progress
+        else:
+            effective_vae_kl_coef = self.vae_kl_coef
+            effective_wyner_kl_coef = self.wyner_kl_coef
+
         entropy_losses = []
         pg_losses, value_losses = [], []
         clip_fractions = []
@@ -414,7 +429,7 @@ class HSWVimePPO(PPO):
 
                 vae_loss = (
                     self.vae_recon_coef * vae_loss_obj.recon_loss
-                    + self.vae_kl_coef  * vae_loss_obj.kl_loss
+                    + effective_vae_kl_coef * vae_loss_obj.kl_loss
                 )
 
                 vae_losses.append(vae_loss.item())
@@ -431,11 +446,12 @@ class HSWVimePPO(PPO):
                     wyner_out,
                     recon_target=vae_t.recon_target,
                     recon_next_target=vae_tp1.recon_target,
+                    w_prev=rollout_data.memories,   # (B, 1, latent_dim); squeezed inside loss()
                 )
 
                 wyner_loss = (
                     self.wyner_recon_coef * (wyner_loss_obj.recon_loss.mean() + wyner_loss_obj.recon_next_loss.mean())
-                    + self.wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
+                    + effective_wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
                 )
 
                 wyner_losses.append(wyner_loss.item())
@@ -512,6 +528,8 @@ class HSWVimePPO(PPO):
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
 
+        self.logger.record("train/vae_kl_coef", effective_vae_kl_coef)
+        self.logger.record("train/wyner_kl_coef", effective_wyner_kl_coef)
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:

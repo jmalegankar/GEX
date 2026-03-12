@@ -156,3 +156,20 @@ def uniformity_loss(mu: torch.Tensor, t: float = 2.0) -> torch.Tensor:
     sq_dists = 2.0 - 2.0 * (mu @ mu.T)
     mask     = ~torch.eye(mu.size(0), dtype=torch.bool, device=mu.device)
     return torch.log(torch.exp(-t * sq_dists[mask]).mean())
+
+def kl_two_gaussians(
+    mu_q: torch.Tensor,
+    logvar_q: torch.Tensor,
+    mu_p: torch.Tensor,
+    logvar_p: torch.Tensor,
+) -> torch.Tensor:
+    """
+    KL[ N(mu_q, exp(logvar_q)) || N(mu_p, exp(logvar_p)) ] per dimension.
+    Returns shape (B, latent_dim).
+    """
+    return 0.5 * (
+        logvar_p - logvar_q
+        + logvar_q.exp() / logvar_p.exp()
+        + (mu_q - mu_p).pow(2) / logvar_p.exp()
+        - 1.0
+    )
