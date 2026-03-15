@@ -130,8 +130,14 @@ def parse_args():
     p.add_argument("--wyner_recon_coef",type=float, default=1.0)
     p.add_argument("--wyner_kl_coef",   type=float, default=0.01)
     p.add_argument("--intrinsic_scale", type=float, default=1.0)
+    p.add_argument("--kl_use_schedule", action="store_true",
+                   help="Enable KL coefficient annealing from 0 to target over kl_anneal_steps.")
+    p.add_argument("--kl_anneal_steps", type=int, default=50_000,
+                   help="Number of timesteps to anneal KL coefficient from 0 to target.")
+    p.add_argument("--free_bits",       type=float, default=0.5,
+                   help="Free bits threshold for Wyner KL (0 to disable).")
 
-    # Model architecture 
+    # Model architecture
     p.add_argument("--embed_per_channel", type=int, default=4)
     p.add_argument("--dir_embed_dim",     type=int, default=4)
     p.add_argument("--vae_latent_dim",    type=int, default=32)
@@ -139,6 +145,8 @@ def parse_args():
     p.add_argument("--vae_action_embed",  type=int, default=32)
     p.add_argument("--wyner_latent_dim",  type=int, default=64)
     p.add_argument("--wyner_decode_hidden", type=int, default=128)
+    p.add_argument("--pos_embed_dim",      type=int, default=16,
+                   help="Dimension of sinusoidal positional embedding for timestep in Wyner.")
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default=None)
@@ -231,6 +239,8 @@ def main():
         wyner_recon_coef=args.wyner_recon_coef,
         wyner_kl_coef=args.wyner_kl_coef,
         intrinsic_scale=args.intrinsic_scale,
+        kl_use_schedule=args.kl_use_schedule,
+        kl_anneal_steps=args.kl_anneal_steps,
         memory_shape=memory_shape,
         policy_kwargs=policy_kwargs,
         vae_features_extractor_class=TransitionSCVAE,
@@ -251,6 +261,8 @@ def main():
             "latent_dim":     args.wyner_latent_dim,
             "latent_tokens":  1,
             "decode_hidden":  args.wyner_decode_hidden,
+            "pos_embed_dim":  args.pos_embed_dim,
+            "free_bits":      args.free_bits,
         },
         episodic_memory_class=BatchedNoveltyMemory,
         episodic_memory_kwargs={

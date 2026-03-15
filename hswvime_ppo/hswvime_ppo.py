@@ -135,6 +135,7 @@ class HSWVimePPO(PPO):
         self._last_memory = None
         self._prev_last_obs = None
         self._prev_action = None
+        self._current_timestep = None
 
         if _init_setup_model:
             self._setup_model()
@@ -147,6 +148,8 @@ class HSWVimePPO(PPO):
             self._last_memory = None
         if force_reset:
             self._prev_action = None
+        if force_reset:
+            self._current_timestep = None
         return ret
     
     def _setup_learn(self, total_timesteps, callback = None, reset_num_timesteps = True, tb_log_name = "run", progress_bar = False):
@@ -154,6 +157,8 @@ class HSWVimePPO(PPO):
         self._last_memory = th.zeros((self.n_envs, *self.memory_shape), device=self.device)
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
+
+        self._current_timestep = np.zeros(self.n_envs, dtype=np.int64)
 
         self._episodic_memory = self.episodic_memory_class(
             n_envs=self.n_envs,
@@ -210,7 +215,8 @@ class HSWVimePPO(PPO):
                 s_tm1 = obs_as_tensor(self._prev_last_obs, self.device)  # type: ignore[arg-type]
                 a_tm1 = obs_as_tensor(self._prev_action, self.device)  # type: ignore[arg-type]
                 s_t = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
-                actions, memory, values, log_probs = self.policy.forward(s_tm1, a_tm1, s_t, self._last_memory)
+                timestep_tensor = th.tensor(self._current_timestep, device=self.device, dtype=th.long)
+                actions, memory, values, log_probs = self.policy.forward(s_tm1, a_tm1, s_t, self._last_memory, timestep=timestep_tensor)
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -234,7 +240,7 @@ class HSWVimePPO(PPO):
                 a_t = obs_as_tensor(actions, self.device)
                 vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
                 wyner_loss: WynerLoss = self.policy.wyner_feature_extractor.loss(
-                    self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips),
+                    self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips, timestep=timestep_tensor),
                 )
                 wyner_kl = wyner_loss.kl_loss.view(-1).cpu()  # (n_envs,)
 
@@ -289,8 +295,16 @@ class HSWVimePPO(PPO):
                 log_probs,
                 self._last_memory,  # type: ignore[call-overload]
                 self._prev_action,  # type: ignore[arg-type]
+                self._current_timestep,
                 intrinsic_rewards,
             )
+
+            # Increment timestep counter, then reset for finished episodes
+            self._current_timestep += 1
+            for idx, done in enumerate(dones):
+                if done:
+                    self._current_timestep[idx] = 0
+
             self._prev_last_obs = self._last_obs  # type: ignore[assignment]
             self._prev_action = actions
             self._last_obs = new_obs  # type: ignore[assignment]
@@ -366,6 +380,7 @@ class HSWVimePPO(PPO):
                     rollout_data.observations,        # s_t
                     rollout_data.memories,            # memory at t
                     actions,
+                    timestep=rollout_data.timesteps.long(),
                 )
                 values = values.flatten()
                 # Normalize advantage
@@ -438,6 +453,7 @@ class HSWVimePPO(PPO):
                     vae_t.mu,
                     vae_tp1.mu,
                     vae_t.skips,
+                    timestep=rollout_data.timesteps.long(),
                 )
                 wyner_loss_obj = self.policy.wyner_feature_extractor.loss(
                     wyner_out,

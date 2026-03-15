@@ -14,6 +14,7 @@ class RolloutBufferSamples(NamedTuple):
     memories: th.Tensor
     actions: th.Tensor
     prev_actions: th.Tensor
+    timesteps: th.Tensor
     old_values: th.Tensor
     old_log_prob: th.Tensor
     advantages: th.Tensor
@@ -37,6 +38,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
     prev_actions: np.ndarray
     next_observations: np.ndarray
     prev_observations: np.ndarray
+    timesteps: np.ndarray
     intrinsic_rewards: np.ndarray
     _last_values: np.ndarray
     _dones: np.ndarray
@@ -57,6 +59,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
         # Will be initialized in reset()
         self.next_observations = None
         self.prev_observations = None
+        self.timesteps = None
         self.intrinsic_rewards = None
         self.memories = None
         self.prev_actions = None
@@ -86,6 +89,10 @@ class TransitionRolloutBuffer(RolloutBuffer):
         self.memories = np.zeros(
             (self.buffer_size, self.n_envs, *self.memory_shape),
             dtype=np.float32,
+        )
+        self.timesteps = np.zeros(
+            (self.buffer_size, self.n_envs),
+            dtype=np.int64,
         )
         self.intrinsic_rewards = np.zeros(
             (self.buffer_size, self.n_envs),
@@ -148,6 +155,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
         log_prob: th.Tensor,
         memory: th.Tensor,
         prev_action: np.ndarray,
+        timestep: Optional[np.ndarray] = None,
         intrinsic_reward: Optional[np.ndarray] = None,
     ) -> None:
         """
@@ -174,6 +182,8 @@ class TransitionRolloutBuffer(RolloutBuffer):
         self.next_observations[self.pos] = np.array(next_obs)
         self.prev_observations[self.pos] = np.array(prev_obs)
         self.memories[self.pos] = memory.clone().cpu().numpy()
+        if timestep is not None:
+            self.timesteps[self.pos] = np.array(timestep)
         if intrinsic_reward is not None:
             self.intrinsic_rewards[self.pos] = intrinsic_reward
         
@@ -194,6 +204,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
                 "memories",
                 "actions",
                 "prev_actions",
+                "timesteps",
                 "values",
                 "log_probs",
                 "advantages",
@@ -226,6 +237,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
             # Cast to float32 (backward compatible), this would lead to RuntimeError for MultiBinary space
             self.actions[batch_inds].astype(np.float32, copy=False),
             self.prev_actions[batch_inds].astype(np.float32, copy=False),
+            self.timesteps[batch_inds],
             self.values[batch_inds].flatten(),
             self.log_probs[batch_inds].flatten(),
             self.advantages[batch_inds].flatten(),

@@ -144,7 +144,8 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
-        deterministic: bool = False
+        deterministic: bool = False,
+        timestep: Optional[th.Tensor] = None,
     ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
         Forward pass in all the networks (actor and critic)
@@ -153,10 +154,11 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         :param a_tm1: Previous action
         :param s_t: Current state
         :param deterministic: Whether to sample or use deterministic actions
+        :param timestep: Episode timestep indices (B,)
         :return: action, value and log probability of the action
         """
         # Preprocess the observation if needed
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
         if self.share_features_extractor:
             latent_pi, latent_vf = self.mlp_extractor(features)
         else:
@@ -176,12 +178,13 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
         s_t: th.Tensor,
-        memory: th.Tensor
+        memory: th.Tensor,
+        timestep: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor]:
         s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
         s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
         mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips)
+        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips, timestep=timestep)
         # encode returns (B, latent_dim); restore the seq dim for storage and MHA
         new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
         features = self.features_extractor(new_memory, mu)
@@ -192,9 +195,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
         s_t: th.Tensor,
-        memory: th.Tensor
+        memory: th.Tensor,
+        timestep: Optional[th.Tensor] = None,
     ) -> Tuple[Distribution, th.Tensor]:
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
         latent_pi = self.mlp_extractor.forward_actor(features)
         return self._get_action_dist_from_latent(latent_pi), memory
 
@@ -203,9 +207,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
         s_t: th.Tensor,
-        memory: th.Tensor
+        memory: th.Tensor,
+        timestep: Optional[th.Tensor] = None,
     ) -> th.Tensor:
-        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
         latent_vf = self.mlp_extractor.forward_critic(features)
         return self.value_net(latent_vf)
 
@@ -215,9 +220,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
-        action: th.Tensor
+        action: th.Tensor,
+        timestep: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory)
+        features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
         latent_vf = self.mlp_extractor.forward_critic(features)
         values = self.value_net(latent_vf)
         latent_pi = self.mlp_extractor.forward_actor(features)
