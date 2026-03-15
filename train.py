@@ -9,7 +9,7 @@ from models.embeddings import CategoricalGridWithDirEmbedding
 from models.config import SCVAEConfig
 from models.episodic_memory import BatchedNoveltyMemory
 from models.vae import TransitionSCVAE
-from models.wyner import WynerVAE, WynerConfig
+from models.wyner import WynerContextVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
@@ -93,24 +93,6 @@ def build_scvae_cfg(act_dim, action_embed_dim, conv_channels, hidden_dim, latent
     )
 
 
-def build_wyner_cfg(
-    mu_dim: int,
-    wyner_dim: int,
-    context_dim: int,
-    hidden_dim: int,
-    lambda_past: float,
-    lambda_future: float,
-    alpha_intrinsic: float,
-) -> WynerConfig:
-    return WynerConfig(
-        mu_dim=mu_dim,
-        wyner_dim=wyner_dim,
-        context_dim=context_dim,
-        hidden_dim=hidden_dim,
-        lambda_past=lambda_past,
-        lambda_future=lambda_future,
-        alpha_intrinsic=alpha_intrinsic,
-    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,17 +137,16 @@ def parse_args():
     p.add_argument("--vae_hidden_dim",    type=int, default=256)
     p.add_argument("--vae_action_embed",  type=int, default=32)
 
-    # WynerVAE architecture
-    # wyner_dim    : dimension of the Wyner latent z  (common cause bottleneck)
-    # context_dim  : GRU hidden state dimension (h_slow)
-    # wyner_hidden : MLP hidden dim for Prior / Posterior / Decoders
-    # lambda_past / lambda_future : reconstruction loss weights
-    p.add_argument("--wyner_dim",         type=int,   default=64)
-    p.add_argument("--context_dim",       type=int,   default=256)
-    p.add_argument("--wyner_hidden",      type=int,   default=256)
-    p.add_argument("--lambda_past",       type=float, default=1.0)
-    p.add_argument("--lambda_future",     type=float, default=2.0)
-    p.add_argument("--alpha_intrinsic",   type=float, default=1.0)
+    # WynerContextVAE architecture
+    # wyner_latent_dim : dimension of the Wyner latent z  (common cause bottleneck)
+    # context_dim      : cross-attention output dimension
+    # wyner_decode_hidden : MLP hidden dim for Prior / Posterior / Decoder
+    # mu_buffer_k      : sliding window size for mu_buffer
+    p.add_argument("--wyner_latent_dim",    type=int,   default=32)
+    p.add_argument("--context_dim",         type=int,   default=64)
+    p.add_argument("--wyner_decode_hidden", type=int,   default=128)
+    p.add_argument("--mu_buffer_k",         type=int,   default=64)
+    p.add_argument("--free_bits",           type=float, default=0.5)
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default=None)
@@ -214,21 +195,12 @@ def main():
         latent_dim       = args.vae_latent_dim,
     )
 
-    # WynerConfig is the single source of truth for all WynerVAE dimensions.
-    # mu_dim must equal scvae_cfg.latent_dim — WynerVAE reads SCVAE's output.
-    wyner_cfg = build_wyner_cfg(
-        mu_dim          = args.vae_latent_dim,   # must match SCVAE latent_dim
-        wyner_dim       = args.wyner_dim,
-        context_dim     = args.context_dim,
-        hidden_dim      = args.wyner_hidden,
-        lambda_past     = args.lambda_past,
-        lambda_future   = args.lambda_future,
-        alpha_intrinsic = args.alpha_intrinsic,
-    )
+    # memory_shape = (context_dim,) — one context_t vector per env per step.
+    # This is stored in the rollout buffer and passed as precomputed context.
+    memory_shape = (args.context_dim,)
 
-    # memory_shape = (context_dim,) — one h_slow vector per env per step.
-    # This is stored in the rollout buffer and passed as h_prev to forward_train.
-    memory_shape = (wyner_cfg.context_dim,)
+    # recon_dim: WynerContextVAE decoder reconstructs mu vectors of this size
+    recon_dim = args.vae_latent_dim
 
     # ── 3. Policy kwargs ──────────────────────────────────────────────────────
     # features_extractor_kwargs controls HSWVIMEFeaturesExtractor:
@@ -237,8 +209,8 @@ def main():
     policy_kwargs = {
         "features_extractor_class":  HSWVIMEFeaturesExtractor,
         "features_extractor_kwargs": {
-            "wyner_dim": wyner_cfg.wyner_dim,
-            "mu_dim":    wyner_cfg.mu_dim,
+            "wyner_dim": args.context_dim,       # context_t dim (was wyner_latent_dim)
+            "mu_dim":    args.vae_latent_dim,
         },
         "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
     }
@@ -269,8 +241,11 @@ def main():
         wyner_kl_coef    = args.wyner_kl_coef,
         intrinsic_scale  = args.intrinsic_scale,
 
-        # Memory: shape must match wyner_cfg.context_dim
-        memory_shape = memory_shape,
+        # Memory: shape must match context_dim
+        memory_shape   = memory_shape,
+        mu_buffer_k    = args.mu_buffer_k,
+        context_dim    = args.context_dim,
+        vae_latent_dim = args.vae_latent_dim,
 
         # Policy
         policy_kwargs = policy_kwargs,
@@ -282,14 +257,21 @@ def main():
             "cfg":       scvae_cfg,
         },
 
-        # WynerVAE: takes a single WynerConfig
-        wyner_features_extractor_class  = WynerVAE,
-        wyner_features_extractor_kwargs = {"cfg": wyner_cfg},
+        # WynerContextVAE: cross-attention over sliding window of cached mu values
+        wyner_features_extractor_class  = WynerContextVAE,
+        wyner_features_extractor_kwargs = {
+            "mu_dim":        args.vae_latent_dim,
+            "latent_dim":    args.wyner_latent_dim,
+            "recon_dim":     recon_dim,
+            "context_dim":   args.context_dim,
+            "decode_hidden": args.wyner_decode_hidden,
+            "free_bits":     args.free_bits,
+        },
 
         # Episodic memory: SimHash over mu_t for novelty bonus
         episodic_memory_class  = BatchedNoveltyMemory,
         episodic_memory_kwargs = {
-            "input_dim": wyner_cfg.mu_dim,
+            "input_dim": args.vae_latent_dim,
             "hash_dim":  8,
         },
 
@@ -304,9 +286,8 @@ def main():
         f"\nTraining on '{args.env}' for {args.total_timesteps:,} steps "
         f"across {args.n_envs} envs on '{args.device}'\n"
         f"  SCVAE:  latent={args.vae_latent_dim}  hidden={args.vae_hidden_dim}\n"
-        f"  Wyner:  z_dim={args.wyner_dim}  context={args.context_dim}"
-        f"  hidden={args.wyner_hidden}\n"
-        f"          λ_past={args.lambda_past}  λ_future={args.lambda_future}\n"
+        f"  WynerContext:  z_dim={args.wyner_latent_dim}  context={args.context_dim}"
+        f"  decode_hidden={args.wyner_decode_hidden}  mu_buffer_k={args.mu_buffer_k}\n"
         f"  Coeffs: vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}"
         f"  wyner_recon={args.wyner_recon_coef}  wyner_kl={args.wyner_kl_coef}"
         f"  intrinsic={args.intrinsic_scale}\n"

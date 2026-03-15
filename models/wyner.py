@@ -44,11 +44,12 @@ Why PosteriorNet sees mu_{t+1}:
     it degenerates into a standard VAE posterior.
 """
 
+import math
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -78,6 +79,7 @@ class WynerOutput:
         "mu_q", "logvar_q", "mu_p", "logvar_p",
         "z_t", "recon_past", "recon_future",
         "target_past", "target_future", "h_slow",
+        "prior_mu", "prior_logvar",
     )
 
     def __init__(
@@ -92,6 +94,8 @@ class WynerOutput:
         target_past:  th.Tensor,  # (B, mu_dim)     sg(mu_t)
         target_future:th.Tensor,  # (B, mu_dim)     sg(mu_{t+1})
         h_slow:       th.Tensor,  # (B, context_dim) updated slow-path hidden state
+        prior_mu:     Optional[th.Tensor] = None,   # (B, wyner_dim) learned prior mean
+        prior_logvar: Optional[th.Tensor] = None,   # (B, wyner_dim) learned prior log-var
     ):
         self.mu_q          = mu_q
         self.logvar_q      = logvar_q
@@ -103,6 +107,8 @@ class WynerOutput:
         self.target_past   = target_past
         self.target_future = target_future
         self.h_slow        = h_slow
+        self.prior_mu      = prior_mu
+        self.prior_logvar  = prior_logvar
 
 
 class WynerLoss:
@@ -441,3 +447,217 @@ class WynerVAE(nn.Module):
     def init_hidden(self, batch_size: int, device: th.device) -> th.Tensor:
         """Convenience wrapper; delegates to SlowPath."""
         return self.slow_path.init_hidden(batch_size, device)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WynerContextVAE — cross-attention over a sliding window of cached mu values
+# ─────────────────────────────────────────────────────────────────────────────
+
+class WynerContextVAE(nn.Module):
+    """
+    Replaces GRU-based WynerVAE with retrieval via cross-attention.
+
+    context_t   = CrossAttn(query=mu_t, key/value=sg(mu_buffer))
+    prior:        p(z | context_t)           — learned, causal (no access to mu_t)
+    posterior:    q(z | context_t, mu_t)     — informed by current transition
+    decoder:      p(recon | z)               — self-sufficient, NO mu or context
+    intrinsic:    KL(q || p)                 — replaces KL(q || N(0,I))
+    """
+
+    def __init__(
+        self,
+        mu_dim: int,
+        latent_dim: int,
+        recon_dim: int,
+        context_dim: int = 64,
+        n_heads: int = 4,
+        decode_hidden: int = 128,
+        free_bits: float = 0.5,
+    ):
+        super().__init__()
+        self.mu_dim = mu_dim
+        self.latent_dim = latent_dim
+        self.recon_dim = recon_dim
+        self.context_dim = context_dim
+        self.free_bits = free_bits
+
+        # ── Cross-attention: query=mu_t, key/value=mu_buffer ──
+        # Project mu_dim → context_dim for Q/K/V so MHA operates in context_dim space
+        self.query_proj = nn.Linear(mu_dim, context_dim)
+        self.kv_proj = nn.Linear(mu_dim, context_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=context_dim, num_heads=n_heads, batch_first=True,
+        )
+
+        # ── Prior: p(z | context_t) — no access to mu_t ──
+        self.prior_mu_head = nn.Sequential(
+            nn.Linear(context_dim, decode_hidden),
+            nn.SiLU(),
+            nn.Linear(decode_hidden, latent_dim),
+        )
+        self.prior_logvar_head = nn.Sequential(
+            nn.Linear(context_dim, decode_hidden),
+            nn.SiLU(),
+            nn.Linear(decode_hidden, latent_dim),
+        )
+
+        # ── Posterior: q(z | context_t, mu_t) ──
+        self.posterior_net = nn.Sequential(
+            nn.Linear(context_dim + mu_dim, decode_hidden),
+            nn.SiLU(),
+            nn.Linear(decode_hidden, decode_hidden),
+            nn.SiLU(),
+            nn.Linear(decode_hidden, latent_dim * 2),
+        )
+        nn.init.zeros_(self.posterior_net[-1].bias[latent_dim:])
+
+        # ── Decoder: p(recon | z) — ONLY z, no mu, no context ──
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_dim, decode_hidden),
+            nn.SiLU(),
+            nn.Linear(decode_hidden, decode_hidden),
+            nn.SiLU(),
+            nn.Linear(decode_hidden, recon_dim),
+        )
+
+    # ── Context computation ──────────────────────────────────────────────
+
+    def compute_context(self, mu_t: th.Tensor, mu_buffer: th.Tensor) -> th.Tensor:
+        """
+        Cross-attention over the sliding window of cached mu values.
+
+        mu_t:       (B, mu_dim)
+        mu_buffer:  (B, K, mu_dim)
+
+        Returns:    (B, context_dim)
+
+        Stop-gradient on mu_buffer is applied HERE — prevents implicit BPTT
+        and decoder shortcut collapse.
+        """
+        mu_buffer = mu_buffer.detach()  # LOAD-BEARING: no grad through buffer
+
+        query = self.query_proj(mu_t).unsqueeze(1)     # (B, 1, context_dim)
+        kv = self.kv_proj(mu_buffer)                   # (B, K, context_dim)
+
+        attn_out, _ = self.cross_attn(query, kv, kv)   # (B, 1, context_dim)
+        return attn_out.squeeze(1)                      # (B, context_dim)
+
+    # ── Encode ───────────────────────────────────────────────────────────
+
+    def encode(
+        self, context: th.Tensor, mu_t: th.Tensor
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        """
+        Returns (post_mu, post_logvar, prior_mu, prior_logvar).
+
+        Prior: from context only (causal — no access to mu_t).
+        Posterior: from concat(context, mu_t).
+        """
+        # Prior — context only
+        prior_mu = self.prior_mu_head(context)
+        prior_logvar = self.prior_logvar_head(context).clamp(-4, 4)
+
+        # Posterior — context + mu_t
+        post_input = th.cat([context, mu_t.detach()], dim=-1)
+        post_out = self.posterior_net(post_input)
+        post_mu, post_logvar = post_out.chunk(2, dim=-1)
+
+        return post_mu, post_logvar, prior_mu, prior_logvar
+
+    # ── Decode ───────────────────────────────────────────────────────────
+
+    def decode(self, z: th.Tensor) -> th.Tensor:
+        """Takes ONLY z — no mu, no context. Self-sufficiency is non-negotiable."""
+        return self.decoder(z)
+
+    # ── Forward ──────────────────────────────────────────────────────────
+
+    def forward(
+        self,
+        mu_t: th.Tensor,
+        mu_buffer: th.Tensor,
+        mu_next: Optional[th.Tensor] = None,
+    ) -> WynerOutput:
+        """
+        Full forward pass.
+
+        mu_t:       (B, mu_dim)      — current SCVAE latent
+        mu_buffer:  (B, K, mu_dim)   — sliding window of past mu's
+        mu_next:    (B, mu_dim)      — next SCVAE latent (training only)
+        """
+        context = self.compute_context(mu_t, mu_buffer)
+
+        # Posterior and prior for current transition
+        q_mu, q_lv, p_mu, p_lv = self.encode(context, mu_t)
+        z_t = reparameterize(q_mu, q_lv)
+        recon_past = self.decode(z_t)
+
+        # Future reconstruction (training only)
+        if mu_next is not None:
+            q_mu_next, q_lv_next, _, _ = self.encode(context, mu_next)
+            z_next = reparameterize(q_mu_next, q_lv_next)
+            recon_future = self.decode(z_next)
+        else:
+            recon_future = recon_past  # placeholder; not used in loss
+
+        return WynerOutput(
+            mu_q=q_mu,
+            logvar_q=q_lv,
+            mu_p=p_mu,
+            logvar_p=p_lv,
+            z_t=z_t,
+            recon_past=recon_past,
+            recon_future=recon_future,
+            target_past=mu_t.detach(),
+            target_future=mu_next.detach() if mu_next is not None else mu_t.detach(),
+            h_slow=context,  # context serves the role of h_slow for downstream
+            prior_mu=p_mu,
+            prior_logvar=p_lv,
+        )
+
+    # ── Loss ─────────────────────────────────────────────────────────────
+
+    def loss(
+        self, output: WynerOutput, recon_target: Optional[th.Tensor] = None,
+        recon_next_target: Optional[th.Tensor] = None,
+    ) -> WynerLoss:
+        """
+        KL(q || p_theta) — NOT KL(q || N(0,I)).
+        Free-bits clamp applied per dimension, then summed.
+        """
+        # KL per dim: 0.5 * (p_lv - q_lv + (q_lv.exp() + (q_mu - p_mu)^2) / p_lv.exp() - 1)
+        p_lv = output.logvar_p
+        q_lv = output.logvar_q
+        q_mu = output.mu_q
+        p_mu = output.mu_p
+
+        kl_per_dim = 0.5 * (
+            p_lv - q_lv
+            + (q_lv.exp() + (q_mu - p_mu).pow(2)) / p_lv.exp()
+            - 1.0
+        )
+        # Free-bits clamp per dimension
+        if self.free_bits > 0.0:
+            kl_per_dim = th.clamp(kl_per_dim, min=self.free_bits)
+        kl_per_sample = kl_per_dim.sum(dim=-1)  # (B,)
+
+        kl_loss = kl_per_sample.mean()
+
+        # Reconstruction losses
+        recon_past_target = recon_target if recon_target is not None else output.target_past
+        recon_past_loss = F.mse_loss(output.recon_past, recon_past_target)
+
+        recon_next_tgt = recon_next_target if recon_next_target is not None else output.target_future
+        recon_future_loss = F.mse_loss(output.recon_future, recon_next_tgt)
+
+        total = kl_loss + recon_past_loss + recon_future_loss
+
+        intrinsic_reward = kl_per_sample.detach()
+
+        return WynerLoss(
+            kl_loss=kl_loss,
+            recon_past_loss=recon_past_loss,
+            recon_future_loss=recon_future_loss,
+            total_loss=total,
+            intrinsic_reward=intrinsic_reward,
+        )

@@ -12,29 +12,21 @@ from stable_baselines3.common.type_aliases import Schedule
 from typing import Any, Optional, Union, Tuple
 
 from models.vae import VAEInterface, TransitionSCVAE
-from models.wyner import WynerVAE
+from models.wyner import WynerVAE, WynerContextVAE
 
 
 class HSWVIMEFeaturesExtractor(nn.Module):
     """
     Policy feature extractor.
 
-    Concatenates the Wyner latent z_t (common cause of past/future) with
+    Concatenates the cross-attention context (episodic memory summary) with
     the current SCVAE latent mu_t (immediate observation encoding).
 
-        features_t = concat( sg(z_t), sg(mu_t) )   shape: (B, wyner_dim + mu_dim)
+        features_t = concat( sg(context_t), sg(mu_t) )   shape: (B, wyner_dim + mu_dim)
 
     Both inputs are stop-gradiented before concatenation. The policy MLP
     trains on these features via PPO loss, but PPO gradients must not reach
-    the WynerVAE or SCVAE — those are updated by their own dedicated losses.
-
-    Why not attention here:
-        The old MHA attended mu_t over the Wyner latent, trying to extract
-        memory-like context from w_t. That role is now properly handled by
-        h_slow inside the WynerVAE. z_t IS the distilled common-cause
-        representation; concatenating it with mu_t gives the policy both
-        "what is happening now" (mu_t) and "what is causally happening"
-        (z_t, which was forced to explain both past and future).
+    the WynerContextVAE or SCVAE — those are updated by their own losses.
     """
 
     def __init__(self, observation_space=None, *, wyner_dim: int, mu_dim: int):
@@ -47,9 +39,9 @@ class HSWVIMEFeaturesExtractor(nn.Module):
     def features_dim(self) -> int:
         return self._features_dim
 
-    def forward(self, z_t: th.Tensor, mu_t: th.Tensor) -> th.Tensor:
-        # Both already detached by extract_features — assert defensively
-        return th.cat([z_t, mu_t], dim=-1)   # (B, wyner_dim + mu_dim)
+    def forward(self, context_t: th.Tensor, mu_t: th.Tensor) -> th.Tensor:
+        # Both already detached by extract_features
+        return th.cat([context_t, mu_t], dim=-1)   # (B, wyner_dim + mu_dim)
 
 
 class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
@@ -108,20 +100,20 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
 
     def extract_features(
         self,
-        s_tm1:  th.Tensor,   # (B, *obs_shape)  previous obs
-        a_tm1:  th.Tensor,   # (B, act_dim)     previous action
-        s_t:    th.Tensor,   # (B, *obs_shape)  current obs
-        h_prev: th.Tensor,   # (B, context_dim) WynerVAE slow-path hidden state h_{t-1}
+        s_tm1:    th.Tensor,   # (B, *obs_shape)  previous obs
+        a_tm1:    th.Tensor,   # (B, act_dim)     previous action
+        s_t:      th.Tensor,   # (B, *obs_shape)  current obs
+        context:  th.Tensor,   # (B, context_dim) precomputed cross-attention context
     ) -> Tuple[th.Tensor, th.Tensor]:
         """
-        Returns (features, h_t).
+        Returns (features, context).
 
-        features = concat(sg(z_t), sg(mu_t))   — detached; PPO does not touch SCVAE/WynerVAE
-        h_t      = updated slow-path hidden state; stored in buffer as memory for next step
+        features = concat(sg(context), sg(mu_t))  — detached; PPO does not touch SCVAE/WynerVAE
+        context is passed through unchanged (precomputed by collect_rollouts)
 
         Gradient isolation:
           - SCVAE is trained only by its own VAE loss (computed in train())
-          - WynerVAE is trained only by its own Wyner loss (computed in train())
+          - WynerContextVAE is trained only by its own Wyner loss (computed in train())
           - PPO loss sees only detached features
         """
         s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
@@ -130,14 +122,9 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         # SCVAE encode: mu_t is the spherical Cauchy latent for the (t-1 → t) transition
         mu_t, _, _ = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
 
-        # WynerVAE rollout: sample z_t from prior (mu_{t+1} unavailable at act time),
-        # update slow-path context.
-        # h_prev = h_{t-1}; h_t will be stored in buffer for next step.
-        z_t, h_t = self.wyner_feature_extractor.forward_rollout(mu_t, h_prev)
-
         # Detach both before the policy MLP — PPO gradient stops here
-        features = self.features_extractor(z_t.detach(), mu_t.detach())
-        return features, h_t
+        features = self.features_extractor(context.detach(), mu_t.detach())
+        return features, context
 
     # ── Policy interface ─────────────────────────────────────────────────────
 

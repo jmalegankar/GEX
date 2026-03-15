@@ -16,7 +16,7 @@ from .buffer import TransitionRolloutBuffer
 from .policies import HSWVIMEActorCriticPolicy
 
 from models.vae import VAEInterface, TransitionSCVAE
-from models.wyner import WynerVAE, WynerConfig, WynerLoss
+from models.wyner import WynerVAE, WynerConfig, WynerLoss, WynerContextVAE
 from models.episodic_memory import EpisodicMemoryInterface, BatchedNoveltyMemory
 
 SelfHSWVimePPO = TypeVar("SelfHSWVimePPO", bound="HSWVimePPO")
@@ -74,9 +74,11 @@ class HSWVimePPO(PPO):
         sde_sample_freq: int = -1,
         rollout_buffer_class: Optional[type[TransitionRolloutBuffer]] = TransitionRolloutBuffer,
         rollout_buffer_kwargs: Optional[dict[str, Any]] = None,
-        # memory_shape must equal (WynerConfig.context_dim,)
-        # e.g. memory_shape=(256,) for a context_dim=256 SlowPath
-        memory_shape: Tuple[int, ...] = (256,),
+        # memory_shape must equal (context_dim,) — stores context_t per step
+        memory_shape: Tuple[int, ...] = (64,),
+        mu_buffer_k: int = 64,
+        context_dim: int = 64,
+        vae_latent_dim: int = 32,
         target_kl: Optional[float] = None,
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
@@ -100,6 +102,7 @@ class HSWVimePPO(PPO):
 
         rollout_buffer_kwargs = rollout_buffer_kwargs or {}
         rollout_buffer_kwargs["memory_shape"] = memory_shape
+        rollout_buffer_kwargs["vae_latent_dim"] = vae_latent_dim
 
         super().__init__(
             policy=policy, env=env, learning_rate=learning_rate,
@@ -125,6 +128,9 @@ class HSWVimePPO(PPO):
         self.intrinsic_scale  = intrinsic_scale
         self.aux_max_grad_norm = aux_max_grad_norm
         self.memory_shape     = memory_shape
+        self.mu_buffer_k      = mu_buffer_k
+        self.context_dim      = context_dim
+        self.vae_latent_dim   = vae_latent_dim
         self.null_action      = null_action
 
         self.episodic_memory_class  = episodic_memory_class
@@ -133,6 +139,8 @@ class HSWVimePPO(PPO):
 
         # Persistent across rollouts; shape (n_envs, context_dim)
         self._last_memory: Optional[th.Tensor] = None
+        self._mu_buffer: Optional[th.Tensor] = None
+        self._episode_start_mu: Optional[th.Tensor] = None
         self._prev_last_obs = None
         self._prev_action   = None
 
@@ -144,9 +152,11 @@ class HSWVimePPO(PPO):
     def set_env(self, env, force_reset: bool = True):
         ret = super().set_env(env, force_reset)
         if force_reset:
-            self._prev_last_obs = None
-            self._last_memory   = None
-            self._prev_action   = None
+            self._prev_last_obs    = None
+            self._last_memory      = None
+            self._prev_action      = None
+            self._mu_buffer        = None
+            self._episode_start_mu = None
         return ret
 
     def _setup_learn(self, total_timesteps, callback=None, reset_num_timesteps=True,
@@ -154,8 +164,14 @@ class HSWVimePPO(PPO):
         ret = super()._setup_learn(
             total_timesteps, callback, reset_num_timesteps, tb_log_name, progress_bar
         )
-        # h_slow: (n_envs, context_dim)  — starts zeroed each learn() call
+        # context_t: (n_envs, context_dim) — starts zeroed each learn() call
         self._last_memory   = th.zeros((self.n_envs, *self.memory_shape), device=self.device)
+        self._mu_buffer     = th.zeros(
+            (self.n_envs, self.mu_buffer_k, self.vae_latent_dim), device=self.device
+        )
+        self._episode_start_mu = th.zeros(
+            (self.n_envs, self.vae_latent_dim), device=self.device
+        )
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action   = np.tile(self.null_action, (self.n_envs, 1))
 
@@ -200,9 +216,9 @@ class HSWVimePPO(PPO):
                 a_tm1 = obs_as_tensor(self._prev_action,   self.device)
                 s_t   = obs_as_tensor(self._last_obs,      self.device)
 
-                # Policy forward: internally runs forward_rollout(mu_t, h_{t-1})
-                # Returns h_t as the updated memory.
-                actions, h_t, values, log_probs = self.policy.forward(
+                # Policy forward: uses precomputed context_t as memory.
+                # Second return is the context passed through unchanged.
+                actions, _, values, log_probs = self.policy.forward(
                     s_tm1, a_tm1, s_t, self._last_memory
                 )
 
@@ -234,10 +250,18 @@ class HSWVimePPO(PPO):
                 # mu_{t+1}: SCVAE latent for (s_t → s_{t+1}) transition
                 vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
 
-                # Full Wyner forward: posterior sees both mu_t AND mu_{t+1}
-                # h_prev = h_{t-1} = self._last_memory
-                wyner_out = self.policy.wyner_feature_extractor.forward_train(
-                    mu_t, vae_tp1.mu, self._last_memory
+                # 1. Compute context BEFORE inserting mu_t (causal)
+                context_t = self.policy.wyner_feature_extractor.compute_context(
+                    vae_tp1.mu, self._mu_buffer
+                )  # (n_envs, context_dim)
+
+                # 2. Roll buffer and insert (detach — buffer should never carry grad)
+                self._mu_buffer = th.roll(self._mu_buffer, -1, dims=1)
+                self._mu_buffer[:, -1, :] = vae_tp1.mu.detach()
+
+                # 3. Intrinsic reward: KL(q || p) via forward + loss
+                wyner_out = self.policy.wyner_feature_extractor.forward(
+                    vae_tp1.mu, self._mu_buffer
                 )
                 wyner_l = self.policy.wyner_feature_extractor.loss(wyner_out)
 
@@ -267,11 +291,8 @@ class HSWVimePPO(PPO):
             # ── Episode-end handling ─────────────────────────────────────────
             #
             # Two cases for done envs:
-            #   1. TimeLimit truncation: bootstrap terminal value, then zero h.
-            #   2. Regular termination: just zero h.
-            # We zero h_t (not h_{t-1}) so the NEXT episode starts clean.
-            # self._last_memory (= h_{t-1}) is already stored in the buffer
-            # below, so resetting h_t here doesn't corrupt stored data.
+            #   1. TimeLimit truncation: bootstrap terminal value, then zero context.
+            #   2. Regular termination: just zero context + mu_buffer.
             for idx, done in enumerate(dones):
                 if done and infos[idx].get("terminal_observation") is not None \
                         and infos[idx].get("TimeLimit.truncated", False):
@@ -282,14 +303,26 @@ class HSWVimePPO(PPO):
                         ).item()
                     rewards[idx] += self.gamma * terminal_value
 
-            # Zero h_t for ALL done envs (truncated or not) before storing
+            # 4. On episode done: zero that env's mu_buffer, recompute episode_start_mu
+            for idx, done in enumerate(dones):
+                if done:
+                    self._mu_buffer[idx].zero_()
+                    # Encode (s_{t+1}, no-op, s_{t+1}) as the new episode's start anchor
+                    with th.no_grad():
+                        s_start = obs_as_tensor(new_obs[idx:idx+1], self.device)
+                        a_noop  = th.zeros(1, *self.null_action.shape, device=self.device)
+                        start_mu, _, _ = self.policy.vae_feature_extractor.encode(
+                            s_start, a_noop, s_start
+                        )
+                    self._episode_start_mu[idx] = start_mu.squeeze(0).detach()
+
+            # Zero context for ALL done envs (truncated or not) before storing
             if dones.any():
                 done_mask = th.from_numpy(dones).bool()
-                h_t[done_mask] = 0.0
+                context_t[done_mask] = 0.0
 
             # ── Store transition ─────────────────────────────────────────────
-            # self._last_memory = h_{t-1} — this is what gets stored as 'memories'
-            # h_t becomes h_{t-1} for the next step via _last_memory.copy_(h_t)
+            # self._last_memory stores context_t (precomputed cross-attention output)
             rollout_buffer.add(
                 self._last_obs,         # s_t
                 self._prev_last_obs,    # s_{t-1}
@@ -299,16 +332,17 @@ class HSWVimePPO(PPO):
                 self._last_episode_starts,
                 values,
                 log_probs,
-                self._last_memory,      # h_{t-1}: stored as 'memories' in buffer
+                self._last_memory,      # context_{t-1}: stored as 'memories' in buffer
                 self._prev_action,
                 intrinsic_rewards,
+                self._episode_start_mu.cpu().numpy(),  # episode_start_mu per env
             )
 
             self._prev_last_obs = self._last_obs
             self._prev_action   = actions_np
             self._last_obs      = new_obs
             self._last_episode_starts = dones
-            self._last_memory.copy_(h_t)  # advance: h_{t-1} ← h_t
+            self._last_memory.copy_(context_t)  # advance: store context_t for next step
 
             if dones.any():
                 self._episodic_memory.reset_envs(th.from_numpy(dones))
@@ -422,21 +456,17 @@ class HSWVimePPO(PPO):
                 vae_recon_losses.append(vae_loss_obj.recon_loss.item())
                 vae_kl_losses.append(vae_loss_obj.kl_loss.item())
 
-                # ── WynerVAE losses ──────────────────────────────────────────
+                # ── WynerContextVAE losses ────────────────────────────────────
                 #
-                # forward_train(mu_t, mu_{t+1}, h_{t-1}):
-                #   - h_{t-1} = rollout_data.memories  (stored h_prev from rollout)
-                #   - mu_t and mu_{t+1} are sg'd inside forward_train
-                #   - Posterior sees both mu_t AND mu_{t+1} (Wyner condition)
-                #   - Decoders see only z_t (self-sufficiency, Wyner bottleneck)
-                #
-                # The stored h_{t-1} may be slightly stale (GRU params changed
-                # since rollout) but this is the standard RSSM training pattern
-                # used by DreamerV3 and is empirically stable.
-                wyner_out = self.policy.wyner_feature_extractor.forward_train(
+                # Build a K=1 context buffer from episode_start_mu stored in buffer.
+                # This gives the prior a real anchor (first observation of each episode)
+                # without storing the full K-step buffer per transition.
+                episode_start_mu = rollout_data.episode_start_mus.unsqueeze(1)  # (B, 1, mu_dim)
+
+                wyner_out = self.policy.wyner_feature_extractor.forward(
                     vae_t.mu,               # mu_t
-                    vae_tp1.mu,             # mu_{t+1}
-                    rollout_data.memories,  # h_{t-1}
+                    episode_start_mu,       # K=1 buffer — real signal, cheap to store
+                    mu_next=vae_tp1.mu,     # mu_{t+1}
                 )
                 wyner_l = self.policy.wyner_feature_extractor.loss(wyner_out)
 
