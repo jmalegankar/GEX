@@ -474,11 +474,28 @@ class HSWVimePPO(PPO):
                 for idx in range(self.rollout_buffer.num_qa):
                     questions = rollout_data.questions[:, idx, ...]
                     recon_answers = self.policy.wyner_feature_extractor.decode(
-                        wyner_out.w,
+                        wyner_out.w + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar),
                         None,
                         timestep=questions,
                     )
                     qa_loss += F.mse_loss(recon_answers, rollout_data.answers[:, idx, ...])
+                
+                wyner_out = self.policy.wyner_feature_extractor.forward(
+                    wyner_out.w,
+                    vae_tp1.mu,
+                    None,
+                    vae_tp1.skips,
+                    timestep=rollout_data.timesteps.long()+1,
+                )
+
+                for idx in range(self.rollout_buffer.num_qa):
+                    questions = rollout_data.questions[:, idx, ...]
+                    recon_next_answers = self.policy.wyner_feature_extractor.decode(
+                        wyner_out.w + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar),
+                        None,
+                        timestep=questions,
+                    )
+                    wyner_loss_obj.recon_next_loss += F.mse_loss(recon_next_answers, rollout_data.answers[:, idx, ...])
 
                 wyner_loss = (
                     self.wyner_recon_coef * (

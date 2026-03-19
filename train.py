@@ -179,7 +179,7 @@ def main():
     _probe = env_fn()
     obs_h, obs_w, _ = _probe.observation_space.shape   # (H, W, 4)
     # Discrete actions are stored as raw indices (B, 1), not one-hot.
-    act_dim = 1
+    act_dim = _probe.action_space.n if isinstance(_probe.action_space, gymnasium.spaces.Discrete) else _probe.action_space.shape[0]
     _probe.close()
 
     vec_env = make_vec_env(env_fn, n_envs=args.n_envs, seed=args.seed)

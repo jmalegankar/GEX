@@ -87,10 +87,11 @@ class TransitionSCVAE(nn.Module):
         A = cfg.action_embed_dim
         H = cfg.hidden_dim
 
-        self.action_embed = nn.Sequential(
-            nn.Linear(cfg.act_dim, A),
-            nn.ReLU(),
-        )
+        # self.action_embed = nn.Sequential(
+        #     nn.Linear(cfg.act_dim, A),
+        #     nn.ReLU(),
+        # )
+        self.action_embed = nn.Embedding(cfg.act_dim, A)
 
         self.encoder_trunk = nn.Sequential(
             nn.Linear(2 * E + A, H),
@@ -132,10 +133,12 @@ class TransitionSCVAE(nn.Module):
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         h_s   = self.conv(self._embed(s_t))
         h_sn  = self.conv(self._embed(s_next))
-        a = a_t.float()
-        if a.dim() == 1:
-            a = a.unsqueeze(-1)  # (B,) → (B, 1) for Discrete actions
-        a_emb = self.action_embed(a)
+        # a = a_t.float()
+        # if a.dim() == 1:
+        #     a = a.unsqueeze(-1)  # (B,) → (B, 1) for Discrete actions
+        # Convert float back to int
+        a = a_t.long()
+        a_emb = self.action_embed(a).view(-1, self.cfg.action_embed_dim)
         return h_s, a_emb, h_sn
 
     def build_target(
