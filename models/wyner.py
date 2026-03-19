@@ -79,7 +79,7 @@ class WynerOutput:
         "mu_q", "logvar_q", "mu_p", "logvar_p",
         "z_t", "recon_past", "recon_future",
         "target_past", "target_future", "h_slow",
-        "prior_mu", "prior_logvar",
+        "prior_mu", "prior_logvar", "recon_prior",
     )
 
     def __init__(
@@ -96,6 +96,7 @@ class WynerOutput:
         h_slow:       th.Tensor,  # (B, context_dim) updated slow-path hidden state
         prior_mu:     Optional[th.Tensor] = None,   # (B, wyner_dim) learned prior mean
         prior_logvar: Optional[th.Tensor] = None,   # (B, wyner_dim) learned prior log-var
+        recon_prior:  Optional[th.Tensor] = None,   # (B, mu_dim)    DecoderPast(z_prior)
     ):
         self.mu_q          = mu_q
         self.logvar_q      = logvar_q
@@ -109,13 +110,14 @@ class WynerOutput:
         self.h_slow        = h_slow
         self.prior_mu      = prior_mu
         self.prior_logvar  = prior_logvar
+        self.recon_prior   = recon_prior
 
 
 class WynerLoss:
     """Holds all scalar loss components and the per-sample intrinsic reward."""
     __slots__ = (
         "kl_loss", "recon_past_loss", "recon_future_loss",
-        "total_loss", "intrinsic_reward",
+        "recon_prior_loss", "total_loss", "intrinsic_reward",
     )
 
     def __init__(
@@ -125,10 +127,12 @@ class WynerLoss:
         recon_future_loss: th.Tensor,  # scalar
         total_loss:        th.Tensor,  # scalar
         intrinsic_reward:  th.Tensor,  # (B,)  detached — no grad
+        recon_prior_loss:  Optional[th.Tensor] = None,  # scalar — prior's own recon signal
     ):
         self.kl_loss           = kl_loss
         self.recon_past_loss   = recon_past_loss
         self.recon_future_loss = recon_future_loss
+        self.recon_prior_loss  = recon_prior_loss
         self.total_loss        = total_loss
         self.intrinsic_reward  = intrinsic_reward
 
@@ -472,7 +476,7 @@ class WynerContextVAE(nn.Module):
         context_dim: int = 64,
         n_heads: int = 4,
         decode_hidden: int = 128,
-        free_bits: float = 0.5,
+        free_bits: float = 0.0,
     ):
         super().__init__()
         self.mu_dim = mu_dim
@@ -514,6 +518,8 @@ class WynerContextVAE(nn.Module):
         # ── Decoder: p(recon | z) — ONLY z, no mu, no context ──
         self.decoder = nn.Sequential(
             nn.Linear(latent_dim, decode_hidden),
+            nn.SiLU(),
+            nn.Linear(decode_hidden, decode_hidden),
             nn.SiLU(),
             nn.Linear(decode_hidden, decode_hidden),
             nn.SiLU(),
@@ -592,6 +598,11 @@ class WynerContextVAE(nn.Module):
         z_t = reparameterize(q_mu, q_lv)
         recon_past = self.decode(z_t)
 
+        # Prior reconstruction: sample from prior and decode.
+        # This gives the prior its own training signal independent of KL.
+        z_prior = reparameterize(p_mu, p_lv)
+        recon_prior = self.decode(z_prior)
+
         # Future reconstruction (training only)
         if mu_next is not None:
             q_mu_next, q_lv_next, _, _ = self.encode(context, mu_next)
@@ -610,9 +621,10 @@ class WynerContextVAE(nn.Module):
             recon_future=recon_future,
             target_past=mu_t.detach(),
             target_future=mu_next.detach() if mu_next is not None else mu_t.detach(),
-            h_slow=context,  # context serves the role of h_slow for downstream
+            h_slow=context,
             prior_mu=p_mu,
             prior_logvar=p_lv,
+            recon_prior=recon_prior,
         )
 
     # ── Loss ─────────────────────────────────────────────────────────────
@@ -622,18 +634,22 @@ class WynerContextVAE(nn.Module):
         recon_next_target: Optional[th.Tensor] = None,
     ) -> WynerLoss:
         """
-        KL(q || p_theta) — NOT KL(q || N(0,I)).
+        KL(q || sg(p_theta)) — prior params are detached in the KL computation.
+        The prior trains via its own reconstruction loss (recon_prior), not by
+        chasing the posterior through the KL term.
         Free-bits clamp applied per dimension, then summed.
         """
-        # KL per dim: 0.5 * (p_lv - q_lv + (q_lv.exp() + (q_mu - p_mu)^2) / p_lv.exp() - 1)
-        p_lv = output.logvar_p
         q_lv = output.logvar_q
         q_mu = output.mu_q
-        p_mu = output.mu_p
+
+        # Stop-gradient on prior params in KL: prevents prior/posterior mutual collapse.
+        # The prior learns to be predictive via recon_prior_loss instead.
+        p_mu_sg = output.mu_p.detach()
+        p_lv_sg = output.logvar_p.detach()
 
         kl_per_dim = 0.5 * (
-            p_lv - q_lv
-            + (q_lv.exp() + (q_mu - p_mu).pow(2)) / p_lv.exp()
+            p_lv_sg - q_lv
+            + (q_lv.exp() + (q_mu - p_mu_sg).pow(2)) / p_lv_sg.exp()
             - 1.0
         )
         # Free-bits clamp per dimension
@@ -643,14 +659,23 @@ class WynerContextVAE(nn.Module):
 
         kl_loss = kl_per_sample.mean()
 
-        # Reconstruction losses
+        # Posterior reconstruction losses
         recon_past_target = recon_target if recon_target is not None else output.target_past
         recon_past_loss = F.mse_loss(output.recon_past, recon_past_target)
 
         recon_next_tgt = recon_next_target if recon_next_target is not None else output.target_future
         recon_future_loss = F.mse_loss(output.recon_future, recon_next_tgt)
 
+        # Prior reconstruction loss: the prior's own training signal.
+        # decode(z_prior) should reconstruct mu_t — this trains the prior to be
+        # predictive of transitions from context alone.
+        recon_prior_loss = None
+        if output.recon_prior is not None:
+            recon_prior_loss = F.mse_loss(output.recon_prior, recon_past_target)
+
         total = kl_loss + recon_past_loss + recon_future_loss
+        if recon_prior_loss is not None:
+            total = total + recon_prior_loss
 
         intrinsic_reward = kl_per_sample.detach()
 
@@ -660,4 +685,5 @@ class WynerContextVAE(nn.Module):
             recon_future_loss=recon_future_loss,
             total_loss=total,
             intrinsic_reward=intrinsic_reward,
+            recon_prior_loss=recon_prior_loss,
         )

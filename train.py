@@ -128,7 +128,7 @@ def parse_args():
     p.add_argument("--vae_kl_coef",      type=float, default=0.1)
     p.add_argument("--wyner_recon_coef", type=float, default=1.0)
     p.add_argument("--wyner_kl_coef",    type=float, default=0.1)
-    p.add_argument("--intrinsic_scale",  type=float, default=1.0)
+    p.add_argument("--intrinsic_scale",  type=float, default=0.01)
 
     # SCVAE architecture
     p.add_argument("--embed_per_channel", type=int, default=4)
@@ -144,9 +144,13 @@ def parse_args():
     # mu_buffer_k      : sliding window size for mu_buffer
     p.add_argument("--wyner_latent_dim",    type=int,   default=32)
     p.add_argument("--context_dim",         type=int,   default=64)
-    p.add_argument("--wyner_decode_hidden", type=int,   default=128)
+    p.add_argument("--wyner_decode_hidden", type=int,   default=512)
     p.add_argument("--mu_buffer_k",         type=int,   default=64)
-    p.add_argument("--free_bits",           type=float, default=0.5)
+    p.add_argument("--free_bits",           type=float, default=0.0)
+
+    # Target EMA / aux optimizer
+    p.add_argument("--aux_lr",    type=float, default=3e-4)
+    p.add_argument("--ema_decay", type=float, default=0.995)
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default=None)
@@ -279,6 +283,8 @@ def main():
         verbose         = args.verbose,
         seed            = args.seed,
         device          = args.device,
+        aux_lr          = args.aux_lr,
+        ema_decay       = args.ema_decay,
     )
 
     # ── 5. Train ──────────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ from typing import Any, TypeVar, Optional, Tuple, Union
 
 import numpy as np
 import torch as th
+import torch.nn as nn
 import torch.nn.functional as F
 from gymnasium import spaces
 
@@ -93,6 +94,8 @@ class HSWVimePPO(PPO):
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         episodic_memory_class: type = BatchedNoveltyMemory,
         episodic_memory_kwargs: Optional[dict[str, Any]] = None,
+        aux_lr: float = 3e-4,
+        ema_decay: float = 0.995,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"]    = vae_features_extractor_class
@@ -133,9 +136,13 @@ class HSWVimePPO(PPO):
         self.vae_latent_dim   = vae_latent_dim
         self.null_action      = null_action
 
+        self.aux_lr    = aux_lr
+        self.ema_decay = ema_decay
+
         self.episodic_memory_class  = episodic_memory_class
         self.episodic_memory_kwargs = episodic_memory_kwargs or {}
         self._episodic_memory: Optional[EpisodicMemoryInterface] = None
+        self._target_vae: Optional[nn.Module] = None
 
         # Persistent across rollouts; shape (n_envs, context_dim)
         self._last_memory: Optional[th.Tensor] = None
@@ -144,10 +151,50 @@ class HSWVimePPO(PPO):
         self._prev_last_obs = None
         self._prev_action   = None
 
+        self.aux_optimizer: Optional[th.optim.Optimizer] = None
+
         if _init_setup_model:
             self._setup_model()
 
     # ── Setup / env reset ────────────────────────────────────────────────────
+
+    def _setup_model(self) -> None:
+        super()._setup_model()
+
+        # Split optimizers: PPO params get one Adam, VAE+Wyner get another.
+        # SB3 creates self.policy.optimizer over ALL policy parameters.
+        # We rebuild it to exclude aux params, then create a separate aux optimizer.
+        aux_param_ids = set(
+            id(p) for p in self.policy.vae_feature_extractor.parameters()
+        ) | set(
+            id(p) for p in self.policy.wyner_feature_extractor.parameters()
+        )
+
+        ppo_params = [p for p in self.policy.parameters() if id(p) not in aux_param_ids]
+        aux_params = [p for p in self.policy.parameters() if id(p) in aux_param_ids]
+
+        lr = self.lr_schedule(1)
+        self.policy.optimizer = self.policy.optimizer_class(
+            ppo_params, lr=lr, **self.policy.optimizer_kwargs
+        )
+        # Fixed LR for aux optimizer — not tied to PPO schedule
+        self.aux_optimizer = th.optim.Adam(aux_params, lr=self.aux_lr)
+
+        # Target SCVAE: EMA copy that produces stable mu targets for Wyner reconstruction.
+        # Without this, the SCVAE mu vectors shift every epoch, making Wyner's recon target
+        # non-stationary and preventing the decoder from learning.
+        self._target_vae = deepcopy(self.policy.vae_feature_extractor)
+        self._target_vae.requires_grad_(False)
+        self._target_vae.eval()
+
+    @th.no_grad()
+    def _update_target_vae(self):
+        """Polyak-average the live SCVAE into the target SCVAE."""
+        for p_live, p_tgt in zip(
+            self.policy.vae_feature_extractor.parameters(),
+            self._target_vae.parameters(),
+        ):
+            p_tgt.data.mul_(self.ema_decay).add_(p_live.data, alpha=1 - self.ema_decay)
 
     def set_env(self, env, force_reset: bool = True):
         ret = super().set_env(env, force_reset)
@@ -250,26 +297,25 @@ class HSWVimePPO(PPO):
                 # mu_{t+1}: SCVAE latent for (s_t → s_{t+1}) transition
                 vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
 
-                # 1. Compute context BEFORE inserting mu_t (causal)
-                context_t = self.policy.wyner_feature_extractor.compute_context(
-                    vae_tp1.mu, self._mu_buffer
-                )  # (n_envs, context_dim)
-
-                # 2. Roll buffer and insert (detach — buffer should never carry grad)
-                self._mu_buffer = th.roll(self._mu_buffer, -1, dims=1)
-                self._mu_buffer[:, -1, :] = vae_tp1.mu.detach()
-
-                # 3. Intrinsic reward: KL(q || p) via forward + loss
+                # 1. Compute intrinsic reward BEFORE inserting mu_{t+1}
+                #    mu_buffer contains [mu_{t-K}, ..., mu_{t-1}] (causal)
                 wyner_out = self.policy.wyner_feature_extractor.forward(
                     vae_tp1.mu, self._mu_buffer
                 )
                 wyner_l = self.policy.wyner_feature_extractor.loss(wyner_out)
 
+                # 2. Compute context for policy features (used next iteration)
+                context_t = wyner_out.h_slow  # (n_envs, context_dim)
+
+                # 3. Roll buffer and insert AFTER forward (no self-attention leak)
+                self._mu_buffer = th.roll(self._mu_buffer, -1, dims=1)
+                self._mu_buffer[:, -1, :] = vae_tp1.mu.detach()
+
                 # Per-env KL scalar; intrinsic_reward is already detached and ≥ 0
                 wyner_kl      = wyner_l.intrinsic_reward.cpu()    # (n_envs,)
                 episodic_bonus = self._episodic_memory.query_and_add(mu_t)  # (n_envs,)
 
-                intrinsic_rewards = self.intrinsic_scale * (wyner_kl * episodic_bonus).numpy()
+                intrinsic_rewards = self.intrinsic_scale * wyner_kl.numpy()
 
                 _wyner_kl_log.append(wyner_kl.mean().item())
                 _episodic_novel_log.append(float(episodic_bonus.mean()))
@@ -366,6 +412,7 @@ class HSWVimePPO(PPO):
     def train(self) -> None:
         self.policy.set_training_mode(True)
         self._update_learning_rate(self.policy.optimizer)
+        # aux_optimizer uses fixed LR — no schedule update
         clip_range = self.clip_range(self._current_progress_remaining)
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
@@ -384,6 +431,7 @@ class HSWVimePPO(PPO):
         wyner_losses         = []
         wyner_kl_losses      = []
         wyner_recon_past_losses, wyner_recon_future_losses = [], []
+        wyner_recon_prior_losses = []
         grad_norms           = []
         all_approx_kl_divs   = []
 
@@ -445,6 +493,20 @@ class HSWVimePPO(PPO):
                     rollout_data.next_observations,
                 )
                 vae_loss_obj = self.policy.vae_feature_extractor.loss(vae_t)
+
+                # Target SCVAE: stable mu targets for Wyner reconstruction.
+                # These don't shift every batch, so the Wyner decoder can learn.
+                with th.no_grad():
+                    tgt_vae_t = self._target_vae.forward(
+                        rollout_data.prev_observations,
+                        rollout_data.prev_actions,
+                        rollout_data.observations,
+                    )
+                    tgt_vae_tp1 = self._target_vae.forward(
+                        rollout_data.observations,
+                        actions,
+                        rollout_data.next_observations,
+                    )
                 vae_loss = (
                     self.vae_recon_coef * vae_loss_obj.recon_loss
                     + effective_vae_kl_coef * vae_loss_obj.kl_loss
@@ -468,7 +530,12 @@ class HSWVimePPO(PPO):
                     episode_start_mu,       # K=1 buffer — real signal, cheap to store
                     mu_next=vae_tp1.mu,     # mu_{t+1}
                 )
-                wyner_l = self.policy.wyner_feature_extractor.loss(wyner_out)
+                # Use target SCVAE mu's as stable reconstruction targets
+                wyner_l = self.policy.wyner_feature_extractor.loss(
+                    wyner_out,
+                    recon_target=tgt_vae_t.mu.detach(),
+                    recon_next_target=tgt_vae_tp1.mu.detach(),
+                )
 
                 # wyner_recon_coef scales both past and future reconstruction.
                 # lambda_past / lambda_future (in WynerConfig) control their
@@ -485,15 +552,16 @@ class HSWVimePPO(PPO):
                 wyner_kl_losses.append(wyner_l.kl_loss.item())
                 wyner_recon_past_losses.append(wyner_l.recon_past_loss.item())
                 wyner_recon_future_losses.append(wyner_l.recon_future_loss.item())
+                if wyner_l.recon_prior_loss is not None:
+                    wyner_recon_prior_losses.append(wyner_l.recon_prior_loss.item())
 
                 # ── Combined loss and update ─────────────────────────────────
-                loss = (
+                ppo_loss = (
                     policy_loss
                     + self.ent_coef   * entropy_loss
                     + self.vf_coef    * value_loss
-                    + vae_loss
-                    + wyner_loss
                 )
+                aux_loss = vae_loss + wyner_loss
 
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
@@ -507,25 +575,36 @@ class HSWVimePPO(PPO):
                         print(f"Early stopping at epoch {epoch}: approx_kl={approx_kl_div:.2f}")
                     break
 
-                self.policy.optimizer.zero_grad()
-                loss.backward()
-
-                # Separate parameter groups for independent gradient norm clipping
+                # Parameter groups for gradient norm logging
                 ppo_params   = (list(self.policy.mlp_extractor.parameters()) +
                                 list(self.policy.value_net.parameters()) +
                                 list(self.policy.action_net.parameters()))
-                vae_params   = list(self.policy.vae_feature_extractor.parameters())
-                wyner_params = list(self.policy.wyner_feature_extractor.parameters())
+                aux_params   = (list(self.policy.vae_feature_extractor.parameters()) +
+                                list(self.policy.wyner_feature_extractor.parameters()))
 
-                for name, params in [("ppo", ppo_params), ("vae", vae_params), ("wyner", wyner_params)]:
-                    total = th.nn.utils.clip_grad_norm_(params, float("inf"))
-                    self.logger.record(f"debug/{name}_grad_norm", total.item())
-
+                # PPO backward + step
+                self.policy.optimizer.zero_grad()
+                ppo_loss.backward(retain_graph=True)
                 grad_norm = th.nn.utils.clip_grad_norm_(ppo_params, self.max_grad_norm)
-                th.nn.utils.clip_grad_norm_(vae_params + wyner_params, self.aux_max_grad_norm)
                 grad_norms.append(grad_norm.item())
-
                 self.policy.optimizer.step()
+
+                # Aux backward + step (separate Adam state)
+                self.aux_optimizer.zero_grad()
+                aux_loss.backward()
+                th.nn.utils.clip_grad_norm_(aux_params, self.aux_max_grad_norm)
+                self.aux_optimizer.step()
+
+                # Polyak-update target SCVAE for stable Wyner recon targets
+                self._update_target_vae()
+
+                # Log gradient norms (diagnostic)
+                with th.no_grad():
+                    for name, params in [("ppo", ppo_params), ("vae", list(self.policy.vae_feature_extractor.parameters())), ("wyner", list(self.policy.wyner_feature_extractor.parameters()))]:
+                        total = sum(p.grad.norm().item() ** 2 for p in params if p.grad is not None) ** 0.5
+                        self.logger.record(f"debug/{name}_grad_norm", total)
+
+                loss = ppo_loss + aux_loss  # for logging only
 
             self._n_updates += 1
             if not continue_training:
@@ -559,6 +638,8 @@ class HSWVimePPO(PPO):
         self.logger.record("wyner/kl_loss",           np.mean(wyner_kl_losses))
         self.logger.record("wyner/recon_past_loss",   np.mean(wyner_recon_past_losses))
         self.logger.record("wyner/recon_future_loss", np.mean(wyner_recon_future_losses))
+        if wyner_recon_prior_losses:
+            self.logger.record("wyner/recon_prior_loss", np.mean(wyner_recon_prior_losses))
 
         self.logger.record("train/vae_kl_coef",   effective_vae_kl_coef)
         self.logger.record("train/wyner_kl_coef", effective_wyner_kl_coef)
