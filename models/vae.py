@@ -52,6 +52,11 @@ class VAEInterface:
     ) -> th.Tensor:
         pass
 
+    def build_target(
+        self, s_t: th.Tensor, a_t: th.Tensor, s_tp1: th.Tensor
+    ) -> th.Tensor:
+        pass
+
     def forward(
         self, s_t: th.Tensor, a_t: th.Tensor, s_tp1: th.Tensor
     ) -> VAEOutput:
@@ -133,7 +138,7 @@ class TransitionSCVAE(nn.Module):
         a_emb = self.action_embed(a)
         return h_s, a_emb, h_sn
 
-    def _build_target(
+    def build_target(
         self,
         s_t: th.Tensor,
         a_t: th.Tensor,
@@ -196,7 +201,7 @@ class TransitionSCVAE(nn.Module):
         z = sc_sample(mu, rho) if self.training else mu
 
         recon        = self.decode(z, skips)
-        recon_target = self._build_target(s_t, a_t, s_next)
+        recon_target = self.build_target(s_t, a_t, s_next)
 
         return VAEOutput(recon, mu, rho, recon_target, skips)
 

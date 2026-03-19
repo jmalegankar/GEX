@@ -19,6 +19,8 @@ class RolloutBufferSamples(NamedTuple):
     old_log_prob: th.Tensor
     advantages: th.Tensor
     returns: th.Tensor
+    questions: th.Tensor
+    answers: th.Tensor
 
 class TransitionRolloutBuffer(RolloutBuffer):
     """
@@ -48,18 +50,24 @@ class TransitionRolloutBuffer(RolloutBuffer):
         buffer_size: int,
         observation_space: spaces.Space,
         action_space: spaces.Space,
+        answer_dim: int,
         device: str = "auto",
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         n_envs: int = 1,
         memory_shape: Tuple[int, ...] = (1, 64),
+        num_qa: int = 3,
     ):
         self.memory_shape = memory_shape
+        self.num_qa = num_qa
+        self.answer_dim = answer_dim
 
         # Will be initialized in reset()
         self.next_observations = None
         self.prev_observations = None
         self.timesteps = None
+        self.questions = None
+        self.answers = None
         self.intrinsic_rewards = None
         self.memories = None
         self.prev_actions = None
@@ -101,6 +109,14 @@ class TransitionRolloutBuffer(RolloutBuffer):
         self.prev_actions = np.zeros(
             (self.buffer_size, self.n_envs, self.action_dim),
             dtype=self.action_space.dtype,
+        )
+        self.questions = np.zeros(
+            (self.buffer_size, self.n_envs, self.num_qa),
+            dtype=np.long,
+        )
+        self.answers = np.zeros(
+            (self.buffer_size, self.n_envs, self.num_qa, self.answer_dim),
+            dtype=np.float32,
         )
         super().reset()
 
@@ -209,6 +225,8 @@ class TransitionRolloutBuffer(RolloutBuffer):
                 "log_probs",
                 "advantages",
                 "returns",
+                "questions",
+                "answers",
             ]
 
             for tensor in _tensor_names:
@@ -242,6 +260,8 @@ class TransitionRolloutBuffer(RolloutBuffer):
             self.log_probs[batch_inds].flatten(),
             self.advantages[batch_inds].flatten(),
             self.returns[batch_inds].flatten(),
+            self.questions[batch_inds],
+            self.answers[batch_inds],
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))
     

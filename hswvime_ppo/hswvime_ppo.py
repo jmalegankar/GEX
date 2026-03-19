@@ -19,6 +19,7 @@ from .policies import HSWVIMEActorCriticPolicy
 from models.vae import VAEInterface, TransitionSCVAE
 from models.wyner import WynerInterface, WynerLoss, WynerVAE
 from models.episodic_memory import EpisodicMemoryInterface, BatchedNoveltyMemory
+from models.qa_module import QASampler
 
 
 from typing import Optional, Tuple, Union, Any
@@ -82,6 +83,7 @@ class HSWVimePPO(PPO):
 
         rollout_buffer_kwargs = rollout_buffer_kwargs or {}
         rollout_buffer_kwargs["memory_shape"] = memory_shape
+        rollout_buffer_kwargs["answer_dim"] = wyner_features_extractor_kwargs.get("recon_dim")
 
         super().__init__(
             policy=policy,
@@ -135,10 +137,11 @@ class HSWVimePPO(PPO):
         self._last_memory = None
         self._prev_last_obs = None
         self._prev_action = None
-        self._current_timestep = None
 
         if _init_setup_model:
             self._setup_model()
+        
+        self._qa_sampler = QASampler(self.rollout_buffer)
     
     def set_env(self, env, force_reset: bool = True):
         ret = super().set_env(env, force_reset)
@@ -149,7 +152,7 @@ class HSWVimePPO(PPO):
         if force_reset:
             self._prev_action = None
         if force_reset:
-            self._current_timestep = None
+            self._qa_sampler.reset()
         return ret
     
     def _setup_learn(self, total_timesteps, callback = None, reset_num_timesteps = True, tb_log_name = "run", progress_bar = False):
@@ -157,9 +160,7 @@ class HSWVimePPO(PPO):
         self._last_memory = th.zeros((self.n_envs, *self.memory_shape), device=self.device)
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
-
-        self._current_timestep = np.zeros(self.n_envs, dtype=np.int64)
-
+        self._qa_sampler.reset()
         self._episodic_memory = self.episodic_memory_class(
             n_envs=self.n_envs,
             **self.episodic_memory_kwargs,
@@ -215,7 +216,7 @@ class HSWVimePPO(PPO):
                 s_tm1 = obs_as_tensor(self._prev_last_obs, self.device)  # type: ignore[arg-type]
                 a_tm1 = obs_as_tensor(self._prev_action, self.device)  # type: ignore[arg-type]
                 s_t = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
-                timestep_tensor = th.tensor(self._current_timestep, device=self.device, dtype=th.long)
+                timestep_tensor = th.tensor(self._qa_sampler.timesteps, device=self.device, dtype=th.long)
                 actions, memory, values, log_probs = self.policy.forward(s_tm1, a_tm1, s_t, self._last_memory, timestep=timestep_tensor)
             actions = actions.cpu().numpy()
 
@@ -240,7 +241,7 @@ class HSWVimePPO(PPO):
                 a_t = obs_as_tensor(actions, self.device)
                 vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
                 wyner_loss: WynerLoss = self.policy.wyner_feature_extractor.loss(
-                    self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips, timestep=timestep_tensor),
+                    self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips, timestep=timestep_tensor+1),
                 )
                 wyner_kl = wyner_loss.kl_loss.view(-1).cpu()  # (n_envs,)
 
@@ -295,16 +296,16 @@ class HSWVimePPO(PPO):
                 log_probs,
                 self._last_memory,  # type: ignore[call-overload]
                 self._prev_action,  # type: ignore[arg-type]
-                self._current_timestep,
+                self._qa_sampler.timesteps,
                 intrinsic_rewards,
             )
 
             # Increment timestep counter, then reset for finished episodes
-            self._current_timestep += 1
+            self._qa_sampler.update(wyner_kl.numpy(), vae_tp1.recon_target.cpu().numpy())
             for idx, done in enumerate(dones):
                 if done:
-                    self._current_timestep[idx] = 0
-
+                    self._qa_sampler.reset(idx)
+            
             self._prev_last_obs = self._last_obs  # type: ignore[assignment]
             self._prev_action = actions
             self._last_obs = new_obs  # type: ignore[assignment]
@@ -360,6 +361,7 @@ class HSWVimePPO(PPO):
         vae_losses, wyner_losses = [], []
         vae_recon_losses, vae_kl_losses = [], []
         wyner_recon_losses, wyner_kl_losses, wyner_recon_next_losses = [], [], []
+        wyner_qa_losses = []
         grad_norms = []
         all_approx_kl_divs = []
 
@@ -461,8 +463,21 @@ class HSWVimePPO(PPO):
                     recon_next_target=vae_tp1.recon_target,
                 )
 
+                # decode from wyner all questions
+                qa_loss = 0.0
+                for idx in range(self.rollout_buffer.num_qa):
+                    questions = rollout_data.questions[:, idx, ...]
+                    recon_answers = self.policy.wyner_feature_extractor.decode(
+                        wyner_out.w,
+                        None,
+                        timestep=questions,
+                    )
+                    qa_loss += F.mse_loss(recon_answers, rollout_data.answers[:, idx, ...])
+
                 wyner_loss = (
-                    self.wyner_recon_coef * (wyner_loss_obj.recon_loss.mean() + wyner_loss_obj.recon_next_loss.mean())
+                    self.wyner_recon_coef * (
+                        wyner_loss_obj.recon_loss.mean() + wyner_loss_obj.recon_next_loss.mean() + qa_loss
+                    )
                     + effective_wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
                 )
 
@@ -470,6 +485,7 @@ class HSWVimePPO(PPO):
                 wyner_recon_losses.append(wyner_loss_obj.recon_loss.mean().item())
                 wyner_kl_losses.append(wyner_loss_obj.kl_loss.mean().item())
                 wyner_recon_next_losses.append(wyner_loss_obj.recon_next_loss.mean().item())
+                wyner_qa_losses.append(qa_loss.item())
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + vae_loss + wyner_loss
 
@@ -532,6 +548,7 @@ class HSWVimePPO(PPO):
         self.logger.record("wyner/wyner_recon_loss", np.mean(wyner_recon_losses))
         self.logger.record("wyner/wyner_kl_loss", np.mean(wyner_kl_losses))
         self.logger.record("wyner/wyner_recon_next_loss", np.mean(wyner_recon_next_losses))
+        self.logger.record("wyner/wyner_qa_loss", np.mean(wyner_qa_losses))
         self.logger.record("train/approx_kl", np.mean(all_approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())

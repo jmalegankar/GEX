@@ -130,10 +130,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         )
     
     def make_features_extractor(self):
-        self.vae_feature_extractor = self.vae_features_extractor_class(
+        self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(
             **self.vae_features_extractor_kwargs
         )
-        self.wyner_feature_extractor = self.wyner_features_extractor_class(
+        self.wyner_feature_extractor: WynerInterface = self.wyner_features_extractor_class(
             **self.wyner_features_extractor_kwargs
         )
         return super().make_features_extractor()
