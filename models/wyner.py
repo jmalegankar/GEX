@@ -269,14 +269,7 @@ class WynerIndependentVAE(nn.Module):
         # Learned prior: p_theta(z | w_{t-1})
         self.prior_net = WynerPriorNetwork(latent_dim, hidden_dim=decode_hidden)
 
-        self.decoder_t = WynerIndependentDecoder(
-            latent_dim=self.latent_dim,
-            latent_tokens=self.latent_tokens,
-            recon_dim=self.recon_dim,
-            decode_hidden=decode_hidden,
-            pos_embed_dim=pos_embed_dim,
-        )
-        self.decoder_tp1 = WynerIndependentDecoder(
+        self.decoder = WynerIndependentDecoder(
             latent_dim=self.latent_dim,
             latent_tokens=self.latent_tokens,
             recon_dim=self.recon_dim,
@@ -285,13 +278,10 @@ class WynerIndependentVAE(nn.Module):
         )
 
     def _gru_step(
-        self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None,
-        timestep: Optional[th.Tensor] = None,
+        self, w: th.Tensor, mu: th.Tensor, timestep: Optional[th.Tensor] = None,
     ) -> th.Tensor:
         # project mu and optionally mu_next, sum, and run GRU.
         gru_input = self.proj_t(mu)
-        if mu_next is not None:
-            gru_input = gru_input + self.proj_tp1(mu_next)
         # concat positional embedding of timestep
         if timestep is not None:
             pos_emb = sinusoidal_timestep_encoding(timestep, self.pos_embed_dim)
@@ -314,7 +304,7 @@ class WynerIndependentVAE(nn.Module):
 
     def decode(self, z: th.Tensor, mu: th.Tensor, timestep: Optional[th.Tensor] = None) -> th.Tensor:
         ts_enc = self._timestep_encoding(timestep, z.size(0), z.device)
-        recon = self.decoder_t(z, ts_enc)
+        recon = self.decoder(z, ts_enc)
         return recon
 
     def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None, timestep: Optional[th.Tensor] = None) -> WynerOutput:
@@ -327,7 +317,7 @@ class WynerIndependentVAE(nn.Module):
         z = z_mu + eps * std
 
         ts_enc = self._timestep_encoding(timestep, z.size(0), z.device)
-        recon = self.decoder_t(z, ts_enc)
+        recon = self.decoder(z, ts_enc)
 
         if mu_next is not None:
             # decoder_tp1 gets timestep + 1 encoding
@@ -335,7 +325,7 @@ class WynerIndependentVAE(nn.Module):
                 ts_enc_next = sinusoidal_timestep_encoding(timestep + 1, self.pos_embed_dim)
             else:
                 ts_enc_next = th.zeros(z.size(0), self.pos_embed_dim, device=z.device)
-            recon_next = self.decoder_tp1(z, ts_enc_next)
+            recon_next = self.decoder(z, ts_enc_next)
         else:
             recon_next = None
 
