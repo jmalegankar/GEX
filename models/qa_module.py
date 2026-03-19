@@ -41,11 +41,11 @@ class QASampler:
 
         pos = self.buffer.pos - 1
 
-        self.buffer.questions[pos, ~mask, :] = 1
+        self.buffer.questions[pos, ~mask, :] = 0
         self.buffer.answers[pos, ~mask, :, :] = answers[~mask].reshape(-1, 1, self.buffer.answer_dim)
         self.scores[~mask, :] = scores[~mask].reshape(-1, 1)
 
-        self.buffer.questions[pos, mask, replace[mask]] = num_timesteps[mask]
+        self.buffer.questions[pos, mask, replace[mask]] = self.timesteps[mask]
         self.buffer.answers[pos, mask, replace[mask], :] = answers[mask]
         self.scores[mask, replace[mask]] = scores[mask]
 

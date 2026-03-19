@@ -343,7 +343,7 @@ class WynerIndependentVAE(nn.Module):
         else:
             # Fallback: KL against N(0, I)
             kl_per_dim = -0.5 * (1 + output.logvar - output.w.pow(2) - output.logvar.exp())
-        kl_loss = kl_per_dim.clamp_min(self.free_bits).sum(dim=-1)
+        kl_loss = kl_per_dim.clamp_min(self.free_bits).mean(dim=-1)
 
         if recon_target is not None:
             recon_loss = nn.functional.mse_loss(output.recon, recon_target, reduction='none').mean(dim=-1)

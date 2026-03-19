@@ -299,9 +299,15 @@ class HSWVimePPO(PPO):
                 self._qa_sampler.timesteps,
                 intrinsic_rewards,
             )
+            
+            with th.no_grad():
+                vae_t = self.policy.vae_feature_extractor.forward(s_tm1, a_tm1, s_t)
+                scores = self.policy.wyner_feature_extractor.loss(
+                    self.policy.wyner_feature_extractor.forward(memory, vae_t.mu, vae_tp1.mu, vae_t.skips, timestep=timestep_tensor),
+                ).kl_loss.cpu().numpy()
 
             # Increment timestep counter, then reset for finished episodes
-            self._qa_sampler.update(wyner_kl.numpy(), vae_tp1.recon_target.cpu().numpy())
+            self._qa_sampler.update(scores, vae_t.recon_target.cpu().numpy())
             for idx, done in enumerate(dones):
                 if done:
                     self._qa_sampler.reset(idx)
