@@ -134,7 +134,7 @@ def parse_args():
                    help="Enable KL coefficient annealing from 0 to target over kl_anneal_steps.")
     p.add_argument("--kl_anneal_steps", type=int, default=50_000,
                    help="Number of timesteps to anneal KL coefficient from 0 to target.")
-    p.add_argument("--free_bits",       type=float, default=0.5,
+    p.add_argument("--free_bits",       type=float, default=0.0,
                    help="Free bits threshold for Wyner KL (0 to disable).")
 
     # Model architecture
