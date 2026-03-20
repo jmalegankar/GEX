@@ -64,20 +64,7 @@ class VAEConfig:
     kl_coef:    float = 0.01
 
 
-# Wyner VAE 
-
-@dataclass
-class WynerConfig:
-    latent_dim:    int = 64
-    decode_hidden: int = 128
-    latent_tokens: int = 1
-
-    # PPO loss coefficients
-    recon_coef: float = 1.0
-    kl_coef:    float = 0.01
-
-
-# PPO 
+# PPO
 
 @dataclass
 class PPOConfig:
@@ -140,7 +127,6 @@ class Config:
     env:    EnvConfig    = field(default_factory=EnvConfig)
     embed:  EmbeddingConfig = field(default_factory=EmbeddingConfig)
     vae:    VAEConfig    = field(default_factory=VAEConfig)
-    wyner:  WynerConfig  = field(default_factory=WynerConfig)
     ppo:    PPOConfig    = field(default_factory=PPOConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
     run:    RunConfig    = field(default_factory=RunConfig)

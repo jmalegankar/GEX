@@ -53,7 +53,25 @@ def _gauss_legendre_01(n: int, device: torch.device, dtype: torch.dtype) -> Tupl
     return t, w
 
 _LEGENDRE_POINTS: int = 64  # default for KL quadrature branch
-_LEGENDRE_TENSORS: Tuple[torch.Tensor, torch.Tensor] = _gauss_legendre_01(_LEGENDRE_POINTS, torch.device('cpu'), torch.float32)  # cached on CPU, moved to target device in function
+
+# Device-keyed cache: {(device_type, device_index): (t, w)}
+_gl_cache: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
+
+def _get_legendre_tensors(device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return cached GL nodes/weights for the given device, creating if needed."""
+    key = (device.type, device.index if device.index is not None else -1)
+    if key not in _gl_cache:
+        t, w = _gauss_legendre_01(_LEGENDRE_POINTS, device, dtype)
+        _gl_cache[key] = (t, w)
+    t, w = _gl_cache[key]
+    if t.dtype != dtype:
+        t = t.to(dtype=dtype)
+        w = w.to(dtype=dtype)
+    return t, w
+
+# Pre-populate CPU cache
+_gl_cache[('cpu', -1)] = _gauss_legendre_01(_LEGENDRE_POINTS, torch.device('cpu'), torch.float32)
+_LEGENDRE_TENSORS: Tuple[torch.Tensor, torch.Tensor] = _gl_cache[('cpu', -1)]
 
 
 @torch.jit.script
@@ -109,7 +127,6 @@ def _sc_kl_quadrature(
 
 _RHO_ASYMP = 0.9
 
-@torch.jit.script
 def sc_kl_uniform(rho: torch.Tensor, dim: int, _rho_asymptotic: float = _RHO_ASYMP) -> torch.Tensor:
     """
     KL( spCauchy_d(·|μ,ρ) ‖ Uniform(S^{d-1}) )
@@ -121,7 +138,6 @@ def sc_kl_uniform(rho: torch.Tensor, dim: int, _rho_asymptotic: float = _RHO_ASY
     Args:
         rho:           (B,) or (B,1) in [0, 1)
         dim:           latent dimension d ≥ 2
-        n_quad_points: G-L quadrature points for the low-ρ branch
     Returns:
         kl: (B,1) non-negative tensor
     """
@@ -136,11 +152,14 @@ def sc_kl_uniform(rho: torch.Tensor, dim: int, _rho_asymptotic: float = _RHO_ASY
     high_rho = rho > _rho_asymptotic   # (B,1)
     kl       = torch.zeros_like(rho)
 
+    # Get cached GL tensors for the correct device
+    gl_tensors = _get_legendre_tensors(rho.device, rho.dtype)
+
     # ── Branch A: quadrature (ρ ≤ 0.9) ──────────────────────────
     if high_rho.logical_not().any():
         rho_lo            = rho.clone()
         rho_lo[high_rho]  = 0.5
-        kl_lo             = _sc_kl_quadrature(rho_lo, dim)
+        kl_lo             = _sc_kl_quadrature(rho_lo, dim, gl_tensors)
         kl                = torch.where(high_rho, kl, kl_lo)
 
     # ── Branch B: asymptotic (ρ > 0.9) ───────────────────────────

@@ -6,12 +6,10 @@ from stable_baselines3.common.callbacks import BaseCallback
 
 from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper
 from models.embeddings import CategoricalGridWithDirEmbedding
-from models.config import SCVAEConfig
-from models.episodic_memory import BatchedNoveltyMemory
-from models.vae import TransitionSCVAE
-from models.wyner import WynerVAE, WynerIndependentVAE
+from models.config import SCVAEConfig, GaussianVAEConfig
+from models.vae import TransitionSCVAE, TransitionGaussianVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
-from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
+from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, SimpleVAEFeaturesExtractor
 
 import minigrid
 
@@ -38,11 +36,11 @@ class RenderCallback(BaseCallback):
     def _on_training_end(self):
         self.render_env.close()
 
-#Vocabulary sizes shared by both multigrid and minigrid
-N_OBJECT_TYPES = 12  
-N_COLORS       = 6   
-N_STATES       = 3   
-N_DIRS         = 4   
+# Vocabulary sizes shared by both multigrid and minigrid
+N_OBJECT_TYPES = 12
+N_COLORS       = 6
+N_STATES       = 3
+N_DIRS         = 4
 
 
 def make_env_fn(env_name: str, view_size: int, env_kwargs: dict):
@@ -74,29 +72,8 @@ def build_embedding(obs_h: int, obs_w: int, embed_per_channel: int, dir_embed_di
     )
 
 
-def build_vae(embedding, act_dim: int, latent_dim: int, conv_channels, hidden_dim: int, action_embed_dim: int):
-    cfg = SCVAEConfig(
-        act_dim=act_dim,
-        action_embed_dim=action_embed_dim,
-        conv_channels=conv_channels,
-        hidden_dim=hidden_dim,
-        latent_dim=latent_dim,
-    )
-    return TransitionSCVAE(embedding, cfg)
-
-
-def build_wyner(recon_dim: int, mu_dim: int, latent_dim: int, decode_hidden: int):
-    return WynerVAE(
-        recon_dim=recon_dim,
-        mu_dim=mu_dim,
-        latent_dim=latent_dim,
-        latent_tokens=1,
-        decode_hidden=decode_hidden,
-    )
-
-
 def parse_args():
-    p = argparse.ArgumentParser(description="Train HSWVimePPO on a grid environment.")
+    p = argparse.ArgumentParser(description="Train spCauchy PPO on a grid environment.")
 
     # Environment
     p.add_argument("--env",       type=str, default="door_button",
@@ -107,10 +84,10 @@ def parse_args():
                    help="Grid size (only used for door_button).")
     p.add_argument("--max_steps", type=int, default=200,
                    help="Max steps per episode.")
-    
+
     p.add_argument("--render", action="store_true", help="Render the environment during training.")
 
-    # Training 
+    # Training
     p.add_argument("--total_timesteps", type=int, default=500_000)
     p.add_argument("--n_envs",          type=int, default=4)
     p.add_argument("--n_steps",         type=int, default=512,
@@ -124,29 +101,24 @@ def parse_args():
     p.add_argument("--seed",            type=int,   default=0)
     p.add_argument("--device",          type=str,   default="auto")
 
-    # Loss coefficients 
+    # Loss coefficients
     p.add_argument("--vae_recon_coef",  type=float, default=1.0)
     p.add_argument("--vae_kl_coef",     type=float, default=0.01)
-    p.add_argument("--wyner_recon_coef",type=float, default=1.0)
-    p.add_argument("--wyner_kl_coef",   type=float, default=0.01)
-    p.add_argument("--intrinsic_scale", type=float, default=1.0)
+    p.add_argument("--vae_fwd_coef",    type=float, default=1.0)
     p.add_argument("--kl_use_schedule", action="store_true",
                    help="Enable KL coefficient annealing from 0 to target over kl_anneal_steps.")
     p.add_argument("--kl_anneal_steps", type=int, default=50_000,
                    help="Number of timesteps to anneal KL coefficient from 0 to target.")
-    p.add_argument("--free_bits",       type=float, default=0.5,
-                   help="Free bits threshold for Wyner KL (0 to disable).")
 
     # Model architecture
+    p.add_argument("--latent_type",       type=str, default="spcauchy",
+                   choices=["spcauchy", "gaussian"],
+                   help="Latent space type: spcauchy (Spherical Cauchy) or gaussian.")
     p.add_argument("--embed_per_channel", type=int, default=4)
     p.add_argument("--dir_embed_dim",     type=int, default=4)
     p.add_argument("--vae_latent_dim",    type=int, default=32)
     p.add_argument("--vae_hidden_dim",    type=int, default=256)
     p.add_argument("--vae_action_embed",  type=int, default=32)
-    p.add_argument("--wyner_latent_dim",  type=int, default=64)
-    p.add_argument("--wyner_decode_hidden", type=int, default=128)
-    p.add_argument("--pos_embed_dim",      type=int, default=16,
-                   help="Dimension of sinusoidal positional embedding for timestep in Wyner.")
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default=None)
@@ -178,51 +150,47 @@ def main():
     # Probe one env to get obs/action dims
     _probe = env_fn()
     obs_h, obs_w, _ = _probe.observation_space.shape   # (H, W, 4)
-    # Discrete actions are stored as raw indices (B, 1), not one-hot.
-    act_dim = 1
+    act_dim = 1  # Discrete actions stored as raw indices (B, 1)
     _probe.close()
 
     vec_env = make_vec_env(env_fn, n_envs=args.n_envs, seed=args.seed)
 
-    # ── 2. Build models ───────────────────────────────────────────────────────
+    # 2. Build models
     embedding = build_embedding(obs_h, obs_w, args.embed_per_channel, args.dir_embed_dim)
-
     conv_channels = [32, 64, 128]
-    vae = build_vae(
-        embedding,
-        act_dim=act_dim,
-        latent_dim=args.vae_latent_dim,
-        conv_channels=conv_channels,
-        hidden_dim=args.vae_hidden_dim,
-        action_embed_dim=args.vae_action_embed,
-    )
-
-    # recon_dim = 2 * conv_out + action_embed
-    recon_dim = 2 * conv_channels[-1] + args.vae_action_embed
-
-    wyner = build_wyner(
-        recon_dim=recon_dim,
-        mu_dim=args.vae_latent_dim,
-        latent_dim=args.wyner_latent_dim,
-        decode_hidden=args.wyner_decode_hidden,
-    )
-
-    memory_shape = (1, args.wyner_latent_dim)
 
     # 3. Policy kwargs
     policy_kwargs = {
-        "features_extractor_class":  HSWVIMEFeaturesExtractor,
+        "features_extractor_class":  SimpleVAEFeaturesExtractor,
         "features_extractor_kwargs": {
-            "wyner_dim": args.wyner_latent_dim,
-            "mu_dim":    args.vae_latent_dim,
+            "mu_dim": args.vae_latent_dim,
         },
         "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
     }
 
-    # null_action is passed to the GRU on the very first step (before any real action)
     null_action = np.zeros(1, dtype=np.float32)
 
-    # 4. Instantiate agent
+    # 4. Select VAE class and config based on latent type
+    if args.latent_type == "gaussian":
+        vae_class = TransitionGaussianVAE
+        vae_cfg = GaussianVAEConfig(
+            act_dim=act_dim,
+            action_embed_dim=args.vae_action_embed,
+            conv_channels=conv_channels,
+            hidden_dim=args.vae_hidden_dim,
+            latent_dim=args.vae_latent_dim,
+        )
+    else:
+        vae_class = TransitionSCVAE
+        vae_cfg = SCVAEConfig(
+            act_dim=act_dim,
+            action_embed_dim=args.vae_action_embed,
+            conv_channels=conv_channels,
+            hidden_dim=args.vae_hidden_dim,
+            latent_dim=args.vae_latent_dim,
+        )
+
+    # 5. Instantiate agent
     model = HSWVimePPO(
         policy=HSWVIMEActorCriticPolicy,
         env=vec_env,
@@ -236,38 +204,14 @@ def main():
         ent_coef=args.ent_coef,
         vae_recon_coef=args.vae_recon_coef,
         vae_kl_coef=args.vae_kl_coef,
-        wyner_recon_coef=args.wyner_recon_coef,
-        wyner_kl_coef=args.wyner_kl_coef,
-        intrinsic_scale=args.intrinsic_scale,
+        vae_fwd_coef=args.vae_fwd_coef,
         kl_use_schedule=args.kl_use_schedule,
         kl_anneal_steps=args.kl_anneal_steps,
-        memory_shape=memory_shape,
         policy_kwargs=policy_kwargs,
-        vae_features_extractor_class=TransitionSCVAE,
+        vae_features_extractor_class=vae_class,
         vae_features_extractor_kwargs={
             "embedding": embedding,
-            "cfg": SCVAEConfig(
-                act_dim=act_dim,
-                action_embed_dim=args.vae_action_embed,
-                conv_channels=conv_channels,
-                hidden_dim=args.vae_hidden_dim,
-                latent_dim=args.vae_latent_dim,
-            ),
-        },
-        wyner_features_extractor_class=WynerIndependentVAE,
-        wyner_features_extractor_kwargs={
-            "recon_dim":      recon_dim,
-            "mu_dim":         args.vae_latent_dim,
-            "latent_dim":     args.wyner_latent_dim,
-            "latent_tokens":  1,
-            "decode_hidden":  args.wyner_decode_hidden,
-            "pos_embed_dim":  args.pos_embed_dim,
-            "free_bits":      args.free_bits,
-        },
-        episodic_memory_class=BatchedNoveltyMemory,
-        episodic_memory_kwargs={
-            "input_dim": args.vae_latent_dim,
-            "hash_dim": 63,  # Max hash_dim for safe int64 bit-packing
+            "cfg": vae_cfg,
         },
         tensorboard_log=args.tensorboard_log,
         verbose=args.verbose,
@@ -282,10 +226,8 @@ def main():
         f"  env_size={args.env_size}  view_size={args.view_size}  max_steps={args.max_steps}\n"
         f"  lr={args.lr}  n_steps={args.n_steps}  batch={args.batch_size}  epochs={args.n_epochs}\n"
         f"  gamma={args.gamma}  gae={args.gae_lambda}  ent={args.ent_coef}  seed={args.seed}\n"
-        f"  vae_latent={args.vae_latent_dim}  wyner_latent={args.wyner_latent_dim}\n"
-        f"  vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}"
-        f"  wyner_recon={args.wyner_recon_coef}  wyner_kl={args.wyner_kl_coef}"
-        f"  intrinsic={args.intrinsic_scale}"
+        f"  latent_type={args.latent_type}  vae_latent={args.vae_latent_dim}\n"
+        f"  vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}  vae_fwd={args.vae_fwd_coef}"
     )
     model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=render_callback)
 

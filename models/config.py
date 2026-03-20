@@ -42,5 +42,19 @@ class SCVAEConfig:
 
 
 @dataclass
-class WynerVAEConfig:
-    pass
+class GaussianVAEConfig:
+    # ── Action ─────────────────────────────────────────────────────
+    act_dim:          int        = 4
+
+    # ── Action Embedding ───────────────────────────────────────────
+    action_embed_dim: int        = 32
+
+    # ── Encoder ────────────────────────────────────────────────────
+    conv_channels:    List[int]  = field(default_factory=lambda: [32, 64, 128])
+
+    # ── Encoder / Decoder trunk ────────────────────────────────────
+    hidden_dim:       int        = 256
+    latent_dim:       int        = 32
+
+    # ── Free bits ──────────────────────────────────────────────────
+    free_bits:        float      = 0.5   # min KL per dimension (nats); 0 disables
