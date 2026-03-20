@@ -120,7 +120,7 @@ def parse_args():
     p.add_argument("--lr",              type=float, default=3e-4)
     p.add_argument("--gamma",           type=float, default=0.99)
     p.add_argument("--gae_lambda",      type=float, default=0.95)
-    p.add_argument("--ent_coef",        type=float, default=0.01)
+    p.add_argument("--ent_coef",        type=float, default=0.0)
     p.add_argument("--seed",            type=int,   default=0)
     p.add_argument("--device",          type=str,   default="auto")
 

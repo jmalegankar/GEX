@@ -29,6 +29,7 @@ class QASampler:
             self.exmeansq[...] = 0.0
     
     def update(self, scores: np.ndarray, answers: np.ndarray):
+        assert np.isnan(scores).any() == False, "Scores contain NaN values"
         num_timesteps = self.timesteps + 1
         self.means = (self.timesteps/num_timesteps) * self.means + scores / num_timesteps
         self.exmeansq = (self.timesteps/num_timesteps) * self.exmeansq + (scores**2) / num_timesteps

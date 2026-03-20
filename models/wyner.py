@@ -130,7 +130,7 @@ class WynerVAE(nn.Module):
         decode_hidden: int = 128,
         state_dim: int = 0,
         state_tokens: int = 0,
-        free_bits: float = 0.5,
+        free_bits: float = 0.0,
     ):
         super().__init__()
         assert latent_tokens >= 1, "Latent tokens must be at least 1."
@@ -255,7 +255,6 @@ class WynerIndependentVAE(nn.Module):
 
         # joint encoder: separate projections summed -> GRU input
         self.proj_t = nn.Linear(mu_dim, mu_dim)
-        self.proj_tp1 = nn.Linear(mu_dim, mu_dim)
 
         if self.state_tokens == 0 and self.latent_tokens == 1:
             self.gru = nn.GRUCell(input_size=mu_dim + pos_embed_dim, hidden_size=latent_dim)
