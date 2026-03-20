@@ -119,6 +119,12 @@ def parse_args():
     p.add_argument("--vae_latent_dim",    type=int, default=32)
     p.add_argument("--vae_hidden_dim",    type=int, default=256)
     p.add_argument("--vae_action_embed",  type=int, default=32)
+    p.add_argument("--gru_hidden_dim",    type=int, default=0,
+                   help="GRU memory hidden dim. 0 = no GRU (features = mu only).")
+    p.add_argument("--vae_lr",            type=float, default=1e-3,
+                   help="Learning rate for VAE + forward predictor optimizer.")
+    p.add_argument("--normalize_intrinsic", action="store_true",
+                   help="Normalize intrinsic rewards with running mean/std.")
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default=None)
@@ -164,6 +170,7 @@ def main():
         "features_extractor_class":  SimpleVAEFeaturesExtractor,
         "features_extractor_kwargs": {
             "mu_dim": args.vae_latent_dim,
+            "gru_hidden_dim": args.gru_hidden_dim,
         },
         "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
     }
@@ -196,6 +203,7 @@ def main():
         env=vec_env,
         null_action=null_action,
         learning_rate=args.lr,
+        vae_lr=args.vae_lr,
         n_steps=args.n_steps,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,
@@ -207,6 +215,8 @@ def main():
         vae_fwd_coef=args.vae_fwd_coef,
         kl_use_schedule=args.kl_use_schedule,
         kl_anneal_steps=args.kl_anneal_steps,
+        normalize_intrinsic=args.normalize_intrinsic,
+        gru_hidden_dim=args.gru_hidden_dim,
         policy_kwargs=policy_kwargs,
         vae_features_extractor_class=vae_class,
         vae_features_extractor_kwargs={
@@ -227,7 +237,8 @@ def main():
         f"  lr={args.lr}  n_steps={args.n_steps}  batch={args.batch_size}  epochs={args.n_epochs}\n"
         f"  gamma={args.gamma}  gae={args.gae_lambda}  ent={args.ent_coef}  seed={args.seed}\n"
         f"  latent_type={args.latent_type}  vae_latent={args.vae_latent_dim}\n"
-        f"  vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}  vae_fwd={args.vae_fwd_coef}"
+        f"  vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}  vae_fwd={args.vae_fwd_coef}\n"
+        f"  vae_lr={args.vae_lr}  gru_hidden_dim={args.gru_hidden_dim}  normalize_intrinsic={args.normalize_intrinsic}"
     )
     model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=render_callback)
 

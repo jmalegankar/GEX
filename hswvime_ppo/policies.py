@@ -17,25 +17,29 @@ from models.vae import VAEInterface, TransitionSCVAE
 
 class SimpleVAEFeaturesExtractor(nn.Module):
     """
-    Features extractor that uses the VAE mu directly as policy features.
+    Features extractor that concatenates sg(mu) and GRU hidden state h_mem.
+    If no GRU is used, passes mu directly.
     """
 
-    def __init__(self, observation_space=None, *, mu_dim: int):
+    def __init__(self, observation_space=None, *, mu_dim: int, gru_hidden_dim: int = 0):
         super().__init__()
-        self._features_dim = mu_dim
+        self._features_dim = mu_dim + gru_hidden_dim
 
     @property
     def features_dim(self) -> int:
         return self._features_dim
 
-    def forward(self, mu_features: th.Tensor) -> th.Tensor:
-        return mu_features
+    def forward(self, features: th.Tensor) -> th.Tensor:
+        return features
 
 
 class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
     """
-    Actor-critic policy that integrates a transition VAE.
-    Features are the VAE's mu (direction on the sphere).
+    Actor-critic policy with transition VAE and optional GRU memory.
+
+    Features = concat(sg(mu), h_mem) where:
+      - mu comes from VAE.encode(s_{t-1}, a_{t-1}, s_t)
+      - h_mem = GRU(sg(mu), h_{t-1}_mem), trained only through PPO gradients
     """
 
     def __init__(
@@ -59,10 +63,12 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
         optimizer_kwargs: Optional[dict[str, Any]] = None,
+        gru_hidden_dim: int = 0,
     ):
         assert share_features_extractor, "Does not support separate feature extractors for policy and value networks"
         self.vae_features_extractor_class = vae_features_extractor_class
         self.vae_features_extractor_kwargs = vae_features_extractor_kwargs or {}
+        self.gru_hidden_dim = gru_hidden_dim
 
         super().__init__(
             observation_space,
@@ -88,7 +94,43 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(
             **self.vae_features_extractor_kwargs
         )
+        # Infer mu_dim from the VAE's latent_dim
+        mu_dim = self.vae_feature_extractor.latent_dim
+
+        # Build GRU if requested
+        if self.gru_hidden_dim > 0:
+            self.gru = nn.GRU(
+                input_size=mu_dim,
+                hidden_size=self.gru_hidden_dim,
+                batch_first=False,  # input: (1, B, mu_dim)
+            )
+        else:
+            self.gru = None
+
         return super().make_features_extractor()
+
+    def _gru_step(
+        self,
+        mu: th.Tensor,
+        h_prev: Optional[th.Tensor],
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        """Single GRU step: h_mem = GRU(sg(mu), h_prev).
+
+        Returns (features, h_mem) where features = concat(sg(mu), h_mem).
+        sg(mu) ensures VAE encoder doesn't get gradients from PPO loss.
+        """
+        mu_sg = mu.detach()  # stop gradient from PPO -> VAE encoder
+        if self.gru is None:
+            return mu_sg, th.zeros(1, device=mu.device)  # dummy h_mem
+
+        if h_prev is None:
+            h_prev = th.zeros(1, mu.size(0), self.gru_hidden_dim, device=mu.device)
+
+        # GRU expects (seq_len=1, batch, input_size)
+        gru_out, h_mem = self.gru(mu_sg.unsqueeze(0), h_prev)
+        # gru_out: (1, B, H), h_mem: (1, B, H)
+        features = th.cat([mu_sg, gru_out.squeeze(0)], dim=-1)
+        return features, h_mem
 
     def forward(
         self,
@@ -96,13 +138,14 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         deterministic: bool = False,
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
+        h_prev: Optional[th.Tensor] = None,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
-        Forward pass in all the networks (actor and critic).
+        Forward pass in all networks (actor and critic).
 
-        :return: action, value, log probability of the action
+        Returns: (action, value, log_prob, h_mem)
         """
-        features = self.extract_features(s_tm1, a_tm1, s_t)
+        features, h_mem = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
         if self.share_features_extractor:
             latent_pi, latent_vf = self.mlp_extractor(features)
         else:
@@ -114,27 +157,37 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
         actions = actions.reshape((-1, *self.action_space.shape))
-        return actions, values, log_prob
+        return actions, values, log_prob, h_mem
 
     def extract_features(
         self,
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
         s_t: th.Tensor,
-    ) -> th.Tensor:
+        h_prev: Optional[th.Tensor] = None,
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        """Returns (features, h_mem)."""
         s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
         s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
         mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        features = self.features_extractor(mu)
-        return features
+
+        if self.gru is not None:
+            features, h_mem = self._gru_step(mu, h_prev)
+        else:
+            features = mu.detach()
+            h_mem = th.zeros(1, device=mu.device)
+
+        features = self.features_extractor(features)
+        return features, h_mem
 
     def get_distribution(
         self,
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
         s_t: th.Tensor,
+        h_prev: Optional[th.Tensor] = None,
     ) -> Distribution:
-        features = self.extract_features(s_tm1, a_tm1, s_t)
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
         latent_pi = self.mlp_extractor.forward_actor(features)
         return self._get_action_dist_from_latent(latent_pi)
 
@@ -143,8 +196,9 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         s_tm1: th.Tensor,
         a_tm1: th.Tensor,
         s_t: th.Tensor,
+        h_prev: Optional[th.Tensor] = None,
     ) -> th.Tensor:
-        features = self.extract_features(s_tm1, a_tm1, s_t)
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
         latent_vf = self.mlp_extractor.forward_critic(features)
         return self.value_net(latent_vf)
 
@@ -154,14 +208,16 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         action: th.Tensor,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
-        features = self.extract_features(s_tm1, a_tm1, s_t)
+        h_prev: Optional[th.Tensor] = None,
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        """Returns (values, log_prob, entropy, h_mem)."""
+        features, h_mem = self.extract_features(s_tm1, a_tm1, s_t, h_prev)
         latent_vf = self.mlp_extractor.forward_critic(features)
         values = self.value_net(latent_vf)
         latent_pi = self.mlp_extractor.forward_actor(features)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(action)
-        return values, log_prob, distribution.entropy()
+        return values, log_prob, distribution.entropy(), h_mem
 
     def predict(
         self,
@@ -169,7 +225,9 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         deterministic: bool = False,
-    ) -> th.Tensor:
+        h_prev: Optional[th.Tensor] = None,
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        """Returns (actions, h_mem)."""
         self.set_training_mode(False)
 
         if isinstance(s_tm1, tuple) and len(s_tm1) == 2 and isinstance(s_tm1[1], dict):
@@ -183,7 +241,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1 = th.as_tensor(a_tm1, device=s_tm1.device)
 
         with th.no_grad():
-            distribution = self.get_distribution(s_tm1, a_tm1, s_t)
+            distribution = self.get_distribution(s_tm1, a_tm1, s_t, h_prev)
             actions = distribution.get_actions(deterministic=deterministic)
 
         actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))

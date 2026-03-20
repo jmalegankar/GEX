@@ -17,12 +17,13 @@ class RolloutBufferSamples(NamedTuple):
     old_log_prob: th.Tensor
     advantages: th.Tensor
     returns: th.Tensor
+    gru_hidden_states: th.Tensor  # (B, gru_hidden_dim) or (B, 0)
 
 
 class TransitionRolloutBuffer(RolloutBuffer):
     """
-    Rollout buffer that stores (s_{t-1}, a_{t-1}, s_t, a_t, s_{t+1}) transitions
-    and intrinsic rewards for GAE computation.
+    Rollout buffer that stores (s_{t-1}, a_{t-1}, s_t, a_t, s_{t+1}) transitions,
+    intrinsic rewards, and GRU hidden states for recurrent policy.
     """
     observations: np.ndarray
     actions: np.ndarray
@@ -36,6 +37,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
     next_observations: np.ndarray
     prev_observations: np.ndarray
     intrinsic_rewards: np.ndarray
+    gru_hidden_states: np.ndarray
     _last_values: np.ndarray
     _dones: np.ndarray
 
@@ -48,11 +50,14 @@ class TransitionRolloutBuffer(RolloutBuffer):
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
         n_envs: int = 1,
+        gru_hidden_dim: int = 0,
     ):
         self.next_observations = None
         self.prev_observations = None
         self.intrinsic_rewards = None
         self.prev_actions = None
+        self.gru_hidden_states = None
+        self.gru_hidden_dim = gru_hidden_dim
 
         self._last_values = None
         self._dones = None
@@ -83,6 +88,11 @@ class TransitionRolloutBuffer(RolloutBuffer):
         self.prev_actions = np.zeros(
             (self.buffer_size, self.n_envs, self.action_dim),
             dtype=self.action_space.dtype,
+        )
+        # GRU hidden states: (buffer_size, n_envs, gru_hidden_dim)
+        self.gru_hidden_states = np.zeros(
+            (self.buffer_size, self.n_envs, max(self.gru_hidden_dim, 1)),
+            dtype=np.float32,
         )
         super().reset()
 
@@ -119,6 +129,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
         log_prob: th.Tensor,
         prev_action: np.ndarray,
         intrinsic_reward: Optional[np.ndarray] = None,
+        gru_hidden_state: Optional[np.ndarray] = None,
     ) -> None:
         """
         Store a full transition (s_{t-1}, a_{t-1}, s_t, a_t, s_{t+1}).
@@ -131,6 +142,8 @@ class TransitionRolloutBuffer(RolloutBuffer):
         self.prev_observations[self.pos] = np.array(prev_obs)
         if intrinsic_reward is not None:
             self.intrinsic_rewards[self.pos] = intrinsic_reward
+        if gru_hidden_state is not None:
+            self.gru_hidden_states[self.pos] = gru_hidden_state
 
         prev_action = prev_action.reshape((self.n_envs, self.action_dim))
         self.prev_actions[self.pos] = np.array(prev_action)
@@ -151,6 +164,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
                 "log_probs",
                 "advantages",
                 "returns",
+                "gru_hidden_states",
             ]
 
             for tensor in _tensor_names:
@@ -180,5 +194,6 @@ class TransitionRolloutBuffer(RolloutBuffer):
             self.log_probs[batch_inds].flatten(),
             self.advantages[batch_inds].flatten(),
             self.returns[batch_inds].flatten(),
+            self.gru_hidden_states[batch_inds],
         )
         return RolloutBufferSamples(*tuple(map(self.to_torch, data)))

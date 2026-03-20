@@ -16,6 +16,7 @@ from .buffer import TransitionRolloutBuffer
 from .policies import HSWVIMEActorCriticPolicy
 
 from models.vae import VAEInterface, TransitionSCVAE
+from models.utils import RunningMeanStd
 
 from typing import Optional, Tuple, Union, Any
 
@@ -32,6 +33,7 @@ class HSWVimePPO(PPO):
         env: Union[GymEnv, str],
         null_action: np.ndarray,
         learning_rate: Union[float, Schedule] = 3e-4,
+        vae_lr: float = 1e-3,
         n_steps: int = 2048,
         batch_size: int = 64,
         n_epochs: int = 10,
@@ -48,6 +50,7 @@ class HSWVimePPO(PPO):
         kl_use_schedule: bool = False,
         kl_anneal_steps: int = 50_000,
         max_grad_norm: float = 0.5,
+        aux_max_grad_norm: float = 5.0,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         rollout_buffer_class: Optional[type[TransitionRolloutBuffer]] = TransitionRolloutBuffer,
@@ -62,13 +65,16 @@ class HSWVimePPO(PPO):
         _init_setup_model: bool = True,
         vae_features_extractor_class: VAEInterface = TransitionSCVAE,
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        aux_max_grad_norm: float = 5.0,
+        normalize_intrinsic: bool = True,
+        gru_hidden_dim: int = 0,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"] = vae_features_extractor_class
         policy_kwargs["vae_features_extractor_kwargs"] = vae_features_extractor_kwargs
+        policy_kwargs["gru_hidden_dim"] = gru_hidden_dim
 
         rollout_buffer_kwargs = rollout_buffer_kwargs or {}
+        rollout_buffer_kwargs["gru_hidden_dim"] = gru_hidden_dim
 
         super().__init__(
             policy=policy,
@@ -99,33 +105,47 @@ class HSWVimePPO(PPO):
             _init_setup_model=False,
         )
 
+        self.vae_lr = vae_lr
         self.vae_recon_coef = vae_recon_coef
         self.vae_kl_coef = vae_kl_coef
         self.vae_fwd_coef = vae_fwd_coef
         self.kl_use_schedule = kl_use_schedule
         self.kl_anneal_steps = kl_anneal_steps
-
-        self.null_action = null_action
-
         self.aux_max_grad_norm = aux_max_grad_norm
+        self.null_action = null_action
+        self.normalize_intrinsic = normalize_intrinsic
+        self.gru_hidden_dim = gru_hidden_dim
 
         self._prev_last_obs = None
         self._prev_action = None
+        self._gru_hidden = None  # (1, n_envs, gru_hidden_dim)
+
+        # Intrinsic reward running stats
+        self.intrinsic_rms = RunningMeanStd() if normalize_intrinsic else None
 
         if _init_setup_model:
             self._setup_model()
+
+    def _setup_model(self) -> None:
+        super()._setup_model()
+        # Create separate VAE optimizer (two-optimizer setup)
+        vae_params = list(self.policy.vae_feature_extractor.parameters())
+        self.vae_optimizer = th.optim.Adam(vae_params, lr=self.vae_lr)
 
     def set_env(self, env, force_reset: bool = True):
         ret = super().set_env(env, force_reset)
         if force_reset:
             self._prev_last_obs = None
             self._prev_action = None
+            self._gru_hidden = None
         return ret
 
     def _setup_learn(self, total_timesteps, callback=None, reset_num_timesteps=True, tb_log_name="run", progress_bar=False):
         ret = super()._setup_learn(total_timesteps, callback, reset_num_timesteps, tb_log_name, progress_bar)
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
+        if self.gru_hidden_dim > 0:
+            self._gru_hidden = th.zeros(1, self.n_envs, self.gru_hidden_dim, device=self.device)
         return ret
 
     def collect_rollouts(
@@ -135,10 +155,7 @@ class HSWVimePPO(PPO):
         rollout_buffer: TransitionRolloutBuffer,
         n_rollout_steps: int,
     ) -> bool:
-        """
-        Collect experiences using the current policy and fill a RolloutBuffer.
-        Intrinsic rewards are zeroed (placeholder until forward predictor is added).
-        """
+        """Collect experiences using the current policy and fill a RolloutBuffer."""
         assert self._last_obs is not None, "No previous observation was provided"
         assert self._prev_last_obs is not None, "No previous observation was provided"
         assert self._prev_action is not None, "No previous action was provided"
@@ -160,8 +177,15 @@ class HSWVimePPO(PPO):
                 s_tm1 = obs_as_tensor(self._prev_last_obs, self.device)
                 a_tm1 = obs_as_tensor(self._prev_action, self.device)
                 s_t = obs_as_tensor(self._last_obs, self.device)
-                actions, values, log_probs = self.policy.forward(s_tm1, a_tm1, s_t)
+                actions, values, log_probs, h_mem = self.policy.forward(
+                    s_tm1, a_tm1, s_t, h_prev=self._gru_hidden,
+                )
             actions = actions.cpu().numpy()
+
+            # Save GRU state before stepping
+            gru_h_np = None
+            if self.gru_hidden_dim > 0:
+                gru_h_np = self._gru_hidden.squeeze(0).cpu().numpy()  # (n_envs, H)
 
             clipped_actions = actions
             if isinstance(self.action_space, spaces.Box):
@@ -178,6 +202,11 @@ class HSWVimePPO(PPO):
                 intrinsic_rewards = self.policy.vae_feature_extractor.intrinsic_reward(
                     s_t, a_t_tensor, obs_as_tensor(new_obs, self.device),
                 ).cpu().numpy()
+
+            # Normalize intrinsic rewards
+            if self.intrinsic_rms is not None:
+                self.intrinsic_rms.update(intrinsic_rewards)
+                intrinsic_rewards = self.intrinsic_rms.normalize(intrinsic_rewards)
 
             self.num_timesteps += env.num_envs
 
@@ -202,7 +231,7 @@ class HSWVimePPO(PPO):
                         s_tp1 = obs_as_tensor(new_obs, self.device)
                         a_t = obs_as_tensor(actions, self.device)
                         terminal_value = self.policy.predict_values(
-                            s_t[idx:idx+1], a_t[idx:idx+1], s_tp1[idx:idx+1]
+                            s_t[idx:idx+1], a_t[idx:idx+1], s_tp1[idx:idx+1],
                         ).item()
                     rewards[idx] += self.gamma * terminal_value
 
@@ -217,7 +246,16 @@ class HSWVimePPO(PPO):
                 log_probs,
                 self._prev_action,
                 intrinsic_rewards,
+                gru_h_np,
             )
+
+            # Update GRU hidden state (keep h_mem from policy forward)
+            if self.gru_hidden_dim > 0:
+                self._gru_hidden = h_mem
+                # Reset GRU state for done envs
+                for idx, done in enumerate(dones):
+                    if done:
+                        self._gru_hidden[:, idx, :] = 0.0
 
             self._prev_last_obs = self._last_obs
             self._prev_action = actions
@@ -238,10 +276,10 @@ class HSWVimePPO(PPO):
         return True
 
     def train(self) -> None:
-        """
-        Update policy using the currently gathered rollout buffer.
-        """
+        """Update policy using the currently gathered rollout buffer."""
         self.policy.set_training_mode(True)
+
+        # Update PPO optimizer LR (VAE optimizer has fixed LR)
         self._update_learning_rate(self.policy.optimizer)
         clip_range = self.clip_range(self._current_progress_remaining)
         if self.clip_range_vf is not None:
@@ -258,8 +296,10 @@ class HSWVimePPO(PPO):
         clip_fractions = []
         vae_losses = []
         vae_recon_losses, vae_kl_losses, vae_fwd_losses = [], [], []
-        grad_norms = []
+        vae_aux_losses = []
+        ppo_grad_norms, vae_grad_norms = [], []
         all_approx_kl_divs = []
+        rho_means, rho_stds = [], []
 
         continue_training = True
         for epoch in range(self.n_epochs):
@@ -269,11 +309,18 @@ class HSWVimePPO(PPO):
                 if isinstance(self.action_space, spaces.Discrete):
                     actions = rollout_data.actions.long().flatten()
 
-                values, log_prob, entropy = self.policy.evaluate_actions(
+                # Reconstruct GRU hidden for single-step BPTT
+                h_prev = None
+                if self.gru_hidden_dim > 0:
+                    # (B, H) -> (1, B, H), detached so no BPTT beyond one step
+                    h_prev = rollout_data.gru_hidden_states.unsqueeze(0).detach()
+
+                values, log_prob, entropy, _ = self.policy.evaluate_actions(
                     rollout_data.prev_observations,
                     rollout_data.prev_actions,
                     rollout_data.observations,
                     actions,
+                    h_prev,
                 )
                 values = values.flatten()
                 advantages = rollout_data.advantages
@@ -305,28 +352,60 @@ class HSWVimePPO(PPO):
                     entropy_loss = -th.mean(entropy)
                 entropy_losses.append(entropy_loss.item())
 
-                # VAE loss
-                vae_t = self.policy.vae_feature_extractor.forward(
+                # ── PPO loss + optimization ──
+                ppo_loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                self.policy.optimizer.zero_grad()
+                ppo_loss.backward()
+
+                ppo_params = (list(self.policy.mlp_extractor.parameters()) +
+                              list(self.policy.value_net.parameters()) +
+                              list(self.policy.action_net.parameters()))
+                if self.policy.gru is not None:
+                    ppo_params += list(self.policy.gru.parameters())
+
+                ppo_gn = th.nn.utils.clip_grad_norm_(ppo_params, self.max_grad_norm)
+                ppo_grad_norms.append(ppo_gn.item())
+                self.policy.optimizer.step()
+
+                # ── VAE loss + optimization (separate optimizer) ──
+                vae_out = self.policy.vae_feature_extractor.forward(
                     rollout_data.prev_observations,
                     rollout_data.prev_actions,
                     rollout_data.observations,
                 )
-                vae_loss_obj = self.policy.vae_feature_extractor.loss(vae_t)
+                vae_loss_obj = self.policy.vae_feature_extractor.loss(vae_out)
                 vae_loss = (
                     self.vae_recon_coef * vae_loss_obj.recon_loss
                     + effective_vae_kl_coef * vae_loss_obj.kl_loss
                 )
                 if vae_loss_obj.aux_loss is not None:
                     vae_loss = vae_loss + vae_loss_obj.aux_loss
+                    vae_aux_losses.append(vae_loss_obj.aux_loss.item())
                 if vae_loss_obj.fwd_loss is not None:
                     vae_loss = vae_loss + self.vae_fwd_coef * vae_loss_obj.fwd_loss
                     vae_fwd_losses.append(vae_loss_obj.fwd_loss.item())
+
+                self.vae_optimizer.zero_grad()
+                vae_loss.backward()
+                vae_gn = th.nn.utils.clip_grad_norm_(
+                    self.policy.vae_feature_extractor.parameters(), self.aux_max_grad_norm,
+                )
+                vae_grad_norms.append(vae_gn.item())
+                self.vae_optimizer.step()
 
                 vae_losses.append(vae_loss.item())
                 vae_recon_losses.append(vae_loss_obj.recon_loss.item())
                 vae_kl_losses.append(vae_loss_obj.kl_loss.item())
 
-                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + vae_loss
+                # Track rho stats
+                if hasattr(vae_out, 'rho') and vae_out.rho is not None:
+                    with th.no_grad():
+                        rho = vae_out.rho
+                        # For spCauchy, rho is concentration; for Gaussian, rho slot holds logvar
+                        if rho.shape[-1] == 1:  # spCauchy: rho is (B, 1)
+                            rho_means.append(rho.mean().item())
+                            rho_stds.append(rho.std().item())
 
                 with th.no_grad():
                     log_ratio = log_prob - rollout_data.old_log_prob
@@ -340,54 +419,46 @@ class HSWVimePPO(PPO):
                         print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
                     break
 
-                # Optimization step
-                self.policy.optimizer.zero_grad()
-                loss.backward()
-
-                ppo_params = (list(self.policy.mlp_extractor.parameters()) +
-                              list(self.policy.value_net.parameters()) +
-                              list(self.policy.action_net.parameters()))
-                vae_params = list(self.policy.vae_feature_extractor.parameters())
-
-                for name, params in [("ppo", ppo_params), ("vae", vae_params)]:
-                    total = th.nn.utils.clip_grad_norm_(params, float("inf"))
-                    self.logger.record(f"debug/{name}_grad_norm", total.item())
-
-                grad_norm = th.nn.utils.clip_grad_norm_(ppo_params, self.max_grad_norm)
-                th.nn.utils.clip_grad_norm_(vae_params, self.aux_max_grad_norm)
-                grad_norms.append(grad_norm.item())
-
-                self.policy.optimizer.step()
-
             self._n_updates += 1
             if not continue_training:
                 break
 
         explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
 
-        # Logs
-        self.logger.record("rewards/intrinsic_reward_mean", self.rollout_buffer.intrinsic_rewards.mean())
-        self.logger.record("rewards/intrinsic_reward_std", self.rollout_buffer.intrinsic_rewards.std())
-        self.logger.record("rewards/extrinsic_reward_mean", self.rollout_buffer.rewards.mean())
-        self.logger.record("rewards/extrinsic_reward_std", self.rollout_buffer.rewards.std())
+        # ── Logging ──
+        # Rewards
+        self.logger.record("rewards/intrinsic_mean", self.rollout_buffer.intrinsic_rewards.mean())
+        self.logger.record("rewards/intrinsic_std", self.rollout_buffer.intrinsic_rewards.std())
+        self.logger.record("rewards/extrinsic_mean", self.rollout_buffer.rewards.mean())
+        self.logger.record("rewards/extrinsic_std", self.rollout_buffer.rewards.std())
+
+        # PPO
         self.logger.record("train/entropy_loss", np.mean(entropy_losses))
         self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
         self.logger.record("train/value_loss", np.mean(value_losses))
-        self.logger.record("vae/vae_loss", np.mean(vae_losses))
-        self.logger.record("vae/vae_recon_loss", np.mean(vae_recon_losses))
-        self.logger.record("vae/vae_kl_loss", np.mean(vae_kl_losses))
-        if vae_fwd_losses:
-            self.logger.record("vae/vae_fwd_loss", np.mean(vae_fwd_losses))
         self.logger.record("train/approx_kl", np.mean(all_approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
-        self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
-        self.logger.record("train/grad_norm", np.mean(grad_norms))
-        if hasattr(self.policy, "log_std"):
-            self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+        self.logger.record("train/ppo_grad_norm", np.mean(ppo_grad_norms))
 
-        self.logger.record("train/vae_kl_coef", effective_vae_kl_coef)
+        # VAE
+        self.logger.record("vae/total_loss", np.mean(vae_losses))
+        self.logger.record("vae/recon_loss", np.mean(vae_recon_losses))
+        self.logger.record("vae/kl_loss", np.mean(vae_kl_losses))
+        self.logger.record("vae/kl_coef", effective_vae_kl_coef)
+        self.logger.record("vae/grad_norm", np.mean(vae_grad_norms))
+        if vae_fwd_losses:
+            self.logger.record("vae/fwd_loss", np.mean(vae_fwd_losses))
+        if vae_aux_losses:
+            self.logger.record("vae/uniformity_loss", np.mean(vae_aux_losses))
+        if rho_means:
+            self.logger.record("vae/rho_mean", np.mean(rho_means))
+            self.logger.record("vae/rho_std", np.mean(rho_stds))
+
+        # Meta
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+        if hasattr(self.policy, "log_std"):
+            self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
