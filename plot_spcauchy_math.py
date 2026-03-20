@@ -7,8 +7,8 @@ Usage:
 Produces 8 subplots:
   (a) KL divergence to uniform vs ρ for d ∈ {8,16,32,64}
   (b) Quadratic approximation near ρ=0 confirming curvature formula
-  (c) Collapse curvature: paper's 2(d-1) vs correct 4(d-1)²/d
-  (d) Paper underestimation factor 2(d-1)/d → 2
+  (c) Collapse curvature: old 2(d-1) vs corrected 4(d-1)²/d
+  (d) Old analysis underestimation factor 2(d-1)/d → 2
   (e) Möbius sample concentration at different ρ
   (f) Möbius sample norm deviation from 1 (ppm)
   (g) KL derivative (monotonicity check)
@@ -71,10 +71,10 @@ def plot_curvature(ax):
     dims_arr = np.array(dims_range)
     ax.plot(dims_arr, curvatures, 'ko', markersize=3, label='Numerical (autograd)', zorder=3)
     ax.plot(dims_arr, 4*(dims_arr-1)**2/dims_arr, 'r-', linewidth=2, label=r'$4(d{-}1)^2/d$ (correct)', zorder=2)
-    ax.plot(dims_arr, 2*(dims_arr-1), 'b--', linewidth=2, label=r'$2(d{-}1)$ (paper claim)', zorder=1)
+    ax.plot(dims_arr, 2*(dims_arr-1), 'b--', linewidth=2, label=r'$2(d{-}1)$ (old analysis)', zorder=1)
     ax.set_xlabel('Dimension d', fontsize=12)
     ax.set_ylabel(r"$d^2 KL / d\rho^2$ at $\rho=0$", fontsize=12)
-    ax.set_title('(c) Collapse Curvature: Paper vs Correct Formula', fontsize=14, fontweight='bold')
+    ax.set_title('(c) Collapse Curvature: Old vs Corrected Formula', fontsize=14, fontweight='bold')
     ax.legend(fontsize=11)
     ax.grid(True, alpha=0.3)
 
@@ -82,19 +82,19 @@ def plot_curvature(ax):
 def plot_underestimation(ax):
     dims_arr = np.arange(4, 129, 2)
     correct = 4 * (dims_arr - 1)**2 / dims_arr
-    paper = 2 * (dims_arr - 1)
-    ratio = correct / paper
+    old = 2 * (dims_arr - 1)
+    ratio = correct / old
     ax.plot(dims_arr, ratio, 'r-', linewidth=2.5, label=r'$2(d-1)/d$')
     ax.axhline(y=2, color='gray', linestyle=':', alpha=0.5, label='Asymptote = 2')
-    ax.axhline(y=1, color='blue', linestyle=':', alpha=0.5, label='Paper claim = 1')
+    ax.axhline(y=1, color='blue', linestyle=':', alpha=0.5, label='Old analysis = 1')
     for dim in DIMS:
         r = 2*(dim-1)/dim
         ax.plot(dim, r, 'ko', markersize=8, zorder=3)
         ax.annotate(f'd={dim}\n{r:.2f}x', (dim, r), textcoords="offset points",
                      xytext=(10, -5), fontsize=9)
     ax.set_xlabel('Dimension d', fontsize=12)
-    ax.set_ylabel('Actual / Paper Claim', fontsize=12)
-    ax.set_title('(d) Paper Underestimation Factor', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Corrected / Old Analysis', fontsize=12)
+    ax.set_title('(d) Old Analysis Underestimation Factor', fontsize=14, fontweight='bold')
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     ax.set_ylim(0.5, 2.5)
