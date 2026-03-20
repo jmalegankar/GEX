@@ -33,7 +33,7 @@ class SCVAEConfig:
     epochs:           int        = 100
 
     # ── Free bits ──────────────────────────────────────────────────
-    free_bits:        float      = 0.5   # min KL per sample (nats); 0 disables
+    free_bits:        float      = 0.0   # min KL per sample (nats); 0 disables
 
     # ── KL annealing ───────────────────────────────────────────────
     kl_warmup_epochs: int        = 0     # beta=0 for this many epochs

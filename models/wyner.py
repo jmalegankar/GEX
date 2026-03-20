@@ -5,7 +5,7 @@ from typing import Optional, List, Tuple
 
 import math
 
-
+@th.jit.script
 def sinusoidal_timestep_encoding(timesteps: th.Tensor, embed_dim: int) -> th.Tensor:
     """Convert integer timesteps (B,) or (B,1) to sinusoidal positional encoding (B, embed_dim)."""
     timesteps = timesteps.view(-1)  # ensure (B,)
@@ -238,7 +238,7 @@ class WynerIndependentVAE(nn.Module):
         decode_hidden: int = 128,
         state_dim: int = 0,
         state_tokens: int = 0,
-        free_bits: float = 0.5,
+        free_bits: float = 0.0,
         pos_embed_dim: int = 16,
     ):
         super().__init__()
