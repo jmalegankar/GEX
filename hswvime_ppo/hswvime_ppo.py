@@ -35,13 +35,13 @@ class HSWVimePPO(PPO):
         policy: HSWVIMEActorCriticPolicy,
         env: Union[GymEnv, str],
         null_action: np.ndarray,
-        learning_rate: Union[float, Schedule] = 3e-4,
+        learning_rate: Union[float, Schedule] = 1e-4,
         n_steps: int = 2048,
-        batch_size: int = 64,
+        batch_size: int = 256,
         n_epochs: int = 10,
         gamma: float = 0.99,
         gae_lambda: float = 0.95,
-        clip_range: Union[float, Schedule] = 0.2,
+        clip_range: Union[float, Schedule] = 0.1,
         clip_range_vf: Union[None, float, Schedule] = None,
         normalize_advantage: bool = True,
         ent_coef: float = 0.0,
@@ -73,7 +73,7 @@ class HSWVimePPO(PPO):
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         episodic_memory_class: type = BatchedNoveltyMemory,
         episodic_memory_kwargs: Optional[dict[str, Any]] = None,
-        aux_max_grad_norm: float = 5.0,
+        aux_max_grad_norm: float = 500.0,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"] = vae_features_extractor_class
@@ -495,7 +495,7 @@ class HSWVimePPO(PPO):
                         None,
                         timestep=questions,
                     )
-                    wyner_loss_obj.recon_next_loss += F.mse_loss(recon_next_answers, rollout_data.answers[:, idx, ...])
+                    qa_loss += F.mse_loss(recon_next_answers, rollout_data.answers[:, idx, ...])
 
                 wyner_loss = (
                     self.wyner_recon_coef * (
