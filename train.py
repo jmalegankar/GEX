@@ -129,7 +129,7 @@ def parse_args():
     p.add_argument("--vae_kl_coef",     type=float, default=0.01)
     p.add_argument("--wyner_recon_coef",type=float, default=1.0)
     p.add_argument("--wyner_kl_coef",   type=float, default=0.01)
-    p.add_argument("--intrinsic_scale", type=float, default=1.0)
+    p.add_argument("--intrinsic_scale", type=float, default=0.0)
     p.add_argument("--kl_use_schedule", action="store_true",
                    help="Enable KL coefficient annealing from 0 to target over kl_anneal_steps.")
     p.add_argument("--kl_anneal_steps", type=int, default=50_000,
@@ -149,7 +149,7 @@ def parse_args():
                    help="Dimension of sinusoidal positional embedding for timestep in Wyner.")
 
     # Logging
-    p.add_argument("--tensorboard_log", type=str, default=None)
+    p.add_argument("--tensorboard_log", type=str, default="runs/histogram")
     p.add_argument("--verbose",         type=int, default=1)
 
     # Rendering

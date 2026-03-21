@@ -22,11 +22,15 @@ class QASampler:
             self.timesteps[idx] = 0
             self.means[idx] = 0.0
             self.exmeansq[idx] = 0.0
+            self._cur_questions[idx, :] = 0
+            self._cur_answers[idx, :, :] = 0.0
         else:
             self.scores[...] = 0
             self.timesteps[...] = 0
             self.means[...] = 0.0
             self.exmeansq[...] = 0.0
+            self._cur_questions[...] = 0
+            self._cur_answers[...] = 0.0
     
     def update(self, scores: np.ndarray, answers: np.ndarray):
         assert np.isnan(scores).any() == False, "Scores contain NaN values"
