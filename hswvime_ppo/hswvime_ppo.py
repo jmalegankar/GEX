@@ -66,6 +66,7 @@ class HSWVimePPO(PPO):
         vae_features_extractor_class: VAEInterface = TransitionSCVAE,
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         normalize_intrinsic: bool = True,
+        intrinsic_coef: float = 1.0,
         gru_hidden_dim: int = 0,
     ):
         policy_kwargs = policy_kwargs or {}
@@ -114,6 +115,7 @@ class HSWVimePPO(PPO):
         self.aux_max_grad_norm = aux_max_grad_norm
         self.null_action = null_action
         self.normalize_intrinsic = normalize_intrinsic
+        self.intrinsic_coef = intrinsic_coef
         self.gru_hidden_dim = gru_hidden_dim
 
         self._prev_last_obs = None
@@ -203,10 +205,11 @@ class HSWVimePPO(PPO):
                     s_t, a_t_tensor, obs_as_tensor(new_obs, self.device),
                 ).cpu().numpy()
 
-            # Normalize intrinsic rewards
+            # Normalize and scale intrinsic rewards
             if self.intrinsic_rms is not None:
                 self.intrinsic_rms.update(intrinsic_rewards)
                 intrinsic_rewards = self.intrinsic_rms.normalize(intrinsic_rewards)
+            intrinsic_rewards *= self.intrinsic_coef
 
             self.num_timesteps += env.num_envs
 

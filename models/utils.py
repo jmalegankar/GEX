@@ -172,4 +172,11 @@ class RunningMeanStd:
         self.count = tot_count
 
     def normalize(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.mean) / (np.sqrt(self.var) + 1e-8)
+        """Normalize by dividing by running std only (no mean subtraction).
+
+        Intrinsic rewards are non-negative by construction (MSE). Subtracting
+        the running mean would make them negative as the predictor improves,
+        effectively punishing exploration. This matches the RND paper's
+        normalization scheme.
+        """
+        return x / (np.sqrt(self.var) + 1e-8)

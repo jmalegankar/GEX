@@ -5,14 +5,26 @@ import gymnasium
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 
-from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper
-from models.embeddings import CategoricalGridWithDirEmbedding
+from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper, CrafterTrainingWrapper
+from models.embeddings import CategoricalGridWithDirEmbedding, CrafterCNNEmbedding
 from models.config import SCVAEConfig, GaussianVAEConfig
 from models.vae import TransitionSCVAE, TransitionGaussianVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, SimpleVAEFeaturesExtractor
 
 import minigrid
+
+# ── Register custom MiniGrid environments ─────────────────────────────
+gymnasium.register(
+    id="MiniGrid-MultiRoom-N7-S4-v0",
+    entry_point="minigrid.envs.multiroom:MultiRoomEnv",
+    kwargs={"minNumRooms": 7, "maxNumRooms": 7, "maxRoomSize": 4},
+)
+gymnasium.register(
+    id="MiniGrid-MultiRoom-N12-S10-v0",
+    entry_point="minigrid.envs.multiroom:MultiRoomEnv",
+    kwargs={"minNumRooms": 12, "maxNumRooms": 12, "maxRoomSize": 10},
+)
 
 
 # ── Callbacks ──────────────────────────────────────────────────────────
@@ -101,12 +113,16 @@ N_DIRS         = 4
 
 # Predefined environment suite for experiments
 ENV_SUITE = {
-    "door_button":    {"desc": "DoorButton 10x10 (custom)", "max_steps": 200},
-    "keycorridor":    {"id": "MiniGrid-KeyCorridorS3R3-v0", "max_steps": 400},
-    "obstructed":     {"id": "MiniGrid-ObstructedMaze-1Dl-v0", "max_steps": 400},
-    "multiroom":      {"id": "MiniGrid-MultiRoom-N4-S5-v0", "max_steps": 400},
-    "doorkey":        {"id": "MiniGrid-DoorKey-8x8-v0", "max_steps": 300},
-    "multiroom_hard": {"id": "MiniGrid-MultiRoom-N6-v0", "max_steps": 600},
+    "door_button":      {"desc": "DoorButton 10x10 (custom)", "max_steps": 200},
+    "keycorridor":      {"id": "MiniGrid-KeyCorridorS3R3-v0", "max_steps": 400},
+    "keycorridor_s4r3": {"id": "MiniGrid-KeyCorridorS4R3-v0", "max_steps": 600},
+    "obstructed":       {"id": "MiniGrid-ObstructedMaze-1Dl-v0", "max_steps": 400},
+    "multiroom":        {"id": "MiniGrid-MultiRoom-N4-S5-v0", "max_steps": 400},
+    "multiroom_n7s4":   {"id": "MiniGrid-MultiRoom-N7-S4-v0", "max_steps": 1000},
+    "multiroom_n12s10": {"id": "MiniGrid-MultiRoom-N12-S10-v0", "max_steps": 2000},
+    "doorkey":          {"id": "MiniGrid-DoorKey-8x8-v0", "max_steps": 300},
+    "multiroom_hard":   {"id": "MiniGrid-MultiRoom-N6-v0", "max_steps": 600},
+    "crafter":          {"desc": "Crafter (64x64 RGB pixel)", "max_steps": 10_000, "domain": "crafter"},
 }
 
 
@@ -115,6 +131,15 @@ def resolve_env_name(env_name: str) -> str:
     if env_name in ENV_SUITE and "id" in ENV_SUITE[env_name]:
         return ENV_SUITE[env_name]["id"]
     return env_name
+
+
+def _get_domain(env_name: str) -> str:
+    """Return the domain type for an environment."""
+    if env_name in ENV_SUITE and "domain" in ENV_SUITE[env_name]:
+        return ENV_SUITE[env_name]["domain"]
+    if env_name == "door_button":
+        return "grid"
+    return "grid"  # default: MiniGrid
 
 
 def make_env_fn(env_name: str, view_size: int, env_kwargs: dict):
@@ -126,6 +151,9 @@ def make_env_fn(env_name: str, view_size: int, env_kwargs: dict):
             if render_mode is not None:
                 kwargs["render_mode"] = render_mode
             return DoorButtonTrainingWrapper(**kwargs)
+    elif _get_domain(env_name) == "crafter":
+        def _fn():
+            return CrafterTrainingWrapper(max_steps=env_kwargs.get("max_steps", 10_000))
     else:
         gym_id = resolve_env_name(env_name)
         def _fn():
@@ -203,7 +231,9 @@ def parse_args():
     p.add_argument("--vae_lr",            type=float, default=1e-3,
                    help="Learning rate for VAE + forward predictor optimizer.")
     p.add_argument("--normalize_intrinsic", action="store_true",
-                   help="Normalize intrinsic rewards with running mean/std.")
+                   help="Normalize intrinsic rewards by dividing by running std.")
+    p.add_argument("--intrinsic_coef", type=float, default=1.0,
+                   help="Scaling coefficient for intrinsic reward (applied after normalization).")
 
     # Checkpointing
     p.add_argument("--checkpoint_freq", type=int, default=50_000,
@@ -219,10 +249,12 @@ def parse_args():
     p.add_argument("--n_eval_episodes", type=int, default=10,
                    help="Number of eval episodes per evaluation.")
 
-    # Logging
-    p.add_argument("--tensorboard_log", type=str, default=None)
+    # Logging — tensorboard is always enabled (logs to runs/<run_name>/ by default).
+    # Add --wandb for additional W&B syncing.
+    p.add_argument("--tensorboard_log", type=str, default=None,
+                   help="Tensorboard log directory (default: runs/<run_name>/).")
     p.add_argument("--wandb",           action="store_true",
-                   help="Enable Weights & Biases logging.")
+                   help="Enable Weights & Biases logging (syncs from tensorboard).")
     p.add_argument("--wandb_project",   type=str, default="spcauchy-exploration",
                    help="WandB project name.")
     p.add_argument("--wandb_entity",    type=str, default=None,
@@ -275,9 +307,10 @@ def main():
             print("WARNING: wandb not installed. Install with: pip install wandb")
             args.wandb = False
 
-    # ── Tensorboard log dir ──
+    # ── Tensorboard log dir (always enabled) ──
     if args.tensorboard_log is None:
         args.tensorboard_log = os.path.join("runs", run_name)
+    print(f"Tensorboard: tensorboard --logdir {args.tensorboard_log}")
 
     # 1. Build env factory
     env_kwargs = {"max_steps": args.max_steps, "render_mode": "human" if args.render else None}
@@ -288,15 +321,24 @@ def main():
 
     # Probe one env to get obs/action dims
     _probe = env_fn()
-    obs_h, obs_w, _ = _probe.observation_space.shape   # (H, W, 4)
+    obs_shape = _probe.observation_space.shape   # (H, W, C)
+    obs_h, obs_w = obs_shape[0], obs_shape[1]
     act_dim = 1  # Discrete actions stored as raw indices (B, 1)
-    _probe.close()
+    try:
+        _probe.close()
+    except AttributeError:
+        pass  # Crafter env has no close()
 
     vec_env = make_vec_env(env_fn, n_envs=args.n_envs, seed=args.seed)
 
     # 2. Build models
-    embedding = build_embedding(obs_h, obs_w, args.embed_per_channel, args.dir_embed_dim)
-    conv_channels = [32, 64, 128]
+    domain = _get_domain(args.env)
+    if domain == "crafter":
+        embedding = CrafterCNNEmbedding(in_channels=3, out_channels=64)
+        conv_channels = [128]  # CrafterCNNEmbedding outputs (B, 64, 4, 4), one DownBlock → (B, 128, 2, 2) → pool
+    else:
+        embedding = build_embedding(obs_h, obs_w, args.embed_per_channel, args.dir_embed_dim)
+        conv_channels = [32, 64, 128]
 
     # 3. Policy kwargs
     policy_kwargs = {
@@ -349,6 +391,7 @@ def main():
         kl_use_schedule=args.kl_use_schedule,
         kl_anneal_steps=args.kl_anneal_steps,
         normalize_intrinsic=args.normalize_intrinsic,
+        intrinsic_coef=args.intrinsic_coef,
         gru_hidden_dim=args.gru_hidden_dim,
         policy_kwargs=policy_kwargs,
         vae_features_extractor_class=vae_class,
@@ -414,7 +457,7 @@ def main():
         f"  gamma={args.gamma}  gae={args.gae_lambda}  ent={args.ent_coef}  seed={args.seed}\n"
         f"  latent_type={args.latent_type}  vae_latent={args.vae_latent_dim}\n"
         f"  vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}  vae_fwd={args.vae_fwd_coef}\n"
-        f"  vae_lr={args.vae_lr}  gru_hidden_dim={args.gru_hidden_dim}  normalize_intrinsic={args.normalize_intrinsic}\n"
+        f"  vae_lr={args.vae_lr}  gru_hidden_dim={args.gru_hidden_dim}  normalize_intrinsic={args.normalize_intrinsic}  intrinsic_coef={args.intrinsic_coef}\n"
         f"  run_name={run_name}"
     )
     model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=callback)

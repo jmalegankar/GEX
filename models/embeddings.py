@@ -127,7 +127,47 @@ class PixelCNNEmbedding(nn.Module):
 
 
 # ============================================================
-# 3) Vector embedding
+# 3) Crafter CNN embedding (64×64 RGB)
+# ============================================================
+
+class CrafterCNNEmbedding(nn.Module):
+    """
+    3-layer CNN for 64×64 RGB pixel observations (Crafter).
+
+    Input:  (B, 3, 64, 64) float — SB3 auto-transposes image obs via VecTransposeImage
+    Output: (B, 64, 4, 4)
+
+    Spatial reduction: 64 → 15 → 6 → 4
+    The output feeds into ConvEncoder for further processing.
+    """
+
+    def __init__(self, in_channels: int = 3, out_channels: int = 64):
+        super().__init__()
+
+        self.cnn = nn.Sequential(
+            nn.Conv2d(in_channels, 32, 8, stride=4),  # 64 → 15
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 4, stride=2),           # 15 → 6
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, out_channels, 3, stride=1),  # 6 → 4
+            nn.ReLU(inplace=True),
+        )
+
+        self._meta = EmbeddingMeta(out_channels, 4, 4, True)
+
+    def meta(self) -> EmbeddingMeta:
+        return self._meta
+
+    def forward(self, obs: torch.Tensor) -> torch.Tensor:
+        # SB3 VecTransposeImage already converts (B, H, W, C) → (B, C, H, W)
+        x = obs.float()
+        if x.max() > 1.0:
+            x = x / 255.0
+        return self.cnn(x)
+
+
+# ============================================================
+# 4) Vector embedding
 # ============================================================
 
 # Example: Box2D obs (B, D) with D continuous variables.
@@ -155,7 +195,7 @@ class VectorToMapEmbedding(nn.Module):
 
 
 # ============================================================
-# 4) Categorical grid + direction embedding (DoorButtonEnv)
+# 5) Categorical grid + direction embedding (DoorButtonEnv)
 # ============================================================
 
 # Input: (B, H, W, 4) int tensor — channels 0-2 are (object_type, color, state),

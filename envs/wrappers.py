@@ -101,3 +101,57 @@ class MiniGridTrainingWrapper(gymnasium.Wrapper):
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         return self._pack_obs(obs), reward, terminated, truncated, info
+
+
+class CrafterTrainingWrapper(gymnasium.Env):
+    """
+    Gymnasium wrapper around Crafter for SB3 training.
+
+    Observation: (64, 64, 3) uint8 RGB — passed through as-is.
+    Action: Discrete(17).
+    Tracks per-achievement success rates in info for achievement score reporting.
+    """
+
+    metadata = {"render_modes": ["rgb_array"]}
+
+    def __init__(self, max_steps: int = 10_000, **kwargs):
+        super().__init__()
+        import crafter
+        self._env = crafter.Env()
+        self._max_steps = max_steps
+        self._step_count = 0
+
+        self.observation_space = spaces.Box(
+            low=0, high=255, shape=(64, 64, 3), dtype=np.uint8,
+        )
+        self.action_space = spaces.Discrete(17)
+
+        # Track cumulative achievements across episode
+        self._achievements = None
+
+    def reset(self, *, seed=None, options=None):
+        obs = self._env.reset()
+        self._step_count = 0
+        self._achievements = None
+        return obs.astype(np.uint8), {}
+
+    def step(self, action):
+        obs, reward, done, info = self._env.step(action)
+        self._step_count += 1
+
+        # Track achievements (cumulative max per episode)
+        if "achievements" in info:
+            if self._achievements is None:
+                self._achievements = dict(info["achievements"])
+            else:
+                for k, v in info["achievements"].items():
+                    self._achievements[k] = max(self._achievements[k], v)
+
+        truncated = self._step_count >= self._max_steps and not done
+        terminated = done
+
+        out_info = {}
+        if self._achievements is not None:
+            out_info["achievements"] = dict(self._achievements)
+
+        return obs.astype(np.uint8), float(reward), terminated, truncated, out_info
