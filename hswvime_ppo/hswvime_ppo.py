@@ -338,6 +338,27 @@ class HSWVimePPO(PPO):
         self.logger.record("intrinsic/wyner_kl_mean", np.mean(_wyner_kl_log))
         self.logger.record("intrinsic/episodic_novel_frac", np.mean(_episodic_novel_log))
 
+        # --- QA offset diagnostics (must run before train()/get() flattens arrays) ---
+        qa_offsets = rollout_buffer.timesteps[:, :, None] - rollout_buffer.questions
+        qa_offsets_flat = qa_offsets.flatten()
+        self.logger.record("qa_debug/offset_mean", float(np.mean(qa_offsets_flat)))
+        self.logger.record("qa_debug/offset_median", float(np.median(qa_offsets_flat)))
+        self.logger.record("qa_debug/offset_std", float(np.std(qa_offsets_flat)))
+        self.logger.record("qa_debug/offset_min", float(np.min(qa_offsets_flat)))
+        self.logger.record("qa_debug/offset_max", float(np.max(qa_offsets_flat)))
+        self.logger.record("qa_debug/offset_neg_frac", float(np.mean(qa_offsets_flat < 0)))
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.hist(qa_offsets_flat, bins=min(50, max(int(qa_offsets_flat.max()) + 1, 10)), edgecolor="black")
+        ax.set_xlabel("QA Offset (current_timestep - question_timestep)")
+        ax.set_ylabel("Count")
+        ax.set_title(f"QA Offset Distribution (step {self.num_timesteps})")
+        fig.tight_layout()
+        plot_dir = os.path.join(self.logger.dir, "qa_debug") if self.logger.dir else "qa_debug"
+        os.makedirs(plot_dir, exist_ok=True)
+        fig.savefig(os.path.join(plot_dir, f"qa_offsets_{self.num_timesteps}.png"), dpi=100)
+        plt.close(fig)
+
         callback.update_locals(locals())
 
         callback.on_rollout_end()
@@ -592,23 +613,3 @@ class HSWVimePPO(PPO):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
-        # --- QA offset diagnostics ---
-        buf = self.rollout_buffer
-        qa_offsets = buf.timesteps[:, :, None] - buf.questions  # (buffer_size, n_envs, num_qa)
-        qa_offsets_flat = qa_offsets.flatten()
-        self.logger.record("qa_debug/offset_mean", float(np.mean(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_median", float(np.median(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_std", float(np.std(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_max", float(np.max(qa_offsets_flat)))
-
-
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.hist(qa_offsets_flat, bins=min(50, max(int(qa_offsets_flat.max()) + 1, 10)), edgecolor="black")
-        ax.set_xlabel("QA Offset (current_timestep - question_timestep)")
-        ax.set_ylabel("Count")
-        ax.set_title(f"QA Offset Distribution (step {self.num_timesteps})")
-        fig.tight_layout()
-        plot_dir = os.path.join(self.logger.dir, "qa_debug") if self.logger.dir else "qa_debug"
-        os.makedirs(plot_dir, exist_ok=True)
-        fig.savefig(os.path.join(plot_dir, f"qa_offsets_{self.num_timesteps}.png"), dpi=100)
-        plt.close(fig)
