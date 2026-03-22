@@ -49,6 +49,7 @@ class WynerOutput:
         recon_next: Optional[th.Tensor] = None,
         prior_mu: Optional[th.Tensor] = None,
         prior_logvar: Optional[th.Tensor] = None,
+        posterior_mu: Optional[th.Tensor] = None,  # LBS: separate from w when w = h_t
     ):
         self.recon = recon
         self.recon_next = recon_next
@@ -56,6 +57,7 @@ class WynerOutput:
         self.logvar = logvar
         self.prior_mu = prior_mu
         self.prior_logvar = prior_logvar
+        self.posterior_mu = posterior_mu
 
 
 @th.jit.script
@@ -355,3 +357,277 @@ class WynerIndependentVAE(nn.Module):
             recon_next_loss = None
 
         return WynerLoss(kl_loss=kl_loss, recon_loss=recon_loss, recon_next_loss=recon_next_loss)
+    
+class WynerLBSVAE(nn.Module):
+    """
+    Wyner VAE with LBS-inspired separation of deterministic and stochastic paths.
+
+    The GRU maintains a deterministic hidden state h_t that summarises episode history.
+    The prior predicts from h_{t-1} (before seeing the current observation).
+    The posterior updates from h_t (after the GRU incorporates μ_t), optionally
+    conditioning on μ_{t+1} for the Wyner bidirectional constraint.
+
+    Intrinsic reward = KL(posterior ‖ prior) = Bayesian surprise in latent space.
+    """
+
+    def __init__(
+        self,
+        recon_dim: int,
+        mu_dim: int,
+        latent_dim: int,
+        latent_tokens: int = 1,
+        decode_hidden: int = 128,
+        state_dim: int = 0,      # unused, kept for interface compat
+        state_tokens: int = 0,   # unused, kept for interface compat
+        free_bits: float = 0.0,
+        pos_embed_dim: int = 16,
+    ):
+        super().__init__()
+        assert latent_tokens == 1, "Only single-token implemented."
+
+        self.mu_dim = mu_dim
+        self.latent_dim = latent_dim
+        self.latent_tokens = latent_tokens
+        self.recon_dim = recon_dim
+        self.free_bits = free_bits
+        self.pos_embed_dim = pos_embed_dim
+
+        # ── Deterministic recurrence ──────────────────────────────
+        # h_t = GRU(proj(μ_t) ‖ pos(t), h_{t-1})
+        self.proj_mu_gru = nn.Linear(mu_dim, mu_dim)
+        self.gru = nn.GRUCell(
+            input_size=mu_dim + pos_embed_dim,
+            hidden_size=latent_dim,          # h_t has same dim as z for simplicity
+        )
+
+        # ── Prior p(z_t | h_{t-1}) ────────────────────────────────
+        # Predicts BEFORE seeing the current observation.
+        self.prior_trunk = nn.Sequential(
+            nn.Linear(latent_dim, decode_hidden),
+            nn.ReLU(),
+            nn.Linear(decode_hidden, decode_hidden),
+            nn.ReLU(),
+        )
+        self.prior_fc_mu = nn.Linear(decode_hidden, latent_dim)
+        self.prior_fc_logvar = nn.Linear(decode_hidden, latent_dim)
+        nn.init.zeros_(self.prior_fc_logvar.bias)
+
+        # ── Posterior q(z_t | h_t [, μ_{t+1}]) ───────────────────
+        # Two projections summed: h_t always present, μ_{t+1} optional.
+        # When μ_{t+1} is absent (rollout), only the h branch fires.
+        self.post_proj_h = nn.Linear(latent_dim, decode_hidden)
+        self.post_proj_mu_next = nn.Linear(mu_dim, decode_hidden)
+        self.post_trunk = nn.Sequential(
+            nn.ReLU(),
+            nn.Linear(decode_hidden, decode_hidden),
+            nn.ReLU(),
+        )
+        self.post_fc_mu = nn.Linear(decode_hidden, latent_dim)
+        self.post_fc_logvar = nn.Linear(decode_hidden, latent_dim)
+        nn.init.zeros_(self.post_fc_logvar.bias)
+
+        # ── Decoder: z + timestep → reconstruction ────────────────
+        self.decoder = WynerIndependentDecoder(
+            latent_dim=latent_dim,
+            latent_tokens=latent_tokens,
+            recon_dim=recon_dim,
+            decode_hidden=decode_hidden,
+            pos_embed_dim=pos_embed_dim,
+        )
+
+    # ──────────────────────────────────────────────────────────────
+    # Internal helpers
+    # ──────────────────────────────────────────────────────────────
+
+    def _timestep_encoding(self, timestep: Optional[th.Tensor], batch_size: int, device: th.device) -> th.Tensor:
+        if timestep is not None:
+            return sinusoidal_timestep_encoding(timestep, self.pos_embed_dim)
+        return th.zeros(batch_size, self.pos_embed_dim, device=device)
+
+    def _gru_step(self, h_prev: th.Tensor, mu: th.Tensor, timestep: Optional[th.Tensor]) -> th.Tensor:
+        """Run one GRU step: h_t = GRU(proj(μ_t) ‖ pos(t), h_{t-1})."""
+        gru_input = self.proj_mu_gru(mu)
+        pos_emb = self._timestep_encoding(timestep, mu.size(0), mu.device)
+        gru_input = th.cat([gru_input, pos_emb], dim=-1)
+        # h_prev may be (B, 1, D) from buffer — squeeze to (B, D)
+        h = h_prev.squeeze(1) if h_prev.dim() == 3 else h_prev
+        return self.gru(gru_input, h)
+
+    def _prior(self, h_prev: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """Prior p(z | h_{t-1}): predict BEFORE seeing current obs."""
+        h = h_prev.squeeze(1) if h_prev.dim() == 3 else h_prev
+        feat = self.prior_trunk(h)
+        return self.prior_fc_mu(feat), self.prior_fc_logvar(feat)
+
+    def _posterior(self, h_t: th.Tensor, mu_next: Optional[th.Tensor] = None) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Posterior q(z | h_t [, μ_{t+1}]).
+
+        During training (mu_next given):
+            Wyner posterior — sees both the GRU-updated state and the
+            next transition encoding, satisfying the bidirectional condition.
+
+        During rollout (mu_next=None):
+            LBS-style posterior — h_t already incorporates μ_t via GRU,
+            so the KL against the prior still measures genuine surprise.
+        """
+        feat = self.post_proj_h(h_t)
+        if mu_next is not None:
+            feat = feat + self.post_proj_mu_next(mu_next)
+        feat = self.post_trunk(feat)
+        return self.post_fc_mu(feat), self.post_fc_logvar(feat)
+
+    # ──────────────────────────────────────────────────────────────
+    # Interface methods
+    # ──────────────────────────────────────────────────────────────
+
+    def encode(
+        self,
+        h_prev: th.Tensor,
+        mu: th.Tensor,
+        skips: Optional[List[th.Tensor]] = None,
+        timestep: Optional[th.Tensor] = None,
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        """
+        Deterministic path only — used by policy for feature extraction.
+        Returns (h_t, dummy) where h_t is the new GRU hidden state.
+
+        This is all the policy needs: h_t goes through attention with μ
+        to produce actor/critic features. No stochastic sampling here.
+        """
+        h_t = self._gru_step(h_prev, mu, timestep)
+        # Return shape (B, latent_dim). Caller unsqueezes to (B, 1, D).
+        return h_t, th.zeros(1, device=h_t.device)
+
+    def decode(
+        self,
+        z: th.Tensor,
+        mu: th.Tensor,           # IGNORED — self-sufficient decoder
+        timestep: Optional[th.Tensor] = None,
+    ) -> th.Tensor:
+        """Decode from z + timestep only. mu param kept for interface compat."""
+        ts_enc = self._timestep_encoding(timestep, z.size(0), z.device)
+        return self.decoder(z, ts_enc)
+
+    def forward(
+        self,
+        h_prev: th.Tensor,
+        mu: th.Tensor,
+        mu_next: Optional[th.Tensor] = None,
+        skips: Optional[List[th.Tensor]] = None,
+        timestep: Optional[th.Tensor] = None,
+    ) -> WynerOutput:
+        """
+        Full forward pass with prior, GRU step, posterior, sampling, decoding.
+
+        Args:
+            h_prev:   (B, 1, D) or (B, D) — deterministic state from previous step
+            mu:       (B, mu_dim)          — current transition encoding
+            mu_next:  (B, mu_dim) or None  — next transition encoding (training only)
+            timestep: (B,) or None         — episode timestep index
+
+        Returns:
+            WynerOutput with:
+              w            = h_t  (deterministic state for memory forwarding)
+              posterior_mu = posterior mean (for z sampling / KL)
+              logvar       = posterior log-variance
+              prior_mu/prior_logvar = prior params
+              recon / recon_next    = decoded reconstructions
+        """
+        # ── 1. Prior: predict from h_{t-1} BEFORE seeing μ_t ─────
+        prior_mu, prior_logvar = self._prior(h_prev)
+
+        # ── 2. GRU step: h_t = GRU(μ_t, h_{t-1}) ────────────────
+        h_t = self._gru_step(h_prev, mu, timestep)
+
+        # ── 3. Posterior: infer from h_t AFTER seeing μ_t ────────
+        #    + optionally μ_{t+1} for Wyner bidirectional constraint
+        post_mu, post_logvar = self._posterior(h_t, mu_next)
+
+        # ── 4. Reparameterised sample ────────────────────────────
+        std = th.exp(0.5 * post_logvar)
+        z = post_mu + std * th.randn_like(std)
+
+        # ── 5. Decode current timestep ───────────────────────────
+        ts_enc = self._timestep_encoding(timestep, z.size(0), z.device)
+        recon = self.decoder(z, ts_enc)
+
+        # ── 6. Decode next timestep (training only) ──────────────
+        recon_next: Optional[th.Tensor] = None
+        if mu_next is not None:
+            if timestep is not None:
+                ts_enc_next = sinusoidal_timestep_encoding(timestep + 1, self.pos_embed_dim)
+            else:
+                ts_enc_next = th.zeros(z.size(0), self.pos_embed_dim, device=z.device)
+            recon_next = self.decoder(z, ts_enc_next)
+
+        # ── 7. Pack output ───────────────────────────────────────
+        # w = h_t for memory forwarding (unsqueeze to match buffer shape)
+        return WynerOutput(
+            w=h_t.unsqueeze(1),          # (B, 1, D) — stored as memory
+            logvar=post_logvar,          # (B, D)
+            recon=recon,                 # (B, recon_dim)
+            recon_next=recon_next,       # (B, recon_dim) or None
+            prior_mu=prior_mu,           # (B, D)
+            prior_logvar=prior_logvar,   # (B, D)
+            posterior_mu=post_mu,        # (B, D) — separate from w!
+        )
+
+    def loss(
+        self,
+        output: WynerOutput,
+        recon_target: Optional[th.Tensor] = None,
+        recon_next_target: Optional[th.Tensor] = None,
+    ) -> WynerLoss:
+        """
+        Compute KL(posterior ‖ prior) + reconstruction losses.
+
+        KL uses the learned prior (not N(0,I)), with per-dimension free_bits
+        and sum reduction — so free_bits=0.1 with latent_dim=64 gives an
+        effective floor of 6.4 nats per sample.
+        """
+        # Posterior mean: use dedicated field, fall back to w for backward compat
+        post_mu = output.posterior_mu if output.posterior_mu is not None else output.w.squeeze(1)
+
+        if output.prior_mu is not None and output.prior_logvar is not None:
+            # KL(q ‖ p) for two Gaussians
+            kl_per_dim = 0.5 * (
+                output.prior_logvar - output.logvar
+                + (output.logvar.exp() + (post_mu - output.prior_mu).pow(2))
+                  / output.prior_logvar.exp()
+                - 1.0
+            )
+        else:
+            # Fallback: KL against N(0, I)
+            kl_per_dim = -0.5 * (1 + output.logvar - post_mu.pow(2) - output.logvar.exp())
+
+        # Per-dimension free_bits, then SUM over latent dims (not mean!)
+        kl_loss = kl_per_dim.clamp_min(self.free_bits).sum(dim=-1)  # (B,)
+
+        # Reconstruction loss
+        recon_loss: Optional[th.Tensor] = None
+        if recon_target is not None:
+            recon_loss = nn.functional.mse_loss(
+                output.recon, recon_target, reduction='none'
+            ).mean(dim=-1)  # (B,)
+
+        recon_next_loss: Optional[th.Tensor] = None
+        if recon_next_target is not None and output.recon_next is not None:
+            recon_next_loss = nn.functional.mse_loss(
+                output.recon_next, recon_next_target, reduction='none'
+            ).mean(dim=-1)  # (B,)
+
+        return WynerLoss(
+            kl_loss=kl_loss,
+            recon_loss=recon_loss,
+            recon_next_loss=recon_next_loss,
+        )
+
+    def sample_z(self, output: WynerOutput) -> th.Tensor:
+        """
+        Sample z from the posterior stored in a WynerOutput.
+        Convenience method for QA loss computation in the training loop.
+        """
+        post_mu = output.posterior_mu if output.posterior_mu is not None else output.w.squeeze(1)
+        std = th.exp(0.5 * output.logvar)
+        return post_mu + std * th.randn_like(std)

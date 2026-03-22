@@ -496,16 +496,19 @@ class HSWVimePPO(PPO):
                 )
 
                 # decode from wyner all questions
+                # LBS: z is sampled from posterior_mu, not w (which is h_t)
+                # For legacy classes posterior_mu is None, so fall back to w
                 qa_loss = 0.0
+                z_mu = wyner_out.posterior_mu if wyner_out.posterior_mu is not None else wyner_out.w
+                z_mu = z_mu.squeeze(1)  # handle (B,1,D) from LBS w or (B,D) from posterior_mu
                 for idx in range(self.rollout_buffer.num_qa):
                     questions = rollout_data.questions[:, idx, ...]
+                    z_sample = z_mu + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar)
                     recon_answers = self.policy.wyner_feature_extractor.decode(
-                        wyner_out.w + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar),
-                        None,
-                        timestep=questions,
+                        z_sample, None, timestep=questions,
                     )
                     qa_loss += F.mse_loss(recon_answers, rollout_data.answers[:, idx, ...])
-                
+
                 wyner_out = self.policy.wyner_feature_extractor.forward(
                     wyner_out.w,
                     vae_tp1.mu,
@@ -514,12 +517,13 @@ class HSWVimePPO(PPO):
                     timestep=rollout_data.timesteps.long()+1,
                 )
 
+                z_mu_next = wyner_out.posterior_mu if wyner_out.posterior_mu is not None else wyner_out.w
+                z_mu_next = z_mu_next.squeeze(1)
                 for idx in range(self.rollout_buffer.num_qa):
                     questions = rollout_data.questions[:, idx, ...]
+                    z_sample = z_mu_next + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar)
                     recon_next_answers = self.policy.wyner_feature_extractor.decode(
-                        wyner_out.w + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar),
-                        None,
-                        timestep=questions,
+                        z_sample, None, timestep=questions,
                     )
                     qa_loss += F.mse_loss(recon_next_answers, rollout_data.answers[:, idx, ...])
 
