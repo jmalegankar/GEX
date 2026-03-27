@@ -1,12 +1,14 @@
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SlotMemory(nn.Module):
     """
-    Fixed-size slot memory with surprise-gated LRU writes.
+    Fixed-size slot memory with surprise-gated content-addressed writes.
 
-    Write: soft-blend h_t into the oldest slot, gated by Wyner KL.
+    Write: soft-blend z_t into slots weighted by cosine similarity,
+           gated by marginal information gain (KL above slot-conditioned prior).
     Read:  handled by HSWVIMEFeaturesExtractor (cross-attention over slots).
     """
 
@@ -17,6 +19,7 @@ class SlotMemory(nn.Module):
         gate_mode: str = "detached",
         gate_scale: float = 1.0,
         gate_threshold: float = 0.0,
+        write_temp: float = 1.0,
     ):
         super().__init__()
         self.num_slots = num_slots
@@ -24,6 +27,7 @@ class SlotMemory(nn.Module):
         self.gate_mode = gate_mode
         self.gate_scale = gate_scale
         self.gate_threshold = gate_threshold
+        self.write_temp = write_temp
 
         if gate_mode == "learned":
             self.gate_net = nn.Sequential(
@@ -37,45 +41,41 @@ class SlotMemory(nn.Module):
     def write(
         self,
         slots: th.Tensor,
-        ages: th.Tensor,
-        h_t: th.Tensor,
+        z_t: th.Tensor,
         kl: th.Tensor,
     ):
         """
-        Soft-gated LRU write.
+        Content-addressed soft write gated by marginal surprise.
 
         Args:
             slots: (B, K, D) current slot contents
-            ages:  (B, K) steps since each slot was last written
-            h_t:   (B, D) new content to write (Wyner deterministic state)
-            kl:    (B,) Wyner KL surprise signal
+            z_t:   (B, D) new content to write (Wyner posterior mean)
+            kl:    (B,) marginal information gain (delta_I)
 
-        Returns: (new_slots, new_ages, gate_values)
+        Returns: (new_slots, gate_values)
         """
         B, K, D = slots.shape
 
+        # ── Gate: whether to write ────────────────────────────────
         if self.gate_mode == "detached":
             gate = th.sigmoid(self.gate_scale * (kl - self.gate_threshold))  # (B,)
         else:
-            gate = th.sigmoid(self.gate_net(h_t).squeeze(-1))  # (B,)
+            gate = th.sigmoid(self.gate_net(z_t).squeeze(-1))  # (B,)
             self._last_learned_gate = gate
             self._last_kl = kl.detach()
 
-        # Oldest slot per batch element
-        lru_idx = ages.argmax(dim=1)  # (B,)
-        idx = lru_idx.view(B, 1, 1).expand(B, 1, D)
+        # ── Content-addressed write weights ───────────────────────
+        # F.normalize returns zero for zero-norm vectors (safe for init)
+        slots_norm = F.normalize(slots, dim=-1, eps=1e-6)       # (B, K, D)
+        z_norm = F.normalize(z_t.unsqueeze(1), dim=-1, eps=1e-6)  # (B, 1, D)
+        sim = (z_norm * slots_norm).sum(dim=-1)                  # (B, K)
+        w = F.softmax(sim / self.write_temp, dim=-1)             # (B, K)
 
-        old = slots.gather(1, idx).squeeze(1)  # (B, D)
-        g = gate.unsqueeze(1)  # (B, 1)
-        new_content = g * h_t + (1 - g) * old  # (B, D)
+        # ── Soft residual update ──────────────────────────────────
+        delta = z_t.unsqueeze(1) - slots                         # (B, K, D)
+        new_slots = slots + gate.view(-1, 1, 1) * w.unsqueeze(2) * delta
 
-        new_slots = slots.clone()
-        new_slots.scatter_(1, idx, new_content.unsqueeze(1))
-
-        new_ages = ages + 1
-        new_ages.scatter_(1, lru_idx.unsqueeze(1), th.zeros(B, 1, device=ages.device, dtype=ages.dtype))
-
-        return new_slots, new_ages, gate
+        return new_slots, gate
 
     def gate_correlation_loss(self) -> th.Tensor:
         """MSE between learned gate and sigmoid(scale * kl). Only for gate_mode='learned'."""
@@ -84,8 +84,6 @@ class SlotMemory(nn.Module):
         target = th.sigmoid(self.gate_scale * self._last_kl)
         return nn.functional.mse_loss(self._last_learned_gate, target)
 
-    def init_state(self, batch_size: int, device: th.device):
-        """Zero slots, staggered ages so first K writes fill distinct slots."""
-        slots = th.zeros(batch_size, self.num_slots, self.slot_dim, device=device)
-        ages = th.arange(self.num_slots, device=device).float().unsqueeze(0).expand(batch_size, -1).clone()
-        return slots, ages
+    def init_state(self, batch_size: int, device: th.device) -> th.Tensor:
+        """Zero slots. No ages tensor needed for content-addressed writes."""
+        return th.zeros(batch_size, self.num_slots, self.slot_dim, device=device)

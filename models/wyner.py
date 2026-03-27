@@ -80,7 +80,7 @@ class WynerInterface:
     def decode(self, z: th.Tensor, mu: th.Tensor, timestep: Optional[th.Tensor] = None) -> th.Tensor:
         pass
 
-    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor], skips: Optional[List[th.Tensor]], timestep: Optional[th.Tensor] = None) -> WynerOutput:
+    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor], skips: Optional[List[th.Tensor]], timestep: Optional[th.Tensor] = None, slots: Optional[th.Tensor] = None) -> WynerOutput:
         pass
 
     def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor], recon_next_target: Optional[th.Tensor]) -> WynerLoss:
@@ -171,7 +171,7 @@ class WynerVAE(nn.Module):
     def decode(self, z: th.Tensor, mu: th.Tensor, timestep: Optional[th.Tensor] = None) -> th.Tensor:
         return self.decoder(z, mu)
 
-    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None, timestep: Optional[th.Tensor] = None) -> WynerOutput:
+    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None, timestep: Optional[th.Tensor] = None, slots: Optional[th.Tensor] = None) -> WynerOutput:
         z_mu, z_logvar = self.encode(w, mu, skips)
         std = th.exp(0.5 * z_logvar)
         eps = th.randn_like(std)
@@ -308,7 +308,7 @@ class WynerIndependentVAE(nn.Module):
         recon = self.decoder(z, ts_enc)
         return recon
 
-    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None, timestep: Optional[th.Tensor] = None) -> WynerOutput:
+    def forward(self, w: th.Tensor, mu: th.Tensor, mu_next: Optional[th.Tensor] = None, skips: Optional[List[th.Tensor]] = None, timestep: Optional[th.Tensor] = None, slots: Optional[th.Tensor] = None) -> WynerOutput:
         # Compute learned prior from w_{t-1} BEFORE GRU update
         prior_mu, prior_logvar = self.prior_net(w)
 
@@ -453,10 +453,10 @@ class WynerLBSVAE(nn.Module):
         h = h_prev.squeeze(1) if h_prev.dim() == 3 else h_prev
         return self.gru(gru_input, h)
 
-    def _prior(self, h_prev: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
-        """Prior p(z | h_{t-1}): predict BEFORE seeing current obs."""
-        h = h_prev.squeeze(1) if h_prev.dim() == 3 else h_prev
-        feat = self.prior_trunk(h)
+    def _prior(self, slot_agg: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
+        """Prior p(z | agg(S)): predict from mean-pooled slot bank."""
+        x = slot_agg.squeeze(1) if slot_agg.dim() == 3 else slot_agg
+        feat = self.prior_trunk(x)
         return self.prior_fc_mu(feat), self.prior_fc_logvar(feat)
 
     def _posterior(self, h_t: th.Tensor, mu_next: Optional[th.Tensor] = None) -> Tuple[th.Tensor, th.Tensor]:
@@ -516,6 +516,7 @@ class WynerLBSVAE(nn.Module):
         mu_next: Optional[th.Tensor] = None,
         skips: Optional[List[th.Tensor]] = None,
         timestep: Optional[th.Tensor] = None,
+        slots: Optional[th.Tensor] = None,
     ) -> WynerOutput:
         """
         Full forward pass with prior, GRU step, posterior, sampling, decoding.
@@ -525,6 +526,7 @@ class WynerLBSVAE(nn.Module):
             mu:       (B, mu_dim)          — current transition encoding
             mu_next:  (B, mu_dim) or None  — next transition encoding (training only)
             timestep: (B,) or None         — episode timestep index
+            slots:    (B, K, D)            — current slot bank (REQUIRED for WGEM prior)
 
         Returns:
             WynerOutput with:
@@ -534,8 +536,14 @@ class WynerLBSVAE(nn.Module):
               prior_mu/prior_logvar = prior params
               recon / recon_next    = decoded reconstructions
         """
-        # ── 1. Prior: predict from h_{t-1} BEFORE seeing μ_t ─────
-        prior_mu, prior_logvar = self._prior(h_prev)
+        if slots is None:
+            raise ValueError(
+                "WynerLBSVAE.forward() requires `slots` for the slot-conditioned prior. "
+                "Passing slots=None is the exact bug WGEM-PPO fixes."
+            )
+        # ── 1. Prior: predict from mean-pooled slot bank ──────────
+        slot_agg = slots.mean(dim=1)  # (B, D)
+        prior_mu, prior_logvar = self._prior(slot_agg)
 
         # ── 2. GRU step: h_t = GRU(μ_t, h_{t-1}) ────────────────
         h_t = self._gru_step(h_prev, mu, timestep)
