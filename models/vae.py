@@ -19,12 +19,14 @@ class VAEOutput:
         rho: th.Tensor,
         recon_target: th.Tensor,
         skips: Optional[List[th.Tensor]] = None,
+        pi: Optional[th.Tensor] = None,
     ):
         self.recon        = recon
         self.mu           = mu
         self.rho          = rho
         self.recon_target = recon_target
         self.skips        = skips
+        self.pi           = pi
 
 
 @th.jit.script
@@ -87,10 +89,6 @@ class TransitionSCVAE(nn.Module):
         A = cfg.action_embed_dim
         H = cfg.hidden_dim
 
-        # self.action_embed = nn.Sequential(
-        #     nn.Linear(cfg.act_dim, A),
-        #     nn.ReLU(),
-        # )
         self.action_embed = nn.Embedding(cfg.act_dim, A)
 
         self.encoder_trunk = nn.Sequential(
@@ -104,6 +102,9 @@ class TransitionSCVAE(nn.Module):
 
         self.fc_mu  = nn.Linear(H, cfg.latent_dim)
         self.fc_rho = nn.Linear(H, 1)
+        # Policy projection head: same dim as μ, but receives PPO gradients
+        # through attention while μ stays protected for VAE reconstruction.
+        self.fc_pi  = nn.Linear(H, cfg.latent_dim)
 
         self._recon_dim = 2 * E + A
 
@@ -133,10 +134,6 @@ class TransitionSCVAE(nn.Module):
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         h_s   = self.conv(self._embed(s_t))
         h_sn  = self.conv(self._embed(s_next))
-        # a = a_t.float()
-        # if a.dim() == 1:
-        #     a = a.unsqueeze(-1)  # (B,) → (B, 1) for Discrete actions
-        # Convert float back to int
         a = a_t.long()
         a_emb = self.action_embed(a).view(-1, self.cfg.action_embed_dim)
         return h_s, a_emb, h_sn
@@ -173,11 +170,11 @@ class TransitionSCVAE(nn.Module):
         )
 
         mu  = F.normalize(self.fc_mu(h), p=2, dim=-1)
-        rho = th.sigmoid(self.fc_rho(h))
+        pi  = self.fc_pi(h)
 
-        skips: Optional[List[th.Tensor]] = None 
+        skips: Optional[List[th.Tensor]] = None
 
-        return mu, rho, skips
+        return mu, pi, skips
 
     def decode(
         self,
@@ -199,14 +196,19 @@ class TransitionSCVAE(nn.Module):
         s_next: th.Tensor,
     ) -> VAEOutput:
 
-        mu, rho, skips = self.encode(s_t, a_t, s_next)
+        h_s, a_emb, h_sn = self._encode_parts(s_t, a_t, s_next)
+        h = self.encoder_trunk(th.cat([h_s, a_emb, h_sn], dim=-1))
+
+        mu  = F.normalize(self.fc_mu(h), p=2, dim=-1)
+        rho = th.sigmoid(self.fc_rho(h))
+        pi  = self.fc_pi(h)
 
         z = sc_sample(mu, rho) if self.training else mu
 
-        recon        = self.decode(z, skips)
+        recon        = self.decode(z, None)
         recon_target = self.build_target(s_t, a_t, s_next)
 
-        return VAEOutput(recon, mu, rho, recon_target, skips)
+        return VAEOutput(recon, mu, rho, recon_target, None, pi)
 
     def loss(self, out: VAEOutput) -> VAELoss:
 

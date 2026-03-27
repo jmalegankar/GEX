@@ -4,12 +4,12 @@ import gymnasium
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback
 
-from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper
+from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper, MemorySignalVisibleWrapper
 from models.embeddings import CategoricalGridWithDirEmbedding
 from models.config import SCVAEConfig
-from models.episodic_memory import BatchedNoveltyMemory
+
 from models.vae import TransitionSCVAE
-from models.wyner import WynerLBSVAE, WynerVAE, WynerIndependentVAE
+from models.wyner import WynerLBSVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
@@ -57,7 +57,11 @@ def make_env_fn(env_name: str, view_size: int, env_kwargs: dict):
     else:
         def _fn():
             env_kwargs['agent_view_size'] = view_size
-            return MiniGridTrainingWrapper(gymnasium.make(env_name, **env_kwargs))
+            base_env = MiniGridTrainingWrapper(gymnasium.make(env_name, **env_kwargs))
+            # For Memory envs, auto turn-around so the agent always sees the signal
+            if "Memory" in env_name:
+                base_env = MemorySignalVisibleWrapper(base_env)
+            return base_env
     return _fn
 
 
@@ -73,26 +77,6 @@ def build_embedding(obs_h: int, obs_w: int, embed_per_channel: int, dir_embed_di
         dir_embed_dim=dir_embed_dim,
     )
 
-
-def build_vae(embedding, act_dim: int, latent_dim: int, conv_channels, hidden_dim: int, action_embed_dim: int):
-    cfg = SCVAEConfig(
-        act_dim=act_dim,
-        action_embed_dim=action_embed_dim,
-        conv_channels=conv_channels,
-        hidden_dim=hidden_dim,
-        latent_dim=latent_dim,
-    )
-    return TransitionSCVAE(embedding, cfg)
-
-
-def build_wyner(recon_dim: int, mu_dim: int, latent_dim: int, decode_hidden: int):
-    return WynerVAE(
-        recon_dim=recon_dim,
-        mu_dim=mu_dim,
-        latent_dim=latent_dim,
-        latent_tokens=1,
-        decode_hidden=decode_hidden,
-    )
 
 
 def parse_args():
@@ -130,6 +114,10 @@ def parse_args():
     p.add_argument("--wyner_recon_coef",type=float, default=1.0)
     p.add_argument("--wyner_kl_coef",   type=float, default=0.01)
     p.add_argument("--intrinsic_scale", type=float, default=0.0)
+    p.add_argument("--intrinsic_anneal_steps", type=int, default=0,
+                   help="Linearly decay intrinsic_scale to 0 over this many steps (0 = no decay).")
+    p.add_argument("--intrinsic_normalize", action="store_true",
+                   help="Normalize intrinsic reward by running std of KL (RND-style). Overrides anneal.")
     p.add_argument("--kl_use_schedule", action="store_true",
                    help="Enable KL coefficient annealing from 0 to target over kl_anneal_steps.")
     p.add_argument("--kl_anneal_steps", type=int, default=50_000,
@@ -147,6 +135,17 @@ def parse_args():
     p.add_argument("--wyner_decode_hidden", type=int, default=128)
     p.add_argument("--pos_embed_dim",      type=int, default=16,
                    help="Dimension of sinusoidal positional embedding for timestep in Wyner.")
+
+    # Slot memory
+    p.add_argument("--num_slots",       type=int,   default=8)
+    p.add_argument("--gate_mode",       type=str,   default="detached",
+                   choices=["detached", "learned"])
+    p.add_argument("--gate_scale",      type=float, default=1.0)
+    p.add_argument("--gate_threshold",  type=float, default=0.0)
+    p.add_argument("--wyner_kl_target", type=float, default=0.0,
+                   help="Target KL for Wyner (0 = use detached-posterior KL instead).")
+    p.add_argument("--wyner_kl_target_coef", type=float, default=0.0,
+                   help="Coefficient for quadratic KL targeting penalty.")
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default="runs/histogram")
@@ -188,24 +187,7 @@ def main():
     embedding = build_embedding(obs_h, obs_w, args.embed_per_channel, args.dir_embed_dim)
 
     conv_channels = [32, 64, 128]
-    vae = build_vae(
-        embedding,
-        act_dim=act_dim,
-        latent_dim=args.vae_latent_dim,
-        conv_channels=conv_channels,
-        hidden_dim=args.vae_hidden_dim,
-        action_embed_dim=args.vae_action_embed,
-    )
-
-    # recon_dim = 2 * conv_out + action_embed
     recon_dim = 2 * conv_channels[-1] + args.vae_action_embed
-
-    wyner = build_wyner(
-        recon_dim=recon_dim,
-        mu_dim=args.vae_latent_dim,
-        latent_dim=args.wyner_latent_dim,
-        decode_hidden=args.wyner_decode_hidden,
-    )
 
     memory_shape = (1, args.wyner_latent_dim)
 
@@ -213,7 +195,6 @@ def main():
     policy_kwargs = {
         "features_extractor_class":  HSWVIMEFeaturesExtractor,
         "features_extractor_kwargs": {
-            "wyner_dim": args.wyner_latent_dim,
             "mu_dim":    args.vae_latent_dim,
         },
         "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
@@ -239,6 +220,15 @@ def main():
         wyner_recon_coef=args.wyner_recon_coef,
         wyner_kl_coef=args.wyner_kl_coef,
         intrinsic_scale=args.intrinsic_scale,
+        intrinsic_anneal_steps=args.intrinsic_anneal_steps,
+        intrinsic_normalize=args.intrinsic_normalize,
+        mu_dim=args.vae_latent_dim,
+        num_slots=args.num_slots,
+        gate_mode=args.gate_mode,
+        gate_scale=args.gate_scale,
+        gate_threshold=args.gate_threshold,
+        wyner_kl_target=args.wyner_kl_target,
+        wyner_kl_target_coef=args.wyner_kl_target_coef,
         kl_use_schedule=args.kl_use_schedule,
         kl_anneal_steps=args.kl_anneal_steps,
         memory_shape=memory_shape,
@@ -263,11 +253,6 @@ def main():
             "decode_hidden":  args.wyner_decode_hidden,
             "pos_embed_dim":  args.pos_embed_dim,
             "free_bits":      args.free_bits,
-        },
-        episodic_memory_class=BatchedNoveltyMemory,
-        episodic_memory_kwargs={
-            "input_dim": args.vae_latent_dim,
-            "hash_dim": 63,  # Max hash_dim for safe int64 bit-packing
         },
         tensorboard_log=args.tensorboard_log,
         verbose=args.verbose,

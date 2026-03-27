@@ -66,6 +66,50 @@ class DoorButtonTrainingWrapper(gymnasium.Env):
         return self._env.close()
 
 
+class MemorySignalVisibleWrapper(gymnasium.Wrapper):
+    """
+    Wrapper for MiniGrid Memory environments that auto-executes a turn-around
+    sequence on reset so the agent always observes the signal object.
+
+    At reset, the signal (key or ball) is BEHIND the agent.  This wrapper
+    executes ``turn_steps`` left-turn actions, then ``turn_steps`` more to
+    face forward again.  The intermediate observations are discarded — the
+    agent receives the post-turn observation as its initial obs, with the
+    remaining max_steps budget reduced accordingly.
+
+    The wrapper also stores ``signal_obs`` (the backward-facing observation
+    that contains the signal) so diagnostics can inspect it.
+    """
+
+    def __init__(self, env: gymnasium.Env, turn_steps: int = 2):
+        super().__init__(env)
+        self.turn_steps = turn_steps
+        self.signal_obs = None  # set during reset
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+
+        # Turn left to face the signal
+        for _ in range(self.turn_steps):
+            obs, _, term, trunc, info = self.env.step(0)  # 0 = turn left
+            if term or trunc:
+                return obs, info
+
+        # Store the backward-facing observation containing the signal
+        self.signal_obs = obs
+
+        # Turn back to face forward
+        for _ in range(self.turn_steps):
+            obs, _, term, trunc, info = self.env.step(0)
+            if term or trunc:
+                return obs, info
+
+        return obs, info
+
+    def step(self, action):
+        return self.env.step(action)
+
+
 class MiniGridTrainingWrapper(gymnasium.Wrapper):
     """
     Observation wrapper for any MiniGrid environment for SB3 training.

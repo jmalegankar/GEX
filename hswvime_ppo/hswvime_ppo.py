@@ -1,5 +1,5 @@
 from copy import deepcopy
-from typing import Any, TypeVar
+from typing import Any, Optional, Tuple, TypeVar, Union
 
 import numpy as np
 import torch as th
@@ -15,19 +15,53 @@ from stable_baselines3 import PPO
 from .buffer import TransitionRolloutBuffer
 from .policies import HSWVIMEActorCriticPolicy
 
-
 from models.vae import VAEInterface, TransitionSCVAE
 from models.wyner import WynerInterface, WynerLoss, WynerVAE
-from models.episodic_memory import EpisodicMemoryInterface, BatchedNoveltyMemory
-from models.qa_module import QASampler
+from models.slot_memory import SlotMemory
 
+class RunningMeanStd:
+    """Welford online estimator for mean / std of a scalar stream."""
+    def __init__(self, warmup: int = 64):
+        self.mean = 0.0
+        self.var = 0.0
+        self.count = 0
+        self.warmup = warmup  # min samples before std is trusted
+        self._buffer: list[np.ndarray] = []
+        self._warmed_up = False
 
-from typing import Optional, Tuple, Union, Any
+    def update(self, batch: np.ndarray):
+        batch = batch.ravel()
+        if not self._warmed_up:
+            self._buffer.append(batch)
+            total = sum(len(b) for b in self._buffer)
+            if total >= self.warmup:
+                all_data = np.concatenate(self._buffer)
+                self.mean = float(all_data.mean())
+                self.var = float(all_data.var())
+                self.count = len(all_data)
+                self._buffer.clear()
+                self._warmed_up = True
+            return
+        batch_mean = batch.mean()
+        batch_var = batch.var()
+        batch_count = len(batch)
+        self._update_from_moments(batch_mean, batch_var, batch_count)
 
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import os
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + delta ** 2 * self.count * batch_count / total
+        self.mean = new_mean
+        self.var = m2 / total
+        self.count = total
+
+    @property
+    def std(self) -> float:
+        return max(float(np.sqrt(self.var)), 1e-6)
+
 
 SelfHSWVimePPO = TypeVar("SelfHSWVimePPO", bound="HSWVimePPO")
 
@@ -58,6 +92,8 @@ class HSWVimePPO(PPO):
         kl_use_schedule: bool = False,
         kl_anneal_steps: int = 50_000,
         intrinsic_scale: float = 1.0,
+        intrinsic_anneal_steps: int = 0,
+        intrinsic_normalize: bool = False,
         max_grad_norm: float = 500.0,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
@@ -76,9 +112,14 @@ class HSWVimePPO(PPO):
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         wyner_features_extractor_class: WynerInterface = WynerVAE,
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        episodic_memory_class: type = BatchedNoveltyMemory,
-        episodic_memory_kwargs: Optional[dict[str, Any]] = None,
         aux_max_grad_norm: float = 500.0,
+        mu_dim: int = 32,
+        num_slots: int = 8,
+        gate_mode: str = "detached",
+        gate_scale: float = 1.0,
+        gate_threshold: float = 0.0,
+        wyner_kl_target: float = 0.0,
+        wyner_kl_target_coef: float = 0.0,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"] = vae_features_extractor_class
@@ -86,9 +127,19 @@ class HSWVimePPO(PPO):
         policy_kwargs["wyner_features_extractor_class"] = wyner_features_extractor_class
         policy_kwargs["wyner_features_extractor_kwargs"] = wyner_features_extractor_kwargs
 
+        self.num_slots = num_slots
+        self.gate_mode = gate_mode
+        self.gate_scale = gate_scale
+        self.gate_threshold = gate_threshold
+        self.wyner_kl_target = wyner_kl_target
+        self.wyner_kl_target_coef = wyner_kl_target_coef
+
+        # Slots store μ (VAE latent, dim=mu_dim), not h_t (Wyner GRU state)
+        self._slot_memory_shape = (num_slots, mu_dim)
+
         rollout_buffer_kwargs = rollout_buffer_kwargs or {}
         rollout_buffer_kwargs["memory_shape"] = memory_shape
-        rollout_buffer_kwargs["answer_dim"] = wyner_features_extractor_kwargs.get("recon_dim")
+        rollout_buffer_kwargs["slot_memory_shape"] = self._slot_memory_shape
 
         super().__init__(
             policy=policy,
@@ -127,49 +178,53 @@ class HSWVimePPO(PPO):
         self.kl_anneal_steps = kl_anneal_steps
 
         self.intrinsic_scale = intrinsic_scale
+        self.intrinsic_anneal_steps = intrinsic_anneal_steps
+        self.intrinsic_normalize = intrinsic_normalize
+        self._kl_running_stats = RunningMeanStd()
+        self._gate_kl_running_stats = RunningMeanStd()  # Always-on stats for gate normalization
 
         self.memory_shape = memory_shape
 
         self.null_action = null_action
 
-        self.episodic_memory_class = episodic_memory_class
-        self.episodic_memory_kwargs = episodic_memory_kwargs or {}
-        self._episodic_memory: Optional[EpisodicMemoryInterface] = None
-
         self.aux_max_grad_norm = aux_max_grad_norm
-        # TODO: add aux_learning_rate param and forward via policy_kwargs when ready
 
         self._last_memory = None
+        self._last_slots = None
+        self._last_ages = None
         self._prev_last_obs = None
         self._prev_action = None
+        self._timesteps = None
 
         if _init_setup_model:
             self._setup_model()
-        
-        self._qa_sampler = QASampler(self.rollout_buffer)
+
+        self.slot_memory = SlotMemory(
+            num_slots=self.num_slots,
+            slot_dim=self._slot_memory_shape[1],
+            gate_mode=self.gate_mode,
+            gate_scale=self.gate_scale,
+            gate_threshold=self.gate_threshold,
+        ).to(self.device)
     
     def set_env(self, env, force_reset: bool = True):
         ret = super().set_env(env, force_reset)
         if force_reset:
             self._prev_last_obs = None
-        if force_reset:
             self._last_memory = None
-        if force_reset:
+            self._last_slots = None
+            self._last_ages = None
             self._prev_action = None
-        if force_reset:
-            self._qa_sampler.reset()
+            self._timesteps = None
         return ret
     
     def _setup_learn(self, total_timesteps, callback = None, reset_num_timesteps = True, tb_log_name = "run", progress_bar = False):
         ret = super()._setup_learn(total_timesteps, callback, reset_num_timesteps, tb_log_name, progress_bar)
         self._last_memory = th.zeros((self.n_envs, *self.memory_shape), device=self.device)
+        self._last_slots, self._last_ages = self.slot_memory.init_state(self.n_envs, self.device)
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
-        self._qa_sampler.reset()
-        self._episodic_memory = self.episodic_memory_class(
-            n_envs=self.n_envs,
-            **self.episodic_memory_kwargs,
-        )
+        self._timesteps = np.zeros(self.n_envs, dtype=np.int64)
 
         return ret
 
@@ -180,32 +235,18 @@ class HSWVimePPO(PPO):
         rollout_buffer: TransitionRolloutBuffer,
         n_rollout_steps: int,
     ) -> bool:
-        """
-        Collect experiences using the current policy and fill a ``RolloutBuffer``.
-        The term rollout here refers to the model-free notion and should not
-        be used with the concept of rollout used in model-based RL or planning.
-
-        :param env: The training environment
-        :param callback: Callback that will be called at each step
-            (and at the beginning and end of the rollout)
-        :param rollout_buffer: Buffer to fill with rollouts
-        :param n_rollout_steps: Number of experiences to collect per environment
-        :return: True if function returned with at least `n_rollout_steps`
-            collected, False if callback terminated rollout prematurely.
-        """
         assert self._last_obs is not None, "No previous observation was provided"
         assert self._prev_last_obs is not None, "No previous observation was provided"
         assert self._last_memory is not None, "No previous memory was provided"
+        assert self._last_slots is not None, "No slot memory was provided"
         assert self._prev_action is not None, "No previous action was provided"
-        # Switch to eval mode (this affects batch norm / dropout)
         self.policy.set_training_mode(False)
 
         n_steps = 0
         rollout_buffer.reset()
         _wyner_kl_log: list[float] = []
-        _episodic_novel_log: list[float] = []
+        _gate_log: list[float] = []
 
-        # Sample new weights for the state dependent exploration
         if self.use_sde:
             self.policy.reset_noise(env.num_envs)
 
@@ -213,29 +254,24 @@ class HSWVimePPO(PPO):
 
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
-                # Sample a new noise matrix
                 self.policy.reset_noise(env.num_envs)
 
             with th.no_grad():
-                # Convert to pytorch tensor or to TensorDict
-                s_tm1 = obs_as_tensor(self._prev_last_obs, self.device)  # type: ignore[arg-type]
-                a_tm1 = obs_as_tensor(self._prev_action, self.device)  # type: ignore[arg-type]
-                s_t = obs_as_tensor(self._last_obs, self.device)  # type: ignore[arg-type]
-                timestep_tensor = th.tensor(self._qa_sampler.timesteps, device=self.device, dtype=th.long)
-                actions, memory, values, log_probs = self.policy.forward(s_tm1, a_tm1, s_t, self._last_memory, timestep=timestep_tensor)
+                s_tm1 = obs_as_tensor(self._prev_last_obs, self.device)
+                a_tm1 = obs_as_tensor(self._prev_action, self.device)
+                s_t = obs_as_tensor(self._last_obs, self.device)
+                timestep_tensor = th.tensor(self._timesteps, device=self.device, dtype=th.long)
+                actions, memory, values, log_probs = self.policy.forward(
+                    s_tm1, a_tm1, s_t, self._last_memory, self._last_slots, timestep=timestep_tensor
+                )
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
             clipped_actions = actions
-
             if isinstance(self.action_space, spaces.Box):
                 if self.policy.squash_output:
-                    # Unscale the actions to match env bounds
-                    # if they were previously squashed (scaled in [-1, 1])
                     clipped_actions = self.policy.unscale_action(clipped_actions)
                 else:
-                    # Otherwise, clip the actions to avoid out of bound error
-                    # as we are sampling from an unbounded Gaussian distribution
                     clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
 
             new_obs, rewards, dones, infos = env.step(clipped_actions)
@@ -250,19 +286,26 @@ class HSWVimePPO(PPO):
                 )
                 wyner_kl = wyner_loss.kl_loss.view(-1).cpu()  # (n_envs,)
 
-                # Episodic bonus: 1.0 if hash bucket is novel this episode, else 0.0
-                episodic_bonus = self._episodic_memory.query_and_add(vae_tp1.mu)  # (n_envs,)
+                kl_np = wyner_kl.numpy()
+                _wyner_kl_log.append(kl_np.mean().item())
 
-                intrinsic_rewards = self.intrinsic_scale * (wyner_kl * episodic_bonus).numpy()
-                _wyner_kl_log.append(wyner_kl.mean().item())
-                _episodic_novel_log.append(episodic_bonus.mean().item())
+                if self.intrinsic_normalize:
+                    self._kl_running_stats.update(kl_np)
+                    if self._kl_running_stats._warmed_up:
+                        intrinsic_rewards = self.intrinsic_scale * kl_np / self._kl_running_stats.std
+                    else:
+                        intrinsic_rewards = np.zeros_like(kl_np)
+                else:
+                    if self.intrinsic_anneal_steps > 0:
+                        decay = max(1.0 - self.num_timesteps / self.intrinsic_anneal_steps, 0.0)
+                    else:
+                        decay = 1.0
+                    intrinsic_rewards = (self.intrinsic_scale * decay) * kl_np
 
-            assert rewards.shape == intrinsic_rewards.shape == (self.n_envs,), f"Reward shape mismatch: {rewards.shape} vs {intrinsic_rewards.shape}"
-
+            assert rewards.shape == intrinsic_rewards.shape == (self.n_envs,)
 
             self.num_timesteps += env.num_envs
 
-            # Give access to local variables
             callback.update_locals(locals())
             if not callback.on_step():
                 return False
@@ -271,96 +314,99 @@ class HSWVimePPO(PPO):
             n_steps += 1
 
             if isinstance(self.action_space, spaces.Discrete):
-                # Reshape in case of discrete action
                 actions = actions.reshape(-1, 1)
 
             # Handle timeout by bootstrapping with value function
-            # see GitHub issue #633
             for idx, done in enumerate(dones):
                 if (
                     done
                     and infos[idx].get("terminal_observation") is not None
                     and infos[idx].get("TimeLimit.truncated", False)
                 ):
-                    # Reset the memory for the next episode
                     memory[idx, ...] = 0.0
                     with th.no_grad():
                         terminal_value = self.policy.predict_values(
-                            s_t[idx:idx+1], a_t[idx:idx+1], s_tp1[idx:idx+1], self._last_memory[idx:idx+1]
+                            s_t[idx:idx+1], a_t[idx:idx+1], s_tp1[idx:idx+1],
+                            self._last_memory[idx:idx+1], self._last_slots[idx:idx+1],
                         ).item()
                     rewards[idx] += self.gamma * terminal_value
 
             rollout_buffer.add(
-                self._last_obs,  # type: ignore[arg-type]
-                self._prev_last_obs,  # type: ignore[arg-type]
-                new_obs,  # type: ignore[arg-type]
+                self._last_obs,
+                self._prev_last_obs,
+                new_obs,
                 actions,
                 rewards,
-                self._last_episode_starts,  # type: ignore[arg-type]
+                self._last_episode_starts,
                 values,
                 log_probs,
-                self._last_memory,  # type: ignore[call-overload]
-                self._prev_action,  # type: ignore[arg-type]
-                self._qa_sampler.timesteps,
+                self._last_memory,
+                memory,
+                self._last_slots,
+                self._prev_action,
+                self._timesteps,
                 intrinsic_rewards,
             )
-            
+
+            # Slot write: store π_t (policy projection) gated by Wyner KL surprise
             with th.no_grad():
                 vae_t = self.policy.vae_feature_extractor.forward(s_tm1, a_tm1, s_t)
-                scores = self.policy.wyner_feature_extractor.loss(
-                    self.policy.wyner_feature_extractor.forward(memory, vae_t.mu, vae_tp1.mu, vae_t.skips, timestep=timestep_tensor),
-                ).kl_loss.cpu().numpy()
+                wyner_out_t = self.policy.wyner_feature_extractor.forward(
+                    self._last_memory, vae_t.mu, None, vae_t.skips, timestep=timestep_tensor,
+                )
+                current_kl = self.policy.wyner_feature_extractor.loss(wyner_out_t).kl_loss.view(-1)
+                # Always z-score normalize KL for gating so the gate discriminates
+                # between relatively surprising vs boring steps, even when mean KL is high.
+                gate_kl_np = current_kl.cpu().numpy()
+                self._gate_kl_running_stats.update(gate_kl_np)
+                if self._gate_kl_running_stats._warmed_up:
+                    gate_kl = (current_kl - self._gate_kl_running_stats.mean) / self._gate_kl_running_stats.std
+                else:
+                    gate_kl = current_kl
+                # Write π_t (policy projection) — same space as attention query,
+                # but decoupled from μ so PPO gradients don't corrupt the VAE.
+                new_slots, new_ages, gate = self.slot_memory.write(
+                    self._last_slots, self._last_ages, vae_t.pi.detach(), gate_kl,
+                )
+                _gate_log.append(gate.mean().item())
 
-            # Increment timestep counter, then reset for finished episodes
-            self._qa_sampler.update(scores, vae_t.recon_target.cpu().numpy())
+            # Increment timesteps, reset for done envs
+            self._timesteps += 1
             for idx, done in enumerate(dones):
                 if done:
-                    self._qa_sampler.reset(idx)
-            
-            self._prev_last_obs = self._last_obs  # type: ignore[assignment]
+                    self._timesteps[idx] = 0
+                    memory[idx, ...] = 0.0
+                    new_slots[idx] = 0.0
+                    new_ages[idx] = th.arange(self.num_slots, device=self.device).float()
+
+            self._prev_last_obs = self._last_obs
             self._prev_action = actions
-            self._last_obs = new_obs  # type: ignore[assignment]
+            self._last_obs = new_obs
             self._last_episode_starts = dones
-            self._last_memory.copy_(memory)  # type: ignore[call-overload]
+            self._last_memory.copy_(memory)
+            self._last_slots = new_slots
+            self._last_ages = new_ages
             del memory
 
-            # Reset episodic memory for finished episodes
-            if dones.any():
-                self._episodic_memory.reset_envs(th.from_numpy(dones))
-
         with th.no_grad():
-            # Compute value for the last timestep
-            values = self.policy.predict_values(s_t, a_t, s_tp1, self._last_memory)  # type: ignore[arg-type]
+            values = self.policy.predict_values(s_t, a_t, s_tp1, self._last_memory, self._last_slots)
             values = values.view(-1).cpu().numpy()
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
         self.logger.record("intrinsic/wyner_kl_mean", np.mean(_wyner_kl_log))
-        self.logger.record("intrinsic/episodic_novel_frac", np.mean(_episodic_novel_log))
-
-        # --- QA offset diagnostics (must run before train()/get() flattens arrays) ---
-        qa_offsets = rollout_buffer.timesteps[:, :, None] - rollout_buffer.questions
-        qa_offsets_flat = qa_offsets.flatten()
-        self.logger.record("qa_debug/offset_mean", float(np.mean(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_median", float(np.median(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_std", float(np.std(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_min", float(np.min(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_max", float(np.max(qa_offsets_flat)))
-        self.logger.record("qa_debug/offset_neg_frac", float(np.mean(qa_offsets_flat < 0)))
-
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.hist(qa_offsets_flat, bins=min(50, max(int(qa_offsets_flat.max()) + 1, 10)), edgecolor="black")
-        ax.set_xlabel("QA Offset (current_timestep - question_timestep)")
-        ax.set_ylabel("Count")
-        ax.set_title(f"QA Offset Distribution (step {self.num_timesteps})")
-        fig.tight_layout()
-        plot_dir = os.path.join(self.logger.dir, "qa_debug") if self.logger.dir else "qa_debug"
-        os.makedirs(plot_dir, exist_ok=True)
-        fig.savefig(os.path.join(plot_dir, f"qa_offsets_{self.num_timesteps}.png"), dpi=100)
-        plt.close(fig)
+        if self.intrinsic_normalize:
+            self.logger.record("intrinsic/kl_running_mean", self._kl_running_stats.mean)
+            self.logger.record("intrinsic/kl_running_std", self._kl_running_stats.std)
+        if self.intrinsic_anneal_steps > 0:
+            self.logger.record("intrinsic/effective_scale", self.intrinsic_scale * max(1.0 - self.num_timesteps / self.intrinsic_anneal_steps, 0.0))
+        self.logger.record("slots/gate_mean", np.mean(_gate_log))
+        self.logger.record("slots/gate_kl_running_mean", self._gate_kl_running_stats.mean)
+        self.logger.record("slots/gate_kl_running_std", self._gate_kl_running_stats.std)
+        self.logger.record("debug/wyner_h_norm", float(th.norm(self._last_memory).item()))
+        self.logger.record("debug/slots_norm", float(th.norm(self._last_slots).item()))
 
         callback.update_locals(locals())
-
         callback.on_rollout_end()
 
         return True
@@ -393,7 +439,6 @@ class HSWVimePPO(PPO):
         vae_losses, wyner_losses = [], []
         vae_recon_losses, vae_kl_losses = [], []
         wyner_recon_losses, wyner_kl_losses, wyner_recon_next_losses = [], [], []
-        wyner_qa_losses = []
         grad_norms = []
         all_approx_kl_divs = []
 
@@ -412,7 +457,8 @@ class HSWVimePPO(PPO):
                     rollout_data.prev_observations,   # s_{t-1}
                     rollout_data.prev_actions,        # a_{t-1}
                     rollout_data.observations,        # s_t
-                    rollout_data.memories,            # memory at t
+                    rollout_data.memories,            # h_{t-1}
+                    rollout_data.slot_memories,       # slot state at t
                     actions,
                     timestep=rollout_data.timesteps.long(),
                 )
@@ -482,63 +528,54 @@ class HSWVimePPO(PPO):
                 vae_recon_losses.append(vae_loss_obj.recon_loss.item())
                 vae_kl_losses.append(vae_loss_obj.kl_loss.item())
 
+                # Wyner forward: h_t already has μ_t baked in, so feed μ_{t+1}
+                # to advance GRU to h_{t+1} — matching rollout KL semantics.
+                if len(wyner_kl_losses) == 0:
+                    self.logger.record("debug/train_h_input_shape", str(tuple(rollout_data.wyner_h.shape)))
+                    self.logger.record("debug/train_h_input_norm", float(th.norm(rollout_data.wyner_h).item()))
                 wyner_out = self.policy.wyner_feature_extractor.forward(
-                    rollout_data.memories,
-                    vae_t.mu,
-                    vae_tp1.mu,
-                    vae_t.skips,
-                    timestep=rollout_data.timesteps.long(),
-                )
-                wyner_loss_obj = self.policy.wyner_feature_extractor.loss(
-                    wyner_out,
-                    recon_target=vae_t.recon_target,
-                    recon_next_target=vae_tp1.recon_target,
-                )
-
-                # decode from wyner all questions
-                # LBS: z is sampled from posterior_mu, not w (which is h_t)
-                # For legacy classes posterior_mu is None, so fall back to w
-                qa_loss = 0.0
-                z_mu = wyner_out.posterior_mu if wyner_out.posterior_mu is not None else wyner_out.w
-                z_mu = z_mu.squeeze(1)  # handle (B,1,D) from LBS w or (B,D) from posterior_mu
-                for idx in range(self.rollout_buffer.num_qa):
-                    questions = rollout_data.questions[:, idx, ...]
-                    z_sample = z_mu + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar)
-                    recon_answers = self.policy.wyner_feature_extractor.decode(
-                        z_sample, None, timestep=questions,
-                    )
-                    qa_loss += F.mse_loss(recon_answers, rollout_data.answers[:, idx, ...])
-
-                wyner_out = self.policy.wyner_feature_extractor.forward(
-                    wyner_out.w,
+                    rollout_data.wyner_h,
                     vae_tp1.mu,
                     None,
                     vae_tp1.skips,
-                    timestep=rollout_data.timesteps.long()+1,
+                    timestep=rollout_data.timesteps.long() + 1,
+                )
+                wyner_loss_obj = self.policy.wyner_feature_extractor.loss(
+                    wyner_out,
+                    recon_target=vae_tp1.recon_target,
+                    recon_next_target=None,
                 )
 
-                z_mu_next = wyner_out.posterior_mu if wyner_out.posterior_mu is not None else wyner_out.w
-                z_mu_next = z_mu_next.squeeze(1)
-                for idx in range(self.rollout_buffer.num_qa):
-                    questions = rollout_data.questions[:, idx, ...]
-                    z_sample = z_mu_next + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar)
-                    recon_next_answers = self.policy.wyner_feature_extractor.decode(
-                        z_sample, None, timestep=questions,
-                    )
-                    qa_loss += F.mse_loss(recon_next_answers, rollout_data.answers[:, idx, ...])
+                kl_mean = wyner_loss_obj.kl_loss.mean()
 
-                wyner_loss = (
-                    self.wyner_recon_coef * (
-                        wyner_loss_obj.recon_loss.mean() + wyner_loss_obj.recon_next_loss.mean() + qa_loss
+                if self.wyner_kl_target_coef > 0:
+                    # KL targeting: quadratic penalty pulling KL toward target.
+                    # Can't collapse to 0, can't explode to 300.
+                    kl_target_loss = (kl_mean - self.wyner_kl_target).pow(2)
+                    wyner_loss = (
+                        self.wyner_recon_coef * wyner_loss_obj.recon_loss.mean()
+                        + self.wyner_kl_target_coef * kl_target_loss
                     )
-                    + effective_wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
-                )
+                else:
+                    # Detached-posterior KL: only train prior to match posterior.
+                    post_mu_d = (wyner_out.posterior_mu if wyner_out.posterior_mu is not None
+                                 else wyner_out.w.squeeze(1)).detach()
+                    post_logvar_d = wyner_out.logvar.detach()
+                    kl_for_prior = 0.5 * (
+                        wyner_out.prior_logvar - post_logvar_d
+                        + (post_logvar_d.exp() + (post_mu_d - wyner_out.prior_mu).pow(2))
+                          / wyner_out.prior_logvar.exp()
+                        - 1.0
+                    ).sum(dim=-1).mean()
+                    wyner_loss = (
+                        self.wyner_recon_coef * wyner_loss_obj.recon_loss.mean()
+                        + effective_wyner_kl_coef * kl_for_prior
+                    )
 
                 wyner_losses.append(wyner_loss.item())
                 wyner_recon_losses.append(wyner_loss_obj.recon_loss.mean().item())
-                wyner_kl_losses.append(wyner_loss_obj.kl_loss.mean().item())
-                wyner_recon_next_losses.append(wyner_loss_obj.recon_next_loss.mean().item())
-                wyner_qa_losses.append(qa_loss.item())
+                wyner_kl_losses.append(kl_mean.detach().item())
+                wyner_recon_next_losses.append(0.0)
 
                 loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss + vae_loss + wyner_loss
 
@@ -563,7 +600,8 @@ class HSWVimePPO(PPO):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
 
-                ppo_params = (list(self.policy.mlp_extractor.parameters()) +
+                ppo_params = (list(self.policy.features_extractor.parameters()) +
+                              list(self.policy.mlp_extractor.parameters()) +
                               list(self.policy.value_net.parameters()) +
                               list(self.policy.action_net.parameters()))
                 vae_params = list(self.policy.vae_feature_extractor.parameters())
@@ -601,7 +639,6 @@ class HSWVimePPO(PPO):
         self.logger.record("wyner/wyner_recon_loss", np.mean(wyner_recon_losses))
         self.logger.record("wyner/wyner_kl_loss", np.mean(wyner_kl_losses))
         self.logger.record("wyner/wyner_recon_next_loss", np.mean(wyner_recon_next_losses))
-        self.logger.record("wyner/wyner_qa_loss", np.mean(wyner_qa_losses))
         self.logger.record("train/approx_kl", np.mean(all_approx_kl_divs))
         self.logger.record("train/clip_fraction", np.mean(clip_fractions))
         self.logger.record("train/loss", loss.item())

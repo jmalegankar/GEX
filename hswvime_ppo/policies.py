@@ -1,5 +1,3 @@
-import warnings
-
 import numpy as np
 import torch as th
 import torch.nn as nn
@@ -9,11 +7,7 @@ from stable_baselines3.common.distributions import Distribution
 from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3.common.type_aliases import Schedule
 
-
 from typing import Any, Optional, Union, Tuple
-
-import typing
-
 
 from models.vae import VAEInterface, TransitionSCVAE
 from models.wyner import WynerInterface, WynerVAE
@@ -27,21 +21,20 @@ class HSWVIMEFeaturesExtractor(nn.Module):
         This corresponds to the number of units for the last layer.
     """
 
-    def __init__(self, observation_space=None, *, wyner_dim: int, mu_dim: int):
+    def __init__(self, observation_space=None, *, mu_dim: int):
         super().__init__()
         self._features_dim = 2 * mu_dim  # attn_output(mu_dim) concat mu(mu_dim)
-        self.wyner_dim = wyner_dim
         self.mu_dim = mu_dim
-        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True, kdim=wyner_dim, vdim=wyner_dim)
+        # Query, key, value all in μ-space (same dim)
+        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True)
     
     @property
     def features_dim(self) -> int:
         return self._features_dim
         
-    @th.jit.export
-    def forward(self, wyner_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
+    def forward(self, slot_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
         mu_features = mu_features.view(-1, 1, self.mu_dim) # Make it (batch_size, 1, mu_dim)
-        attn_output, _ = self.attn(mu_features, wyner_features, wyner_features, need_weights = False) # Query is mu, key and value are wyner
+        attn_output, _ = self.attn(mu_features, slot_features, slot_features, need_weights = False) # Query is mu, key and value are stored μ's
         x = th.cat((mu_features, attn_output), dim=-1).squeeze(1) # Concatenate along the feature dimension
         return x
 
@@ -144,6 +137,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
+        slots: th.Tensor,
         deterministic: bool = False,
         timestep: Optional[th.Tensor] = None,
     ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
@@ -153,12 +147,14 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         :param s_tm1: Previous state
         :param a_tm1: Previous action
         :param s_t: Current state
+        :param memory: Wyner GRU hidden state h_{t-1}
+        :param slots: Slot memory state (B, K, slot_dim)
         :param deterministic: Whether to sample or use deterministic actions
         :param timestep: Episode timestep indices (B,)
-        :return: action, value and log probability of the action
+        :return: action, h_t memory, value and log probability of the action
         """
         # Preprocess the observation if needed
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
+        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, slots, timestep=timestep)
         if self.share_features_extractor:
             latent_pi, latent_vf = self.mlp_extractor(features)
         else:
@@ -179,15 +175,19 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
+        slots: th.Tensor,
         timestep: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor]:
         s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
         s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
-        mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips, timestep=timestep)
+        mu, pi, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
+        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu.detach(), skips, timestep=timestep)
         # encode returns (B, latent_dim); restore the seq dim for storage and MHA
         new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
-        features = self.features_extractor(new_memory, mu)
+        # Dual-head: μ (detached) for VAE/Wyner, π for attention/policy.
+        # π receives PPO gradients through attention, μ stays protected.
+        # Slots contain π values written during rollout (detached).
+        features = self.features_extractor(slots.detach(), pi)
         return features, new_memory
     
     def get_distribution(
@@ -196,9 +196,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
+        slots: th.Tensor,
         timestep: Optional[th.Tensor] = None,
     ) -> Tuple[Distribution, th.Tensor]:
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
+        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, slots, timestep=timestep)
         latent_pi = self.mlp_extractor.forward_actor(features)
         return self._get_action_dist_from_latent(latent_pi), memory
 
@@ -208,9 +209,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
+        slots: th.Tensor,
         timestep: Optional[th.Tensor] = None,
     ) -> th.Tensor:
-        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
+        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory, slots, timestep=timestep)
         latent_vf = self.mlp_extractor.forward_critic(features)
         return self.value_net(latent_vf)
 
@@ -220,10 +222,11 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
+        slots: th.Tensor,
         action: th.Tensor,
         timestep: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
+        features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory, slots, timestep=timestep)
         latent_vf = self.mlp_extractor.forward_critic(features)
         values = self.value_net(latent_vf)
         latent_pi = self.mlp_extractor.forward_actor(features)
@@ -237,6 +240,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1: th.Tensor,
         s_t: th.Tensor,
         memory: th.Tensor,
+        slots: th.Tensor,
         deterministic: bool = False
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
         self.set_training_mode(False)
@@ -257,7 +261,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         a_tm1 = th.as_tensor(a_tm1, device=s_tm1.device)
 
         with th.no_grad():
-            distribution, memory = self.get_distribution(s_tm1, a_tm1, s_t, memory)
+            distribution, memory = self.get_distribution(s_tm1, a_tm1, s_t, memory, slots)
             actions = distribution.get_actions(deterministic=deterministic)
         
         actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
