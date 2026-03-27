@@ -196,6 +196,7 @@ def main():
         "features_extractor_class":  HSWVIMEFeaturesExtractor,
         "features_extractor_kwargs": {
             "mu_dim":    args.vae_latent_dim,
+            "slot_dim":  args.wyner_latent_dim,
         },
         "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
     }

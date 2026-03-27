@@ -134,8 +134,9 @@ class HSWVimePPO(PPO):
         self.wyner_kl_target = wyner_kl_target
         self.wyner_kl_target_coef = wyner_kl_target_coef
 
-        # Slots store μ (VAE latent, dim=mu_dim), not h_t (Wyner GRU state)
-        self._slot_memory_shape = (num_slots, mu_dim)
+        # Slots store z_t (Wyner posterior mean, dim=wyner_latent_dim)
+        wyner_latent_dim = memory_shape[-1]  # memory_shape = (1, wyner_latent_dim)
+        self._slot_memory_shape = (num_slots, wyner_latent_dim)
 
         rollout_buffer_kwargs = rollout_buffer_kwargs or {}
         rollout_buffer_kwargs["memory_shape"] = memory_shape
@@ -191,7 +192,6 @@ class HSWVimePPO(PPO):
 
         self._last_memory = None
         self._last_slots = None
-        self._last_ages = None
         self._prev_last_obs = None
         self._prev_action = None
         self._timesteps = None
@@ -213,7 +213,6 @@ class HSWVimePPO(PPO):
             self._prev_last_obs = None
             self._last_memory = None
             self._last_slots = None
-            self._last_ages = None
             self._prev_action = None
             self._timesteps = None
         return ret
@@ -221,7 +220,7 @@ class HSWVimePPO(PPO):
     def _setup_learn(self, total_timesteps, callback = None, reset_num_timesteps = True, tb_log_name = "run", progress_bar = False):
         ret = super()._setup_learn(total_timesteps, callback, reset_num_timesteps, tb_log_name, progress_bar)
         self._last_memory = th.zeros((self.n_envs, *self.memory_shape), device=self.device)
-        self._last_slots, self._last_ages = self.slot_memory.init_state(self.n_envs, self.device)
+        self._last_slots = self.slot_memory.init_state(self.n_envs, self.device)
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
         self._timesteps = np.zeros(self.n_envs, dtype=np.int64)
@@ -246,6 +245,12 @@ class HSWVimePPO(PPO):
         rollout_buffer.reset()
         _wyner_kl_log: list[float] = []
         _gate_log: list[float] = []
+        _gate_std_log: list[float] = []
+        _slot_norm_log: list[float] = []
+        _slot_diversity_log: list[float] = []
+        _prior_mu_norm_log: list[float] = []
+        _prior_logvar_log: list[float] = []
+        _delta_I_log: list[float] = []
 
         if self.use_sde:
             self.policy.reset_noise(env.num_envs)
@@ -282,7 +287,7 @@ class HSWVimePPO(PPO):
                 a_t = obs_as_tensor(actions, self.device)
                 vae_tp1 = self.policy.vae_feature_extractor.forward(s_t, a_t, s_tp1)
                 wyner_loss: WynerLoss = self.policy.wyner_feature_extractor.loss(
-                    self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips, timestep=timestep_tensor+1),
+                    self.policy.wyner_feature_extractor.forward(memory, vae_tp1.mu, None, vae_tp1.skips, timestep=timestep_tensor+1, slots=self._last_slots),
                 )
                 wyner_kl = wyner_loss.kl_loss.view(-1).cpu()  # (n_envs,)
 
@@ -348,27 +353,38 @@ class HSWVimePPO(PPO):
                 intrinsic_rewards,
             )
 
-            # Slot write: store π_t (policy projection) gated by Wyner KL surprise
+            # Slot write: store z_t (Wyner posterior mean) gated by marginal info gain
             with th.no_grad():
                 vae_t = self.policy.vae_feature_extractor.forward(s_tm1, a_tm1, s_t)
                 wyner_out_t = self.policy.wyner_feature_extractor.forward(
                     self._last_memory, vae_t.mu, None, vae_t.skips, timestep=timestep_tensor,
+                    slots=self._last_slots,
                 )
-                current_kl = self.policy.wyner_feature_extractor.loss(wyner_out_t).kl_loss.view(-1)
-                # Always z-score normalize KL for gating so the gate discriminates
-                # between relatively surprising vs boring steps, even when mean KL is high.
-                gate_kl_np = current_kl.cpu().numpy()
+                # delta_I = KL(posterior || slot-conditioned prior) = marginal info above memory
+                delta_I = self.policy.wyner_feature_extractor.loss(wyner_out_t).kl_loss.view(-1)
+                # Z-score normalize for gating so gate discriminates
+                gate_kl_np = delta_I.cpu().numpy()
                 self._gate_kl_running_stats.update(gate_kl_np)
                 if self._gate_kl_running_stats._warmed_up:
-                    gate_kl = (current_kl - self._gate_kl_running_stats.mean) / self._gate_kl_running_stats.std
+                    gate_kl = (delta_I - self._gate_kl_running_stats.mean) / self._gate_kl_running_stats.std
                 else:
-                    gate_kl = current_kl
-                # Write π_t (policy projection) — same space as attention query,
-                # but decoupled from μ so PPO gradients don't corrupt the VAE.
-                new_slots, new_ages, gate = self.slot_memory.write(
-                    self._last_slots, self._last_ages, vae_t.pi.detach(), gate_kl,
+                    gate_kl = delta_I
+                # Write z_t (Wyner posterior mean) — lives in same space as slots (dim 64)
+                new_slots, gate = self.slot_memory.write(
+                    self._last_slots, wyner_out_t.posterior_mu.detach(), gate_kl,
                 )
                 _gate_log.append(gate.mean().item())
+                _gate_std_log.append(gate.std().item())
+                _slot_norm_log.append(new_slots.norm(dim=-1).mean().item())
+                _delta_I_log.append(delta_I.mean().item())
+                _prior_mu_norm_log.append(wyner_out_t.prior_mu.norm(dim=-1).mean().item())
+                _prior_logvar_log.append(wyner_out_t.prior_logvar.mean().item())
+                # Slot diversity: mean pairwise cosine distance
+                _slot_diversity_log.append(
+                    (1 - F.cosine_similarity(
+                        new_slots.unsqueeze(2), new_slots.unsqueeze(1), dim=-1
+                    )).mean().item()
+                )
 
             # Increment timesteps, reset for done envs
             self._timesteps += 1
@@ -377,7 +393,6 @@ class HSWVimePPO(PPO):
                     self._timesteps[idx] = 0
                     memory[idx, ...] = 0.0
                     new_slots[idx] = 0.0
-                    new_ages[idx] = th.arange(self.num_slots, device=self.device).float()
 
             self._prev_last_obs = self._last_obs
             self._prev_action = actions
@@ -385,7 +400,6 @@ class HSWVimePPO(PPO):
             self._last_episode_starts = dones
             self._last_memory.copy_(memory)
             self._last_slots = new_slots
-            self._last_ages = new_ages
             del memory
 
         with th.no_grad():
@@ -401,8 +415,14 @@ class HSWVimePPO(PPO):
         if self.intrinsic_anneal_steps > 0:
             self.logger.record("intrinsic/effective_scale", self.intrinsic_scale * max(1.0 - self.num_timesteps / self.intrinsic_anneal_steps, 0.0))
         self.logger.record("slots/gate_mean", np.mean(_gate_log))
+        self.logger.record("slots/gate_std", np.mean(_gate_std_log))
+        self.logger.record("slots/slot_norm_mean", np.mean(_slot_norm_log))
+        self.logger.record("slots/slot_diversity", np.mean(_slot_diversity_log))
         self.logger.record("slots/gate_kl_running_mean", self._gate_kl_running_stats.mean)
         self.logger.record("slots/gate_kl_running_std", self._gate_kl_running_stats.std)
+        self.logger.record("wyner/prior_mu_norm", np.mean(_prior_mu_norm_log))
+        self.logger.record("wyner/prior_logvar_mean", np.mean(_prior_logvar_log))
+        self.logger.record("wyner/delta_I_mean", np.mean(_delta_I_log))
         self.logger.record("debug/wyner_h_norm", float(th.norm(self._last_memory).item()))
         self.logger.record("debug/slots_norm", float(th.norm(self._last_slots).item()))
 
@@ -539,6 +559,7 @@ class HSWVimePPO(PPO):
                     None,
                     vae_tp1.skips,
                     timestep=rollout_data.timesteps.long() + 1,
+                    slots=rollout_data.slot_memories,
                 )
                 wyner_loss_obj = self.policy.wyner_feature_extractor.loss(
                     wyner_out,

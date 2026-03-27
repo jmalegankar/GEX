@@ -21,21 +21,27 @@ class HSWVIMEFeaturesExtractor(nn.Module):
         This corresponds to the number of units for the last layer.
     """
 
-    def __init__(self, observation_space=None, *, mu_dim: int):
+    def __init__(self, observation_space=None, *, mu_dim: int, slot_dim: int = 64):
         super().__init__()
-        self._features_dim = 2 * mu_dim  # attn_output(mu_dim) concat mu(mu_dim)
         self.mu_dim = mu_dim
-        # Query, key, value all in μ-space (same dim)
-        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True)
-    
+        self.slot_dim = slot_dim
+        # Project pi (mu_dim) → slot space (slot_dim) for attention query
+        self.proj_pi = nn.Linear(mu_dim, slot_dim)
+        # Attention operates in slot_dim space (slots are dim slot_dim)
+        self.attn = nn.MultiheadAttention(slot_dim, num_heads=1, batch_first=True)
+        # Output: attn_output(slot_dim) concat pi(mu_dim)
+        self._features_dim = slot_dim + mu_dim
+
     @property
     def features_dim(self) -> int:
         return self._features_dim
-        
+
     def forward(self, slot_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
-        mu_features = mu_features.view(-1, 1, self.mu_dim) # Make it (batch_size, 1, mu_dim)
-        attn_output, _ = self.attn(mu_features, slot_features, slot_features, need_weights = False) # Query is mu, key and value are stored μ's
-        x = th.cat((mu_features, attn_output), dim=-1).squeeze(1) # Concatenate along the feature dimension
+        # mu_features = pi (B, mu_dim=32), slot_features = (B, K, slot_dim=64)
+        q = self.proj_pi(mu_features).view(-1, 1, self.slot_dim)  # (B, 1, slot_dim)
+        attn_output, _ = self.attn(q, slot_features, slot_features, need_weights=False)
+        # Concatenate raw pi (not projected) with attention output
+        x = th.cat((mu_features.view(-1, 1, self.mu_dim), attn_output), dim=-1).squeeze(1)
         return x
 
 class HSWVIMEActorCriticPolicy(ActorCriticPolicy):

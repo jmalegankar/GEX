@@ -115,7 +115,7 @@ def build_models(device="cpu"):
     ).to(device)
 
     slot_mem = SlotMemory(
-        num_slots=NUM_SLOTS, slot_dim=MU_DIM,
+        num_slots=NUM_SLOTS, slot_dim=WYNER_LATENT_DIM,
         gate_mode="detached", gate_scale=5.0, gate_threshold=0.0,
     ).to(device)
 
@@ -139,7 +139,7 @@ def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200):
 
         # Init memory state
         h = th.zeros(1, 1, WYNER_LATENT_DIM, device=device)
-        slots, ages = slot_mem.init_state(1, device)
+        slots = slot_mem.init_state(1, device)
 
         # Process turn-around steps through the pipeline too
         # (so memory accumulates from the very start)
@@ -157,13 +157,12 @@ def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200):
                 h_new, _ = wyner.encode(h, mu.detach(), skips, timestep=ts_tensor)
                 h_new_3d = h_new.unsqueeze(1)
 
-                wyner_out = wyner.forward(h, mu, None, skips, timestep=ts_tensor)
+                wyner_out = wyner.forward(h, mu, None, skips, timestep=ts_tensor, slots=slots)
                 kl = wyner.loss(wyner_out).kl_loss.view(-1)
-                new_slots, new_ages, gate = slot_mem.write(slots, ages, pi.detach(), kl)
+                new_slots, gate = slot_mem.write(slots, wyner_out.posterior_mu.detach(), kl)
 
             h = h_new_3d
             slots = new_slots
-            ages = new_ages
             prev_obs = turn_obs.copy()
             prev_action = np.array([turn_act], dtype=np.float32)
 
@@ -187,9 +186,9 @@ def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200):
                 h_new, _ = wyner.encode(h, mu.detach(), skips, timestep=ts_tensor)
                 h_new_3d = h_new.unsqueeze(1)
 
-                wyner_out = wyner.forward(h, mu, None, skips, timestep=ts_tensor)
+                wyner_out = wyner.forward(h, mu, None, skips, timestep=ts_tensor, slots=slots)
                 kl = wyner.loss(wyner_out).kl_loss.view(-1)
-                new_slots, new_ages, gate = slot_mem.write(slots, ages, pi.detach(), kl)
+                new_slots, gate = slot_mem.write(slots, wyner_out.posterior_mu.detach(), kl)
 
             records.append({
                 "timestep": t,
@@ -205,7 +204,6 @@ def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200):
 
             h = h_new_3d
             slots = new_slots
-            ages = new_ages
             prev_obs = obs.copy()
             prev_action = np.array([action], dtype=np.float32)
             obs = next_obs
