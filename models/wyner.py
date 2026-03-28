@@ -411,6 +411,7 @@ class WynerLBSVAE(nn.Module):
         self.prior_fc_mu = nn.Linear(decode_hidden, latent_dim)
         self.prior_fc_logvar = nn.Linear(decode_hidden, latent_dim)
         nn.init.zeros_(self.prior_fc_logvar.bias)
+        nn.init.zeros_(self.prior_fc_logvar.weight)
 
         # ── Posterior q(z_t | h_t [, μ_{t+1}]) ───────────────────
         # Two projections summed: h_t always present, μ_{t+1} optional.
@@ -425,6 +426,7 @@ class WynerLBSVAE(nn.Module):
         self.post_fc_mu = nn.Linear(decode_hidden, latent_dim)
         self.post_fc_logvar = nn.Linear(decode_hidden, latent_dim)
         nn.init.zeros_(self.post_fc_logvar.bias)
+        nn.init.zeros_(self.post_fc_logvar.weight)
 
         # ── Decoder: z + timestep → reconstruction ────────────────
         self.decoder = WynerIndependentDecoder(

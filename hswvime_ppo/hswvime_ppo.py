@@ -118,6 +118,7 @@ class HSWVimePPO(PPO):
         gate_mode: str = "detached",
         gate_scale: float = 1.0,
         gate_threshold: float = 0.0,
+        slot_temp: float = 0.1,
         wyner_kl_target: float = 0.0,
         wyner_kl_target_coef: float = 0.0,
     ):
@@ -131,6 +132,7 @@ class HSWVimePPO(PPO):
         self.gate_mode = gate_mode
         self.gate_scale = gate_scale
         self.gate_threshold = gate_threshold
+        self.slot_temp = slot_temp
         self.wyner_kl_target = wyner_kl_target
         self.wyner_kl_target_coef = wyner_kl_target_coef
 
@@ -182,7 +184,8 @@ class HSWVimePPO(PPO):
         self.intrinsic_anneal_steps = intrinsic_anneal_steps
         self.intrinsic_normalize = intrinsic_normalize
         self._kl_running_stats = RunningMeanStd()
-        self._gate_kl_running_stats = RunningMeanStd()  # Always-on stats for gate normalization
+        self._delta_I_ema = 1.0  # EMA of delta_I for ratio gating (floor=1.0 nat)
+        self._delta_I_ema_alpha = 0.01  # half-life ~70 steps
 
         self.memory_shape = memory_shape
 
@@ -205,6 +208,7 @@ class HSWVimePPO(PPO):
             gate_mode=self.gate_mode,
             gate_scale=self.gate_scale,
             gate_threshold=self.gate_threshold,
+            write_temp=self.slot_temp,
         ).to(self.device)
     
     def set_env(self, env, force_reset: bool = True):
@@ -362,16 +366,19 @@ class HSWVimePPO(PPO):
                 )
                 # delta_I = KL(posterior || slot-conditioned prior) = marginal info above memory
                 delta_I = self.policy.wyner_feature_extractor.loss(wyner_out_t).kl_loss.view(-1)
-                # Z-score normalize for gating so gate discriminates
-                gate_kl_np = delta_I.cpu().numpy()
-                self._gate_kl_running_stats.update(gate_kl_np)
-                if self._gate_kl_running_stats._warmed_up:
-                    gate_kl = (delta_I - self._gate_kl_running_stats.mean) / self._gate_kl_running_stats.std
-                else:
-                    gate_kl = delta_I
+                delta_I = delta_I.detach().clamp(max=500.0)
+                # Ratio gating: normalize by EMA of delta_I so gate is scale-invariant
+                delta_I_mean = float(delta_I.mean().item())
+                self._delta_I_ema = (
+                    (1 - self._delta_I_ema_alpha) * self._delta_I_ema
+                    + self._delta_I_ema_alpha * delta_I_mean
+                )
+                # Floor at 1.0 nat so early steps don't explode the ratio
+                ratio = delta_I / max(self._delta_I_ema, 1.0)
                 # Write z_t (Wyner posterior mean) — lives in same space as slots (dim 64)
+                # gate_threshold is now a ratio (default 2.0 = 2× average surprise)
                 new_slots, gate = self.slot_memory.write(
-                    self._last_slots, wyner_out_t.posterior_mu.detach(), gate_kl,
+                    self._last_slots, wyner_out_t.posterior_mu.detach(), ratio,
                 )
                 _gate_log.append(gate.mean().item())
                 _gate_std_log.append(gate.std().item())
@@ -392,7 +399,7 @@ class HSWVimePPO(PPO):
                 if done:
                     self._timesteps[idx] = 0
                     memory[idx, ...] = 0.0
-                    new_slots[idx] = 0.0
+                    new_slots[idx] = th.randn(self.num_slots, self._slot_memory_shape[1], device=self.device) * 0.01
 
             self._prev_last_obs = self._last_obs
             self._prev_action = actions
@@ -418,11 +425,10 @@ class HSWVimePPO(PPO):
         self.logger.record("slots/gate_std", np.mean(_gate_std_log))
         self.logger.record("slots/slot_norm_mean", np.mean(_slot_norm_log))
         self.logger.record("slots/slot_diversity", np.mean(_slot_diversity_log))
-        self.logger.record("slots/gate_kl_running_mean", self._gate_kl_running_stats.mean)
-        self.logger.record("slots/gate_kl_running_std", self._gate_kl_running_stats.std)
         self.logger.record("wyner/prior_mu_norm", np.mean(_prior_mu_norm_log))
         self.logger.record("wyner/prior_logvar_mean", np.mean(_prior_logvar_log))
         self.logger.record("wyner/delta_I_mean", np.mean(_delta_I_log))
+        self.logger.record("wyner/delta_I_ema", self._delta_I_ema)
         self.logger.record("debug/wyner_h_norm", float(th.norm(self._last_memory).item()))
         self.logger.record("debug/slots_norm", float(th.norm(self._last_slots).item()))
 

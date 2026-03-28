@@ -116,7 +116,7 @@ def build_models(device="cpu"):
 
     slot_mem = SlotMemory(
         num_slots=NUM_SLOTS, slot_dim=WYNER_LATENT_DIM,
-        gate_mode="detached", gate_scale=5.0, gate_threshold=0.0,
+        gate_mode="detached", gate_scale=3.0, gate_threshold=2.0,
     ).to(device)
 
     return vae, wyner, slot_mem
@@ -412,10 +412,15 @@ def main():
 
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
-        sd = th.load(args.checkpoint, map_location=args.device, weights_only=False)
-        vae_keys = {k.replace("policy.vae_feature_extractor.", ""): v
+        # SB3 checkpoints are zip files containing policy.pth
+        import zipfile, io
+        with zipfile.ZipFile(args.checkpoint, "r") as zf:
+            with zf.open("policy.pth") as f:
+                buf = io.BytesIO(f.read())
+        sd = th.load(buf, map_location=args.device, weights_only=False)
+        vae_keys = {k.replace("vae_feature_extractor.", ""): v
                     for k, v in sd.items() if "vae_feature_extractor" in k}
-        wyner_keys = {k.replace("policy.wyner_feature_extractor.", ""): v
+        wyner_keys = {k.replace("wyner_feature_extractor.", ""): v
                       for k, v in sd.items() if "wyner_feature_extractor" in k}
         if vae_keys:
             vae.load_state_dict(vae_keys)

@@ -28,6 +28,7 @@ class SlotMemory(nn.Module):
         self.gate_scale = gate_scale
         self.gate_threshold = gate_threshold
         self.write_temp = write_temp
+        self.max_slot_norm = 5.0
 
         if gate_mode == "learned":
             self.gate_net = nn.Sequential(
@@ -75,6 +76,14 @@ class SlotMemory(nn.Module):
         delta = z_t.unsqueeze(1) - slots                         # (B, K, D)
         new_slots = slots + gate.view(-1, 1, 1) * w.unsqueeze(2) * delta
 
+        # ── Clamp slot norms to prevent unbounded growth ─────────
+        norms = new_slots.norm(dim=-1, keepdim=True).clamp(min=1e-6)  # (B, K, 1)
+        new_slots = th.where(
+            norms > self.max_slot_norm,
+            new_slots * (self.max_slot_norm / norms),
+            new_slots,
+        )
+
         return new_slots, gate
 
     def gate_correlation_loss(self) -> th.Tensor:
@@ -85,5 +94,5 @@ class SlotMemory(nn.Module):
         return nn.functional.mse_loss(self._last_learned_gate, target)
 
     def init_state(self, batch_size: int, device: th.device) -> th.Tensor:
-        """Zero slots. No ages tensor needed for content-addressed writes."""
-        return th.zeros(batch_size, self.num_slots, self.slot_dim, device=device)
+        """Small noise init to break softmax symmetry from the first write."""
+        return th.randn(batch_size, self.num_slots, self.slot_dim, device=device) * 0.01

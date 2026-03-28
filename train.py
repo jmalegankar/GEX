@@ -2,7 +2,7 @@ import argparse
 import numpy as np
 import gymnasium
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 
 from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper, MemorySignalVisibleWrapper
 from models.embeddings import CategoricalGridWithDirEmbedding
@@ -140,8 +140,12 @@ def parse_args():
     p.add_argument("--num_slots",       type=int,   default=8)
     p.add_argument("--gate_mode",       type=str,   default="detached",
                    choices=["detached", "learned"])
-    p.add_argument("--gate_scale",      type=float, default=1.0)
-    p.add_argument("--gate_threshold",  type=float, default=0.0)
+    p.add_argument("--gate_scale",      type=float, default=3.0,
+                   help="Sigmoid sharpness for ratio gate (3.0 = transition spans ~2x around threshold).")
+    p.add_argument("--gate_threshold",  type=float, default=2.0,
+                   help="Ratio threshold: write only if delta_I > threshold * running mean.")
+    p.add_argument("--slot_temp",       type=float, default=0.1,
+                   help="Softmax temperature for content-addressed slot write (lower = sharper).")
     p.add_argument("--wyner_kl_target", type=float, default=0.0,
                    help="Target KL for Wyner (0 = use detached-posterior KL instead).")
     p.add_argument("--wyner_kl_target_coef", type=float, default=0.0,
@@ -228,6 +232,7 @@ def main():
         gate_mode=args.gate_mode,
         gate_scale=args.gate_scale,
         gate_threshold=args.gate_threshold,
+        slot_temp=args.slot_temp,
         wyner_kl_target=args.wyner_kl_target,
         wyner_kl_target_coef=args.wyner_kl_target_coef,
         kl_use_schedule=args.kl_use_schedule,
@@ -273,7 +278,16 @@ def main():
         f"  wyner_recon={args.wyner_recon_coef}  wyner_kl={args.wyner_kl_coef}"
         f"  intrinsic={args.intrinsic_scale}"
     )
-    model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=render_callback)
+    # Checkpoint every 100k steps
+    checkpoint_cb = CheckpointCallback(
+        save_freq=max(100_000 // args.n_envs, 1),
+        save_path=f"{args.tensorboard_log}/checkpoints",
+        name_prefix="model",
+    )
+    callbacks = [checkpoint_cb]
+    if render_callback is not None:
+        callbacks.append(render_callback)
+    model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=callbacks)
 
     print("Done.")
 
