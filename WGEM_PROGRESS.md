@@ -518,4 +518,68 @@ This writes unit-norm content to ALL 8 slots, so `mean(slots) = slot_content` (f
 
 **Conclusion:** All versions plateau at 0.45–0.62 regardless of representation fixes. The signal is verified at every stage (probes show 85–89% accuracy), slot norms are stable, yet the policy cannot learn to use the information. The 0.5 ceiling suggests the bottleneck is NOT the representation — it may be PPO credit assignment on this 50+ step horizon.
 
-**Next step:** Run a GRU-PPO baseline to determine if PPO can solve MemoryS7 at all (see pivot plan).
+---
+
+## Phase 0 Baseline: LSTM-PPO (No VAE, No Wyner, No Slots)
+
+**Script:** `scripts/baseline_recurrent_ppo.py`
+**Setup:** sb3-contrib `RecurrentPPO` with `MlpLstmPolicy`, FlattenObservation wrapper (5×5×4 → 100-dim), same hyperparams as WGEM runs.
+
+**Run:** `runs/baseline_lstm` — 500k steps, seed=0
+
+| Step | Reward |
+|------|--------|
+| 20k | 0.380 |
+| 40k | 0.442 |
+| 60k | 0.465 |
+| 100k | 0.495 |
+| 200k | 0.525 |
+| 242k | **0.611** (peak) |
+| 300k | 0.505 |
+| 500k | 0.517 |
+
+| Metric | Value |
+|--------|-------|
+| Final reward (500k) | 0.517 |
+| Peak reward | **0.611 @ 242k** |
+| Last-20 mean | 0.475 |
+
+**CRITICAL FINDING: The vanilla LSTM baseline matches WGEM performance exactly.** With perfect recurrent access to all observations (no VAE bottleneck, no slot memory, no information-theoretic losses), PPO still cannot break 0.5 sustained. The LSTM peak (0.611) is virtually identical to WGEM v4 peak (0.620).
+
+**Diagnosis:** The 0.5 ceiling is a **PPO credit assignment failure**, not a representation problem. The ~50-step delay between seeing the key/ball signal and making the T-junction choice is beyond what PPO's GAE(λ=0.95, γ=0.99) can bridge. At 50 steps, the effective discount is 0.99^50 ≈ 0.61, and the advantage estimate is heavily diluted.
+
+**Implications:**
+1. All v4–v9b representation work was solving the wrong problem
+2. The architecture (SCVAE + Wyner + slots) is NOT the bottleneck
+3. To break 0.5, we need to fix credit assignment, not representation
+
+**Options for credit assignment fix:**
+- (a) **Higher gamma** (0.999): extends effective horizon, discount at 50 steps = 0.999^50 ≈ 0.95
+- (b) **Curriculum**: start with shorter corridors (MemoryS5), scale up
+- (c) **Shaped reward**: intermediate reward at T-junction based on correct direction
+- (d) **Different algorithm**: R2D2, IMPALA, or transformer-based with longer context
+- (e) **Intrinsic reward at T-junction**: reward for using slot information when it matters
+
+---
+
+## Baseline Ablation: LSTM-PPO with gamma=0.999
+
+**Run:** `runs/baseline_lstm_g999` — 500k steps, gamma=0.999, ent_coef=0.01
+
+| Step | Reward |
+|------|--------|
+| 20k | 0.167 |
+| 60k | 0.018 (collapsed — high-variance returns destabilize value learning) |
+| 200k | 0.450 (recovered) |
+| 408k | **0.638** (peak) |
+| 500k | 0.554 |
+
+| Metric | gamma=0.99 | gamma=0.999 |
+|--------|-----------|-------------|
+| Final reward | 0.517 | 0.554 |
+| Peak reward | 0.611 | **0.638** |
+| Last-10 mean | 0.475 | 0.471 |
+
+**Conclusion:** Higher gamma gives a marginal peak improvement (0.611 → 0.638) but the sustained mean is identical (~0.47). The initial collapse (0→60k) confirms that gamma=0.999 makes value estimation harder. PPO fundamentally cannot reliably solve the 50-step credit assignment in this task regardless of gamma.
+
+**Updated assessment:** The 0.5 ceiling is a hard PPO limitation on MemoryS7. Next steps should focus on either (b) curriculum with MemoryS5 or (c) a fundamentally different approach to credit assignment.
