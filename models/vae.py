@@ -152,6 +152,10 @@ class TransitionSCVAE(nn.Module):
     def encode_state(self, s_t: th.Tensor) -> th.Tensor:
         return self._embed(s_t)
 
+    def encode_obs_conv(self, obs: th.Tensor) -> th.Tensor:
+        """Return conv encoder features for slot memory writes. (B, conv_out_dim)."""
+        return self.conv(self._embed(obs))
+
     # ---------------------------------------------------------
     # Interface methods
     # ---------------------------------------------------------

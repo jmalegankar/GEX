@@ -25,11 +25,7 @@ class HSWVIMEFeaturesExtractor(nn.Module):
         super().__init__()
         self.mu_dim = mu_dim
         self.slot_dim = slot_dim
-        # Project pi (mu_dim) → slot space (slot_dim) for attention query
-        self.proj_pi = nn.Linear(mu_dim, slot_dim)
-        # Attention operates in slot_dim space (slots are dim slot_dim)
-        self.attn = nn.MultiheadAttention(slot_dim, num_heads=1, batch_first=True)
-        # Output: attn_output(slot_dim) concat pi(mu_dim)
+        # Output: mean(slots)(slot_dim) concat pi(mu_dim)
         self._features_dim = slot_dim + mu_dim
 
     @property
@@ -38,10 +34,10 @@ class HSWVIMEFeaturesExtractor(nn.Module):
 
     def forward(self, slot_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
         # mu_features = pi (B, mu_dim=32), slot_features = (B, K, slot_dim=64)
-        q = self.proj_pi(mu_features).view(-1, 1, self.slot_dim)  # (B, 1, slot_dim)
-        attn_output, _ = self.attn(q, slot_features, slot_features, need_weights=False)
-        # Concatenate raw pi (not projected) with attention output
-        x = th.cat((mu_features.view(-1, 1, self.mu_dim), attn_output), dim=-1).squeeze(1)
+        # All slots contain similar content (same turn-around observation),
+        # so mean pooling is equivalent to attention but with zero learning overhead.
+        slot_mean = slot_features.mean(dim=1)  # (B, slot_dim)
+        x = th.cat((mu_features, slot_mean), dim=-1)  # (B, mu_dim + slot_dim)
         return x
 
 class HSWVIMEActorCriticPolicy(ActorCriticPolicy):

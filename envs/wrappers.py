@@ -85,14 +85,20 @@ class MemorySignalVisibleWrapper(gymnasium.Wrapper):
         super().__init__(env)
         self.turn_steps = turn_steps
         self.signal_obs = None  # set during reset
+        self.turn_history = []  # [(obs, action), ...] for each turn step
 
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
+        self.turn_history = []
 
+        prev_obs = obs
         # Turn left to face the signal
         for _ in range(self.turn_steps):
+            self.turn_history.append((prev_obs.copy(), 0))
             obs, _, term, trunc, info = self.env.step(0)  # 0 = turn left
+            prev_obs = obs
             if term or trunc:
+                info["turn_history"] = self.turn_history
                 return obs, info
 
         # Store the backward-facing observation containing the signal
@@ -100,10 +106,14 @@ class MemorySignalVisibleWrapper(gymnasium.Wrapper):
 
         # Turn back to face forward
         for _ in range(self.turn_steps):
+            self.turn_history.append((prev_obs.copy(), 0))
             obs, _, term, trunc, info = self.env.step(0)
+            prev_obs = obs
             if term or trunc:
+                info["turn_history"] = self.turn_history
                 return obs, info
 
+        info["turn_history"] = self.turn_history
         return obs, info
 
     def step(self, action):

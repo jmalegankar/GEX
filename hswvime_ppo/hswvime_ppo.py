@@ -210,6 +210,17 @@ class HSWVimePPO(PPO):
             gate_threshold=self.gate_threshold,
             write_temp=self.slot_temp,
         ).to(self.device)
+
+        # Frozen random projection: conv encoder features → slot_dim for slot writes.
+        # Conv features retain 89% signal vs 50% for mu. Random projection (JL lemma)
+        # preserves pairwise distances, so ~80-85% signal survives the 128→64 projection.
+        # L2-normalize after projection so slot content stays unit-norm as conv encoder
+        # feature distribution shifts during VAE training (without this, slot norms
+        # collapse from ~2.5 to ~0.12 by 60k steps, starving the policy of slot signal).
+        conv_out_dim = self.policy.vae_feature_extractor.conv.out_dim
+        slot_dim = self._slot_memory_shape[1]
+        self._slot_proj = th.nn.Linear(conv_out_dim, slot_dim, bias=False).to(self.device)
+        self._slot_proj.requires_grad_(False)
     
     def set_env(self, env, force_reset: bool = True):
         ret = super().set_env(env, force_reset)
@@ -229,7 +240,51 @@ class HSWVimePPO(PPO):
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
         self._timesteps = np.zeros(self.n_envs, dtype=np.int64)
 
+        # Process turn-around observations from initial reset
+        self._process_turn_history_all_envs(self.env, self._last_obs)
+
         return ret
+
+    def _process_turn_history_all_envs(self, env, obs_after_reset):
+        """Process turn-around observations through VAE/Wyner/slots for all envs."""
+        with th.no_grad():
+            for idx in range(self.n_envs):
+                sub_env = env.envs[idx]
+                wrapper = getattr(sub_env, 'env', sub_env)
+                while wrapper is not None and not hasattr(wrapper, 'turn_history'):
+                    wrapper = getattr(wrapper, 'env', None)
+                if wrapper is None or not hasattr(wrapper, 'turn_history') or not wrapper.turn_history:
+                    continue
+                turn_h = self._last_memory[idx:idx+1]
+                turn_slots = self._last_slots[idx:idx+1]
+                null_a = th.tensor(self.null_action, dtype=th.float32, device=self.device).unsqueeze(0)
+                turn_obs_list = [entry[0] for entry in wrapper.turn_history]
+                turn_obs_list.append(obs_after_reset[idx])
+                for ti in range(len(wrapper.turn_history)):
+                    s_prev = th.tensor(turn_obs_list[ti], dtype=th.float32, device=self.device).unsqueeze(0)
+                    s_curr = th.tensor(turn_obs_list[ti + 1], dtype=th.float32, device=self.device).unsqueeze(0)
+                    a_prev = null_a if ti == 0 else th.tensor([0.0], dtype=th.float32, device=self.device).unsqueeze(0)
+                    vae_turn = self.policy.vae_feature_extractor.forward(s_prev, a_prev, s_curr)
+                    ts_turn = th.tensor([ti], device=self.device, dtype=th.long)
+                    wyner_turn = self.policy.wyner_feature_extractor.forward(
+                        turn_h, vae_turn.mu, None, vae_turn.skips, timestep=ts_turn, slots=turn_slots,
+                    )
+                    turn_h_new, _ = self.policy.wyner_feature_extractor.encode(
+                        turn_h, vae_turn.mu.detach(), vae_turn.skips, timestep=ts_turn,
+                    )
+                    turn_h = turn_h_new.unsqueeze(1)
+                    turn_kl = self.policy.wyner_feature_extractor.loss(wyner_turn).kl_loss.view(-1)
+                    turn_kl = turn_kl.detach().clamp(max=500.0)
+                    # Write conv features (not posterior_mu) — bypasses dead VAE bottleneck
+                    # Broadcast conv features to ALL slots during turn-around.
+                    # Content-addressed write concentrates on 1 slot, leaving 7 at noise;
+                    # mean pooling then dilutes the signal by 8x. Broadcasting ensures
+                    # mean(slots) = slot_content (unit-norm) — full signal to policy.
+                    h_s_turn = self.policy.vae_feature_extractor.encode_obs_conv(s_curr)
+                    slot_content = th.nn.functional.normalize(self._slot_proj(h_s_turn.detach()), dim=-1)
+                    turn_slots = slot_content.unsqueeze(1).expand_as(turn_slots).clone()
+                self._last_memory[idx] = turn_h.squeeze(0)
+                self._last_slots[idx] = turn_slots.squeeze(0)
 
     def collect_rollouts(
         self,
@@ -357,36 +412,31 @@ class HSWVimePPO(PPO):
                 intrinsic_rewards,
             )
 
-            # Slot write: store z_t (Wyner posterior mean) gated by marginal info gain
+            # Slot memory: frozen after turn-around — only signal observations are written.
+            # Forward-movement writes would gradually dilute the signal (probe: 73%→58%).
+            # Still compute Wyner KL for intrinsic reward logging.
             with th.no_grad():
                 vae_t = self.policy.vae_feature_extractor.forward(s_tm1, a_tm1, s_t)
                 wyner_out_t = self.policy.wyner_feature_extractor.forward(
                     self._last_memory, vae_t.mu, None, vae_t.skips, timestep=timestep_tensor,
                     slots=self._last_slots,
                 )
-                # delta_I = KL(posterior || slot-conditioned prior) = marginal info above memory
                 delta_I = self.policy.wyner_feature_extractor.loss(wyner_out_t).kl_loss.view(-1)
                 delta_I = delta_I.detach().clamp(max=500.0)
-                # Ratio gating: normalize by EMA of delta_I so gate is scale-invariant
                 delta_I_mean = float(delta_I.mean().item())
                 self._delta_I_ema = (
                     (1 - self._delta_I_ema_alpha) * self._delta_I_ema
                     + self._delta_I_ema_alpha * delta_I_mean
                 )
-                # Floor at 1.0 nat so early steps don't explode the ratio
-                ratio = delta_I / max(self._delta_I_ema, 1.0)
-                # Write z_t (Wyner posterior mean) — lives in same space as slots (dim 64)
-                # gate_threshold is now a ratio (default 2.0 = 2× average surprise)
-                new_slots, gate = self.slot_memory.write(
-                    self._last_slots, wyner_out_t.posterior_mu.detach(), ratio,
-                )
-                _gate_log.append(gate.mean().item())
-                _gate_std_log.append(gate.std().item())
+                # No slot write during forward movement — slots hold signal from turn-around
+                new_slots = self._last_slots
+                gate = th.zeros(self.n_envs, device=self.device)
+                _gate_log.append(0.0)
+                _gate_std_log.append(0.0)
                 _slot_norm_log.append(new_slots.norm(dim=-1).mean().item())
                 _delta_I_log.append(delta_I.mean().item())
                 _prior_mu_norm_log.append(wyner_out_t.prior_mu.norm(dim=-1).mean().item())
                 _prior_logvar_log.append(wyner_out_t.prior_logvar.mean().item())
-                # Slot diversity: mean pairwise cosine distance
                 _slot_diversity_log.append(
                     (1 - F.cosine_similarity(
                         new_slots.unsqueeze(2), new_slots.unsqueeze(1), dim=-1
@@ -400,6 +450,42 @@ class HSWVimePPO(PPO):
                     self._timesteps[idx] = 0
                     memory[idx, ...] = 0.0
                     new_slots[idx] = th.randn(self.num_slots, self._slot_memory_shape[1], device=self.device) * 0.01
+
+                    # Process turn-around observations through VAE/Wyner/slots
+                    # so the signal enters the memory pipeline at episode start
+                    sub_env = env.envs[idx]
+                    wrapper = getattr(sub_env, 'env', sub_env)
+                    while wrapper is not None and not hasattr(wrapper, 'turn_history'):
+                        wrapper = getattr(wrapper, 'env', None)
+                    if wrapper is not None and hasattr(wrapper, 'turn_history') and wrapper.turn_history:
+                        with th.no_grad():
+                            turn_h = memory[idx:idx+1]  # (1, 1, D) zeroed memory
+                            turn_slots = new_slots[idx:idx+1]  # (1, K, D) noise-init slots
+                            null_a = th.tensor(self.null_action, dtype=th.float32, device=self.device).unsqueeze(0)
+                            # Build list of observations: turn_obs[i] → step → turn_obs[i+1], last → new_obs[idx]
+                            turn_obs_list = [entry[0] for entry in wrapper.turn_history]
+                            turn_obs_list.append(new_obs[idx])  # final forward-facing obs
+                            for ti in range(len(wrapper.turn_history)):
+                                s_prev = th.tensor(turn_obs_list[ti], dtype=th.float32, device=self.device).unsqueeze(0)
+                                s_curr = th.tensor(turn_obs_list[ti + 1], dtype=th.float32, device=self.device).unsqueeze(0)
+                                a_prev = null_a if ti == 0 else th.tensor([0.0], dtype=th.float32, device=self.device).unsqueeze(0)
+                                vae_turn = self.policy.vae_feature_extractor.forward(s_prev, a_prev, s_curr)
+                                ts_turn = th.tensor([ti], device=self.device, dtype=th.long)
+                                wyner_turn = self.policy.wyner_feature_extractor.forward(
+                                    turn_h, vae_turn.mu, None, vae_turn.skips, timestep=ts_turn, slots=turn_slots,
+                                )
+                                turn_h_new, _ = self.policy.wyner_feature_extractor.encode(
+                                    turn_h, vae_turn.mu.detach(), vae_turn.skips, timestep=ts_turn,
+                                )
+                                turn_h = turn_h_new.unsqueeze(1)
+                                # Broadcast conv features to ALL slots during turn-around
+                                turn_kl = self.policy.wyner_feature_extractor.loss(wyner_turn).kl_loss.view(-1)
+                                turn_kl = turn_kl.detach().clamp(max=500.0)
+                                h_s_turn = self.policy.vae_feature_extractor.encode_obs_conv(s_curr)
+                                slot_content = th.nn.functional.normalize(self._slot_proj(h_s_turn.detach()), dim=-1)
+                                turn_slots = slot_content.unsqueeze(1).expand_as(turn_slots).clone()
+                            memory[idx] = turn_h.squeeze(0)
+                            new_slots[idx] = turn_slots.squeeze(0)
 
             self._prev_last_obs = self._last_obs
             self._prev_action = actions

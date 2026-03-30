@@ -274,44 +274,248 @@ Prevents unbounded slot norm growth (was 8.6+ at 90k in v3). Insurance against r
 
 ---
 
-## Component 7: Full 500k Training Run
+## V4: Full 500k Training Run
 
-**Status:** READY — all prerequisites + v4 fixes passed. Run with:
-```bash
-python train.py \
-  --env "MiniGrid-MemoryS7-v0" \
-  --total_timesteps 500000 \
-  --n_envs 4 --n_steps 512 --batch_size 256 \
-  --device mps --seed 42 \
-  --num_slots 8 --gate_scale 3.0 --gate_threshold 2.0 \
-  --slot_temp 0.1 \
-  --ent_coef 0.05 --intrinsic_scale 0.0 \
-  --free_bits 0.0 \
-  --tensorboard_log runs/wgem_v4 \
-  --wyner_kl_target 0.0
+**Run:** `runs/wgem_v4` — 500k steps, seed=42, ent_coef=0.05, gate_scale=3.0, gate_threshold=2.0
+
+**Results:**
+
+| Metric | Value |
+|--------|-------|
+| Final reward (500k) | 0.549 |
+| Peak reward | **0.620 @ 291k** |
+| `slots/gate_mean` | 0.051 |
+| `slots/slot_norm_mean` | 1.28 |
+| `slots/slot_diversity` | 0.34 |
+
+**Observations:**
+- Best result to date at the time (peak 0.62)
+- Gate discriminates (0.05 mean, not saturated)
+- Slot diversity decays over training (0.85 → 0.34) — slots converging
+- Reward oscillates 0.45–0.62 after 200k, never sustains above 0.6
+
+---
+
+## V5: Signal Visibility Fix
+
+**Problem diagnosed:** `MemorySignalVisibleWrapper` was consuming turn-around observations without exposing them to the RL loop. The agent never "saw" the key/ball signal during rollout.
+
+**Fix:** Added turn-around observation processing in `_process_turn_history_all_envs()` and mid-rollout episode resets. Turn history from the wrapper is replayed through VAE/Wyner/slots at episode start.
+
+**Run:** `runs/wgem_v5` — 500k steps
+
+**Results:**
+
+| Metric | Value |
+|--------|-------|
+| Final reward (500k) | 0.443 |
+| Peak reward | 0.607 @ 444k |
+| `slots/gate_mean` | 0.050 |
+| `slots/slot_norm_mean` | 0.83 |
+| `slots/slot_diversity` | 0.54 |
+
+**Observations:**
+- Worse than v4 despite fixing signal visibility
+- Probe investigation revealed: the signal IS in the pipeline, but mu (after L2 norm) kills it
+
+---
+
+## V6: Signal Bottleneck Diagnosis
+
+**Diagnostic script:** `scripts/diagnose_signal_bottleneck.py` — tests linear separability at 7 pipeline stages.
+
+**Probe results (key/ball discrimination accuracy):**
+
+| Stage | Random Weights | Trained Weights |
+|-------|---------------|-----------------|
+| Raw obs | ~50% | ~50% |
+| Embedding | 76% | 76% |
+| Conv encoder | **89%** | **89%** |
+| Trunk (fc) | 72% | 68% |
+| fc_mu (before L2 norm) | 61% | 61% |
+| mu (after L2 norm) | **50%** | **50%** |
+| pi (unnormalized) | 61% | 61% |
+
+**Key finding:** L2 normalization (required by spCauchy prior) destroys the key/ball signal. Conv encoder features retain 89% but the VAE bottleneck (256 → 32 → L2 norm) compresses it to chance. Training actively destroys signal — random weights preserve it better than trained weights because VAE reconstruction allocates capacity to high-variance features (corridor layout), not the low-variance signal (1 cell key/ball).
+
+**Run:** `runs/wgem_v6` — 100k steps (short diagnostic run)
+
+| Metric | Value |
+|--------|-------|
+| Final reward (100k) | 0.446 |
+| Peak reward | 0.538 @ 78k |
+
+---
+
+## V7: Conv Features → Slots (Bypass VAE Bottleneck)
+
+**Approach:** Write conv encoder features (128-dim, 89% signal) directly to slots instead of posterior_mu (64-dim, inherits dead mu). Use frozen random projection (JL lemma) from 128 → 64 to match slot_dim.
+
+**Changes:**
+- Added `encode_obs_conv()` method to `TransitionSCVAE` — exposes conv encoder output
+- Added `_slot_proj = nn.Linear(128, 64, bias=False)` with `requires_grad_(False)` — frozen random projection
+- Slot writes during turn-around use `_slot_proj(encode_obs_conv(s_curr).detach())` instead of `posterior_mu`
+
+**Run:** `runs/wgem_v7_convslots` — 100k steps
+
+| Metric | Value |
+|--------|-------|
+| Final reward (100k) | 0.400 |
+| Peak reward | 0.435 @ 74k |
+| `slots/gate_mean` | 0.089 |
+| `slots/slot_norm_mean` | 2.03 |
+
+**Probe results (v7 conv-slot probe):**
+- Slots at turn-around: **73.5%** (up from ~55% with posterior_mu)
+- Slots at late timesteps: **58.4%** (signal decaying during forward movement)
+- Gate mean 0.029 — small but nonzero writes at every forward step accumulate and overwrite turn-around signal
+
+---
+
+## V7b: Tight Gate (gate_threshold=8.0)
+
+**Hypothesis:** Higher gate threshold would prevent forward-step writes from eroding signal.
+
+**Run:** `runs/wgem_v7b_tightgate` — 8k steps (aborted)
+
+**Result:** Gate completely shut. `sigmoid(5.0*(1.0 - 8.0)) ≈ 0`. Ratio gating normalizes to ~1.0, so threshold=8 means "8× average surprise" which never happens. Slots stayed at noise initialization.
+
+---
+
+## V7c: Frozen Slots After Turn-Around
+
+**Approach:** Instead of tuning the gate, freeze slots entirely during forward movement. Only write during turn-around replay. This guarantees the signal is preserved.
+
+**Changes:**
+- Forward movement: `new_slots = self._last_slots` (no write, no gate)
+- Turn-around: normal conv-feature write via `_slot_proj`
+- Added `--freeze_slots` flag to probe script for consistency
+
+**Probe results (v7c):**
+
+| Window | Accuracy |
+|--------|----------|
+| Turn-around (early) | **87–88%** |
+| Late timesteps | **87–88%** (constant — no erosion) |
+
+Signal fully preserved! But reward didn't improve:
+
+**Run:** `runs/wgem_v7c_frozenslots` — 100k steps
+
+| Metric | Value |
+|--------|-------|
+| Final reward (100k) | 0.485 |
+| Peak reward | 0.485 @ 100k |
+| `slots/gate_mean` | 0.000 (frozen) |
+| `slots/slot_norm_mean` | 0.37 |
+
+**Run:** `runs/wgem_v7c_500k` — 500k intended, died at 76k
+
+| Metric | Value |
+|--------|-------|
+| Final reward (76k) | 0.454 |
+| Peak reward | 0.471 @ 72k |
+
+**Diagnosis:** Slots contain signal (87% probe) but policy can't use it. Cross-attention with uniform slot content (all 8 slots identical) is degenerate — attention weights are irrelevant. `proj_pi` has too sparse a learning signal (1–2 T-junction steps per episode).
+
+---
+
+## V8: Mean Pooling (Replace Cross-Attention)
+
+**Approach:** Replace `nn.MultiheadAttention` + `proj_pi` with simple `mean(slots)` concatenated with pi. Rationale: all 8 slots contain identical content (same turn-around observation), so attention weights don't matter. Mean pooling removes unnecessary learned indirection.
+
+**Changes in `HSWVIMEFeaturesExtractor`:**
+- Removed: `self.proj_pi`, `self.attn` (nn.MultiheadAttention)
+- `forward()`: `slot_mean = slots.mean(dim=1); features = cat(pi, slot_mean)`
+- `_features_dim` = slot_dim (64) + mu_dim (32) = 96
+
+**Run:** `runs/wgem_v8_meanpool` — 200k steps
+
+| Step | Reward |
+|------|--------|
+| 20k | 0.13 |
+| 50k | 0.37 |
+| 80k | **0.57** (first time above 0.5) |
+| 100k | 0.47 |
+| 149k | **0.586** (peak) |
+| 200k | 0.44 |
+
+| Metric | Value |
+|--------|-------|
+| `slots/gate_mean` | 0.000 (frozen) |
+| `slots/slot_norm_mean` | **0.14** |
+
+**Key finding:** Slot norms collapsed from ~2.5 at 43k to ~0.12 by 63k. The frozen random projection doesn't adapt as the conv encoder's feature distribution shifts during VAE training. Policy was effectively blind to slots after 60k.
+
+---
+
+## V9: L2 Normalization on Projected Slot Content
+
+**Fix:** Added `F.normalize(self._slot_proj(conv_features), dim=-1)` so slot content is unit-norm regardless of conv encoder scale drift.
+
+**Run:** `runs/wgem_v9_normed_slots` — 200k steps
+
+| Step | Reward |
+|------|--------|
+| 20k | 0.17 |
+| 50k | 0.54 |
+| 82k | **0.605** (peak) |
+| 200k | 0.57 |
+
+| Metric | Value |
+|--------|-------|
+| `slots/slot_norm_mean` | **0.08** |
+
+**Problem:** Despite L2 normalizing the *content*, the *slot states* had norm 0.08. The gate was still closed (gate_mean=0.0) — turn-around writes also went through SlotMemory.write() which applies `sigmoid(3.0 * (ratio - 2.0))` as gate. Turn ratio ≈ 1.0 → gate ≈ sigmoid(-3.0) ≈ 0.05. Almost no content actually written.
+
+---
+
+## V9b: Broadcast Write (Bypass SlotMemory.write)
+
+**Fix:** Replace content-addressed gated write during turn-around with direct broadcast:
+```python
+turn_slots = slot_content.unsqueeze(1).expand_as(turn_slots).clone()
 ```
+This writes unit-norm content to ALL 8 slots, so `mean(slots) = slot_content` (full signal).
 
-**Checkpoints needed at:** 100k, 300k, 500k
+**Run:** `runs/wgem_v9b_broadcast_slots` — 200k steps
 
-**Target metrics:**
+| Step | Reward |
+|------|--------|
+| 20k | 0.44 |
+| 40k | 0.52 |
+| 60k | 0.52 |
+| 80k | 0.46 |
+| 115k | **0.577** (peak) |
+| 200k | 0.54 |
 
-| Metric | Target at 300k | Target at 500k |
-|--------|---------------|----------------|
-| `ep_rew_mean` | > 0.6 | > 0.75 |
-| `slots/gate_mean` | 0.05 – 0.2 | 0.05 – 0.15 |
-| `wyner/kl_mean` | 2 – 15 | 2 – 15 |
-| `train/entropy_loss` | < -0.5 | < -0.3 |
-| `train/explained_variance` | > 0.3 | > 0.5 |
+| Metric | Value |
+|--------|-------|
+| `slots/slot_norm_mean` | **1.00** (stable) |
+| `slots/gate_mean` | 0.000 (frozen during forward) |
+| `slots/slot_diversity` | 0.87 |
 
-**100k probe checkpoint criteria (run before continuing to 500k):**
-- (a) Gate shows spike at t=0-2 then drops to < 0.3 for rest of episode
-- (b) At least one slot probes above 75% accuracy individually
-- (c) Flattened slot probe at late timesteps > 70%
+**Observations:**
+- Slot norms finally stable at 1.0 throughout training
+- Fastest ramp (0.44 at 20k vs 0.13 for v8)
+- Still plateaus at 0.45–0.58 — same ceiling as all prior versions
 
-**Final probe pass criterion:**
+---
 
-| Timestep window | Required accuracy |
-|----------------|-------------------|
-| Early (t=0-2)  | > 90%             |
-| Mid (t=3-50)   | > 75%             |
-| Late (t=51+)   | > 70%             |
+## Summary: All Versions
+
+| Version | Key Change | Steps | Peak Reward | Final Reward | Slot Norm |
+|---------|-----------|-------|-------------|--------------|-----------|
+| v4 | EMA ratio gate, norm clamp | 500k | **0.620** | 0.549 | 1.28 |
+| v5 | Signal visibility fix | 500k | 0.607 | 0.443 | 0.83 |
+| v6 | Diagnostic (bottleneck probe) | 100k | 0.538 | 0.446 | — |
+| v7 | Conv features → slots | 100k | 0.435 | 0.400 | 2.03 |
+| v7b | Tight gate (threshold=8) | 8k | 0.127 | 0.092 | — |
+| v7c | Frozen slots after turn-around | 100k | 0.485 | 0.485 | 0.37 |
+| v8 | Mean-pool (replace attention) | 200k | 0.586 | 0.442 | 0.14 |
+| v9 | L2 norm on slot content | 200k | **0.605** | 0.567 | 0.08 |
+| v9b | Broadcast write to all slots | 200k | 0.577 | 0.538 | **1.00** |
+
+**Conclusion:** All versions plateau at 0.45–0.62 regardless of representation fixes. The signal is verified at every stage (probes show 85–89% accuracy), slot norms are stable, yet the policy cannot learn to use the information. The 0.5 ceiling suggests the bottleneck is NOT the representation — it may be PPO credit assignment on this 50+ step horizon.
+
+**Next step:** Run a GRU-PPO baseline to determine if PPO can solve MemoryS7 at all (see pivot plan).

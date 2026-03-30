@@ -122,8 +122,13 @@ def build_models(device="cpu"):
     return vae, wyner, slot_mem
 
 
-def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200):
-    """Run episodes with turn-around + random policy, collecting all representations."""
+def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200, use_conv_slots=False, slot_proj=None, freeze_slots=False):
+    """Run episodes with turn-around + random policy, collecting all representations.
+
+    If use_conv_slots=True, writes projected conv features to slots (v7 mode)
+    instead of Wyner posterior_mu.
+    If freeze_slots=True, only writes during turn-around (v7c mode).
+    """
     records = []
     vae.eval()
     wyner.eval()
@@ -159,7 +164,12 @@ def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200):
 
                 wyner_out = wyner.forward(h, mu, None, skips, timestep=ts_tensor, slots=slots)
                 kl = wyner.loss(wyner_out).kl_loss.view(-1)
-                new_slots, gate = slot_mem.write(slots, wyner_out.posterior_mu.detach(), kl)
+                if use_conv_slots and slot_proj is not None:
+                    h_s = vae.encode_obs_conv(s_t)
+                    slot_content = slot_proj(h_s.detach())
+                    new_slots, gate = slot_mem.write(slots, slot_content, kl)
+                else:
+                    new_slots, gate = slot_mem.write(slots, wyner_out.posterior_mu.detach(), kl)
 
             h = h_new_3d
             slots = new_slots
@@ -188,7 +198,16 @@ def collect_data(env, vae, wyner, slot_mem, device, n_episodes=200):
 
                 wyner_out = wyner.forward(h, mu, None, skips, timestep=ts_tensor, slots=slots)
                 kl = wyner.loss(wyner_out).kl_loss.view(-1)
-                new_slots, gate = slot_mem.write(slots, wyner_out.posterior_mu.detach(), kl)
+                if freeze_slots:
+                    # v7c: no writes during forward movement — slots hold signal from turn-around
+                    new_slots = slots
+                    gate = th.zeros(1)
+                elif use_conv_slots and slot_proj is not None:
+                    h_s = vae.encode_obs_conv(s_t)
+                    slot_content = slot_proj(h_s.detach())
+                    new_slots, gate = slot_mem.write(slots, slot_content, kl)
+                else:
+                    new_slots, gate = slot_mem.write(slots, wyner_out.posterior_mu.detach(), kl)
 
             records.append({
                 "timestep": t,
@@ -400,6 +419,10 @@ def main():
     parser.add_argument("--checkpoint", type=str, default=None)
     parser.add_argument("--n_episodes", type=int, default=200)
     parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--use_conv_slots", action="store_true",
+                        help="Use projected conv features for slot writes (v7 mode)")
+    parser.add_argument("--freeze_slots", action="store_true",
+                        help="Only write to slots during turn-around, freeze during forward movement (v7c mode)")
     args = parser.parse_args()
 
     print("Building environment (view_size=5)...")
@@ -409,6 +432,14 @@ def main():
 
     print("Building models...")
     vae, wyner, slot_mem = build_models(args.device)
+
+    # Build frozen random projection for conv→slot content (v7 mode)
+    slot_proj = None
+    if args.use_conv_slots:
+        conv_out_dim = 128  # matches conv_channels[-1]
+        slot_proj = th.nn.Linear(conv_out_dim, WYNER_LATENT_DIM, bias=False).to(args.device)
+        slot_proj.requires_grad_(False)
+        print(f"  Using conv slot mode: {conv_out_dim} → {WYNER_LATENT_DIM} (frozen projection)")
 
     if args.checkpoint:
         print(f"Loading checkpoint: {args.checkpoint}")
@@ -430,7 +461,9 @@ def main():
             print(f"  Loaded {len(wyner_keys)} Wyner params")
 
     print(f"Collecting data ({args.n_episodes} episodes)...")
-    records = collect_data(env, vae, wyner, slot_mem, args.device, args.n_episodes)
+    records = collect_data(env, vae, wyner, slot_mem, args.device, args.n_episodes,
+                          use_conv_slots=args.use_conv_slots, slot_proj=slot_proj,
+                          freeze_slots=args.freeze_slots)
     env.close()
 
     if len(records) < 50:
