@@ -12,6 +12,8 @@ from stable_baselines3.common.utils import explained_variance, obs_as_tensor
 from stable_baselines3.common.vec_env import VecEnv
 from stable_baselines3 import PPO
 
+from models.utils import sc_log_prob
+
 from .buffer import TransitionRolloutBuffer
 from .policies import HSWVIMEActorCriticPolicy
 
@@ -53,7 +55,7 @@ class HSWVimePPO(PPO):
         kl_use_schedule: bool = False,
         kl_anneal_steps: int = 50_000,
         intrinsic_scale: float = 1.0,
-        max_grad_norm: float = 500.0,
+        max_grad_norm: float = 0.5,
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         rollout_buffer_class: Optional[type[TransitionRolloutBuffer]] = TransitionRolloutBuffer,
@@ -73,7 +75,7 @@ class HSWVimePPO(PPO):
         wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
         episodic_memory_class: type = BatchedNoveltyMemory,
         episodic_memory_kwargs: Optional[dict[str, Any]] = None,
-        aux_max_grad_norm: float = 500.0,
+        aux_max_grad_norm: float = 0.5,
     ):
         policy_kwargs = policy_kwargs or {}
         policy_kwargs["vae_features_extractor_class"] = vae_features_extractor_class
@@ -83,7 +85,7 @@ class HSWVimePPO(PPO):
 
         rollout_buffer_kwargs = rollout_buffer_kwargs or {}
         rollout_buffer_kwargs["memory_shape"] = memory_shape
-        rollout_buffer_kwargs["answer_dim"] = wyner_features_extractor_kwargs.get("recon_dim")
+        rollout_buffer_kwargs["answer_dim"] = wyner_features_extractor_kwargs.get("mu_dim")
 
         super().__init__(
             policy=policy,
@@ -307,7 +309,7 @@ class HSWVimePPO(PPO):
                 ).kl_loss.cpu().numpy()
 
             # Increment timestep counter, then reset for finished episodes
-            self._qa_sampler.update(scores, vae_t.recon_target.cpu().numpy())
+            self._qa_sampler.update(scores, vae_t.mu.cpu().numpy())
             for idx, done in enumerate(dones):
                 if done:
                     self._qa_sampler.reset(idx)
@@ -452,61 +454,88 @@ class HSWVimePPO(PPO):
                     + effective_vae_kl_coef * vae_loss_obj.kl_loss
                 )
 
+                vae_loss_obj = self.policy.vae_feature_extractor.loss(vae_tp1)
+
+                vae_loss += (
+                    self.vae_recon_coef * vae_loss_obj.recon_loss
+                    + effective_vae_kl_coef * vae_loss_obj.kl_loss
+                )
+
                 vae_losses.append(vae_loss.item())
                 vae_recon_losses.append(vae_loss_obj.recon_loss.item())
                 vae_kl_losses.append(vae_loss_obj.kl_loss.item())
 
                 wyner_out = self.policy.wyner_feature_extractor.forward(
                     rollout_data.memories,
-                    vae_t.mu,
-                    vae_tp1.mu,
+                    vae_t.mu.detach(),
+                    vae_tp1.mu.detach(),
                     vae_t.skips,
                     timestep=rollout_data.timesteps.long(),
                 )
+
+                kl_loss = 0.0
+
                 wyner_loss_obj = self.policy.wyner_feature_extractor.loss(
                     wyner_out,
                     recon_target=vae_t.recon_target,
                     recon_next_target=vae_tp1.recon_target,
                 )
 
+                kl_loss += wyner_loss_obj.kl_loss.mean()
+
                 # decode from wyner all questions
                 qa_loss = 0.0
-                for idx in range(self.rollout_buffer.num_qa):
-                    questions = rollout_data.questions[:, idx, ...]
-                    recon_answers = self.policy.wyner_feature_extractor.decode(
-                        wyner_out.w + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar),
-                        None,
-                        timestep=questions,
-                    )
-                    qa_loss += F.mse_loss(recon_answers, rollout_data.answers[:, idx, ...])
+                # for idx in range(self.rollout_buffer.num_qa):
+                #     questions = rollout_data.questions[:, idx, ...]
+                #     recon_answers = self.policy.wyner_feature_extractor.decode(
+                #         wyner_out.w,
+                #         None,
+                #         timestep=questions,
+                #     )
+                #     mu, rho, _ = self.policy.vae_feature_extractor.encode_direct(recon_answers)
+                #     rho = rho.detach()  # don't backprop through next answer uncertainty
+                #     qa_loss += -sc_log_prob(rollout_data.answers[:, idx, ...], mu, rho).mean()  # Cauchy log-prob prediction loss
                 
                 wyner_out = self.policy.wyner_feature_extractor.forward(
                     wyner_out.w,
-                    vae_tp1.mu,
+                    vae_tp1.mu.detach(),
                     None,
                     vae_tp1.skips,
                     timestep=rollout_data.timesteps.long()+1,
                 )
 
+                kl_loss += self.policy.wyner_feature_extractor.loss(
+                    wyner_out,
+                    recon_target=vae_tp1.recon_target,
+                ).kl_loss.mean()
+
+                for param in self.policy.vae_feature_extractor.parameters():
+                    param.requires_grad = False
+
                 for idx in range(self.rollout_buffer.num_qa):
                     questions = rollout_data.questions[:, idx, ...]
                     recon_next_answers = self.policy.wyner_feature_extractor.decode(
-                        wyner_out.w + th.exp(0.5 * wyner_out.logvar) * th.randn_like(wyner_out.logvar),
+                        wyner_out.w,
                         None,
                         timestep=questions,
                     )
-                    qa_loss += F.mse_loss(recon_next_answers, rollout_data.answers[:, idx, ...])
+                    mu, rho, _ = self.policy.vae_feature_extractor.encode_direct(recon_next_answers)
+                    qa_loss += -sc_log_prob(rollout_data.answers[:, idx, ...], mu, rho).mean()  # Cauchy log-prob prediction loss
 
-                wyner_loss = (
-                    self.wyner_recon_coef * (
-                        wyner_loss_obj.recon_loss.mean() + wyner_loss_obj.recon_next_loss.mean() + qa_loss
-                    )
-                    + effective_wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
-                )
+                for param in self.policy.vae_feature_extractor.parameters():
+                    param.requires_grad = True
+
+                # wyner_loss = (
+                #     self.wyner_recon_coef * (
+                #         wyner_loss_obj.recon_loss.mean() + wyner_loss_obj.recon_next_loss.mean() + qa_loss
+                #     )
+                #     + effective_wyner_kl_coef * wyner_loss_obj.kl_loss.mean()
+                # )
+                wyner_loss = self.wyner_recon_coef * qa_loss + effective_wyner_kl_coef * kl_loss
 
                 wyner_losses.append(wyner_loss.item())
                 wyner_recon_losses.append(wyner_loss_obj.recon_loss.mean().item())
-                wyner_kl_losses.append(wyner_loss_obj.kl_loss.mean().item())
+                wyner_kl_losses.append(kl_loss.item())
                 wyner_recon_next_losses.append(wyner_loss_obj.recon_next_loss.mean().item())
                 wyner_qa_losses.append(qa_loss.item())
 

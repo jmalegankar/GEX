@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import math
 
 from typing import Tuple
 
@@ -23,6 +24,22 @@ def sc_sample(mu: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
     xi = F.normalize(torch.randn_like(mu), p=2.0, dim=-1)
     return _mobius_add(rho * mu, xi)
 
+# @torch.jit.script
+# def sc_log_prob(z: torch.Tensor, mu: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
+#     d = z.size(-1)
+#     z_mu = _mobius_add(-mu, z)  # (B, d)
+#     z_mu_norm_sq = (z_mu * z_mu).sum(-1)  # (B,)
+#     rho_sq = rho * rho # (B,1)
+#     log_unnormalized = -d * torch.log1p(z_mu_norm_sq / (rho_sq + 1e-8))  # (B,)
+#     log_normalizer = (d - 1) * torch.log1p(rho) + torch.lgamma(torch.tensor(d / 2.0)) - torch.lgamma(torch.tensor((d - 1) / 2.0))
+#     return log_unnormalized - log_normalizer
+
+@torch.jit.script
+def sc_log_prob(z: torch.Tensor, mu: torch.Tensor, rho: torch.Tensor) -> torch.Tensor:
+    noise = _mobius_add(-mu*rho, z)  # (B, d)
+    noise *= math.sqrt(z.size(-1))  # scale by sqrt(d) for better numerical stability
+    # This should be a sample from gaussian with identity covariance, so log prob is just -0.5 * ||noise||^2 + const
+    return -noise.pow(2).mean(dim=-1)  # (B,)
 
 @torch.jit.script
 def _sc_kl_asymptotic(rho: torch.Tensor, dim: int) -> torch.Tensor:

@@ -214,7 +214,12 @@ class WynerIndependentDecoder(nn.Module):
 
         self.fc1 = nn.Linear(self.decode_hidden * self.latent_tokens + self.pos_embed_dim, self.decode_hidden)
         self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(self.decode_hidden, self.decode_hidden)
+        self.fc2 = nn.Sequential(
+            nn.Linear(self.decode_hidden, self.decode_hidden),
+            nn.ReLU(),
+            nn.Linear(self.decode_hidden, self.decode_hidden),
+            nn.ReLU(),
+        )
         self.fc_out = nn.Linear(self.decode_hidden, self.recon_dim)
 
     def forward(self, z: th.Tensor, timestep_encoding: th.Tensor) -> th.Tensor:

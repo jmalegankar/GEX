@@ -160,7 +160,8 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         # Preprocess the observation if needed
         features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
         if self.share_features_extractor:
-            latent_pi, latent_vf = self.mlp_extractor(features)
+            latent_pi = self.mlp_extractor.forward_actor(features.detach())  # don't backprop through features for policy
+            latent_vf = self.mlp_extractor.forward_critic(features)
         else:
             pi_features, vf_features = features
             latent_pi = self.mlp_extractor.forward_actor(pi_features)
@@ -181,9 +182,10 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         memory: th.Tensor,
         timestep: Optional[th.Tensor] = None,
     ) -> Tuple[th.Tensor, th.Tensor]:
-        s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
-        s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
-        mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
+        with th.no_grad():
+            s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
+            s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
+            mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
         new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips, timestep=timestep)
         # encode returns (B, latent_dim); restore the seq dim for storage and MHA
         new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
@@ -226,7 +228,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
         latent_vf = self.mlp_extractor.forward_critic(features)
         values = self.value_net(latent_vf)
-        latent_pi = self.mlp_extractor.forward_actor(features)
+        latent_pi = self.mlp_extractor.forward_actor(features.detach())  # don't backprop through features for policy
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(action)
         return values, log_prob, distribution.entropy(), new_memory

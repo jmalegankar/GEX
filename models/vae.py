@@ -2,7 +2,7 @@ import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, overload
 
 from .utils import sc_kl_uniform, uniformity_loss, sc_sample
 from .embeddings import EmbeddingInterface
@@ -171,6 +171,20 @@ class TransitionSCVAE(nn.Module):
         h = self.encoder_trunk(
             th.cat([h_s, a_emb, h_sn], dim=-1)
         )
+
+        mu  = F.normalize(self.fc_mu(h), p=2, dim=-1)
+        rho = th.sigmoid(self.fc_rho(h))
+
+        skips: Optional[List[th.Tensor]] = None 
+
+        return mu, rho, skips
+    
+    def encode_direct(
+        self,
+        encoded: th.Tensor,
+    ) -> Tuple[th.Tensor, th.Tensor, Optional[List[th.Tensor]]]:
+        
+        h = self.encoder_trunk(encoded)
 
         mu  = F.normalize(self.fc_mu(h), p=2, dim=-1)
         rho = th.sigmoid(self.fc_rho(h))
