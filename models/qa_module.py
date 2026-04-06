@@ -11,9 +11,9 @@ class QASampler:
         self.exmeansq = np.zeros(buffer.n_envs, dtype=np.float32)
         self.num_qa = buffer.n_envs
         self.scores = np.zeros((buffer.n_envs, buffer.num_qa), dtype=np.float32)
-        self.timesteps = np.zeros((buffer.n_envs), dtype=np.long)
+        self.timesteps = np.zeros((buffer.n_envs), dtype=np.float64)
         self._env_idx = np.arange(buffer.n_envs)
-        self._cur_questions = np.zeros((buffer.n_envs, buffer.num_qa), dtype=np.long)
+        self._cur_questions = np.zeros((buffer.n_envs, buffer.num_qa), dtype=np.float64)
         self._cur_answers = np.zeros((buffer.n_envs, buffer.num_qa, buffer.answer_dim), dtype=np.float32)
     
     def reset(self, idx: Optional[int] = None):
