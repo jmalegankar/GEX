@@ -34,6 +34,7 @@ class QASampler:
     
     def update(self, scores: np.ndarray, answers: np.ndarray):
         assert np.isnan(scores).any() == False, "Scores contain NaN values"
+        scores = np.clip(scores, -1e6, 1e6)  # prevent float overflow in squares
         num_timesteps = self.timesteps + 1
         self.means = (self.timesteps/num_timesteps) * self.means + scores / num_timesteps
         self.exmeansq = (self.timesteps/num_timesteps) * self.exmeansq + (scores**2) / num_timesteps
