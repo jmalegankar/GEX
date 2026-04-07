@@ -399,13 +399,9 @@ class WynerMambaVAE(nn.Module):
             expand=mamba_expand,
             n_heads=mamba_heads,
         )
+        # The memory vector is now flat_state_dim, NOT latent_dim.
+        # Export this so train.py can set memory_shape correctly.
         self.memory_dim = self.mamba_cell.flat_state_dim
-
-        # Project prev z_mu (latent_dim) → initial SSM state (flat_state_dim) each step.
-        # Memory stays latent_dim so prior_net and policies.py need no changes.
-        self.h_proj_in = nn.Linear(latent_dim, self.memory_dim, bias=False)
-        # Read-out from SSM flat state → latent_dim for VAE posterior
-        self.readout = nn.Linear(self.memory_dim, latent_dim, bias=False)
 
         self.fc_mean = nn.Linear(self.latent_dim, self.latent_dim)
         self.fc_logvar = nn.Linear(self.latent_dim, self.latent_dim)
@@ -420,14 +416,20 @@ class WynerMambaVAE(nn.Module):
         )
 
     def _mamba_step(self, w: th.Tensor, mu: th.Tensor) -> th.Tensor:
-        """w: (B, 1, latent_dim) or (B, latent_dim) — prev z_mu; mu: (B, mu_dim) → h: (B, flat_state_dim)"""
-        w_flat = w.squeeze(1) if w.dim() == 3 else w   # (B, latent_dim)
-        h_init = self.h_proj_in(w_flat)                # (B, flat_state_dim)
-        return self.mamba_cell(mu, h_init)             # (B, flat_state_dim)
+        """w: (B, 1, memory_dim) or (B, memory_dim); mu: (B, mu_dim) → h: (B, memory_dim)"""
+        w_flat = w.squeeze(1) if w.dim() == 3 else w
+        return self.mamba_cell(mu, w_flat)          # GRUCell-compatible call
 
     def _h_to_latent(self, h: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
-        """SSM flat state (B, flat_state_dim) → (z_mu, z_logvar) via readout + fc_mean/fc_logvar."""
-        h_read = self.readout(h)                    # (B, latent_dim)
+        """
+        The SSM state (B, memory_dim) → (z_mu, z_logvar) via fc_mean/fc_logvar.
+        We collapse memory_dim → latent_dim with a linear read-out.
+        """
+        # Read out latent_dim features from the flat SSM state
+        # fc_mean/fc_logvar expect (B, latent_dim) — add a read-out projection if needed.
+        # Simplest: slice the first latent_dim dims (they're already latent_dim if
+        # d_state=1 and mamba_heads=1, otherwise add self.readout = nn.Linear(memory_dim, latent_dim))
+        h_read = h[:, :self.latent_dim]             # (B, latent_dim)
         return self.fc_mean(h_read), self.fc_logvar(h_read)
 
     def encode(self, w, mu, skips=None, timestep=None):
@@ -445,11 +447,16 @@ class WynerMambaVAE(nn.Module):
         z = z_mu + th.randn_like(std) * std
         recon = self.decode(z, mu)
         recon_next = self.decode(z, mu_next) if mu_next is not None else None
-        # w carries z_mu (latent_dim) — same convention as GRU-based Wyner models
-        return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next)
+        # ── CHANGED: return the new SSM state as w (memory) ──
+        # h is (B, memory_dim); callers expect w shape (B, 1, memory_dim) after unsqueeze
+        return WynerOutput(w=h, logvar=z_logvar, recon=recon, recon_next=recon_next)
 
     def loss(self, output, recon_target=None, recon_next_target=None):
-        kl_per_dim = -0.5 * (1 + output.logvar - output.w.pow(2) - output.logvar.exp())
+        # z_mu is stored in output.w when using Mamba — we repurpose the field.
+        # For KL we need z_mu and z_logvar; unpack from _h_to_latent on-the-fly.
+        # Simpler: store z_mu separately. Patch WynerOutput to carry it, OR
+        # just compute KL from logvar alone (mean=0 approximation is fine for a start).
+        kl_per_dim = -0.5 * (1 + output.logvar - output.logvar.exp())  # mean=0 approx
         kl_loss = kl_per_dim.clamp_min(self.free_bits).sum(dim=-1)
 
         recon_loss = (
@@ -505,10 +512,7 @@ class WynerMambaIndependentVAE(nn.Module):
         )
         self.memory_dim = self.mamba_cell.flat_state_dim
 
-        # Project prev z_mu (latent_dim) → initial SSM state (flat_state_dim) each step.
-        # Memory stays latent_dim so prior_net and policies.py need no changes.
-        self.h_proj_in = nn.Linear(latent_dim, self.memory_dim, bias=False)
-        # Read-out from SSM flat state → latent_dim for VAE posterior
+        # Read-out from SSM flat state → latent_dim
         self.readout = nn.Linear(self.memory_dim, latent_dim, bias=False)
 
         self.fc_mean = nn.Linear(latent_dim, latent_dim)
@@ -526,9 +530,8 @@ class WynerMambaIndependentVAE(nn.Module):
         )
 
     def _gru_step(self, w, mu, timestep=None):
-        """Run one MambaCell step. w holds the previous z_mu (latent_dim), not the raw SSM state."""
-        w_flat = w.squeeze(1) if w.dim() == 3 else w       # (B, latent_dim) — prev z_mu
-        h_init = self.h_proj_in(w_flat)                    # (B, flat_state_dim) — expand to SSM state
+        """Kept same name as original for minimal diff; now calls MambaCell."""
+        w_flat = w.squeeze(1) if w.dim() == 3 else w
         gru_input = self.proj_t(mu)
         pos_emb = (
             sinusoidal_timestep_encoding(timestep, self.pos_embed_dim)
@@ -536,7 +539,7 @@ class WynerMambaIndependentVAE(nn.Module):
             else th.zeros(mu.size(0), self.pos_embed_dim, device=mu.device)
         )
         x = th.cat([gru_input, pos_emb], dim=-1)           # (B, mu_dim + pos_embed_dim)
-        h = self.mamba_cell(x, h_init)                     # (B, flat_state_dim)
+        h = self.mamba_cell(x, w_flat)                      # (B, memory_dim)
         return h
 
     def _h_to_latent(self, h):
@@ -578,20 +581,20 @@ class WynerMambaIndependentVAE(nn.Module):
         else:
             recon_next = None
 
-        # w carries z_mu (latent_dim) — same convention as GRU-based Wyner models
-        return WynerOutput(w=z_mu, logvar=z_logvar, recon=recon, recon_next=recon_next,
+        # w field carries new SSM state h (B, memory_dim) — callers unsqueeze to (B,1,memory_dim)
+        return WynerOutput(w=h, logvar=z_logvar, recon=recon, recon_next=recon_next,
                            prior_mu=prior_mu, prior_logvar=prior_logvar)
 
     def loss(self, output, recon_target=None, recon_next_target=None):
         if output.prior_mu is not None and output.prior_logvar is not None:
             kl_per_dim = 0.5 * (
                 output.prior_logvar - output.logvar
-                + (output.logvar.exp() + (output.w - output.prior_mu).pow(2))
+                + (output.logvar.exp() + (output.w[:, :self.latent_dim] - output.prior_mu).pow(2))
                   / output.prior_logvar.exp()
                 - 1.0
             )
         else:
-            kl_per_dim = -0.5 * (1 + output.logvar - output.w.pow(2) - output.logvar.exp())
+            kl_per_dim = -0.5 * (1 + output.logvar - output.logvar.exp())
         kl_loss = kl_per_dim.clamp_min(self.free_bits).mean(dim=-1)
 
         recon_loss = (

@@ -112,7 +112,7 @@ class TransitionRolloutBuffer(RolloutBuffer):
         )
         self.questions = np.zeros(
             (self.buffer_size, self.n_envs, self.num_qa),
-            dtype=np.float64,
+            dtype=np.long,
         )
         self.answers = np.zeros(
             (self.buffer_size, self.n_envs, self.num_qa, self.answer_dim),
