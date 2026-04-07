@@ -36,7 +36,7 @@ class WynerPriorNetwork(nn.Module):
         """w_prev: (B, 1, latent_dim) or (B, latent_dim). Returns (prior_mu, prior_logvar)."""
         x = w_prev.squeeze(1) if w_prev.dim() == 3 else w_prev
         h = self.net(x)
-        return self.fc_mean(h), self.fc_logvar(h).clamp(-8, 8)
+        return self.fc_mean(h), self.fc_logvar(h)
 
 
 @th.jit.script
@@ -163,7 +163,7 @@ class WynerVAE(nn.Module):
     def encode(self, w: th.Tensor, mu: th.Tensor, skips: Optional[List[th.Tensor]] = None, timestep: Optional[th.Tensor] = None) -> Tuple[th.Tensor, th.Tensor]:
         h = self.gru(mu, w.squeeze(1))
         z_mu = self.fc_mean(h)
-        z_logvar = self.fc_logvar(h).clamp(-8, 8)
+        z_logvar = self.fc_logvar(h)
         return z_mu, z_logvar
 
     def decode(self, z: th.Tensor, mu: th.Tensor, timestep: Optional[th.Tensor] = None) -> th.Tensor:
@@ -303,7 +303,7 @@ class WynerIndependentVAE(nn.Module):
     def encode(self, w: th.Tensor, mu: th.Tensor, skips: Optional[List[th.Tensor]] = None, timestep: Optional[th.Tensor] = None) -> Tuple[th.Tensor, th.Tensor]:
         h = self._gru_step(w, mu, timestep=timestep)
         z_mu = self.fc_mean(h)
-        z_logvar = self.fc_logvar(h).clamp(-8, 8)
+        z_logvar = self.fc_logvar(h)
         return z_mu, z_logvar
 
     def decode(self, z: th.Tensor, mu: th.Tensor, timestep: Optional[th.Tensor] = None) -> th.Tensor:
@@ -428,7 +428,7 @@ class WynerMambaVAE(nn.Module):
     def _h_to_latent(self, h: th.Tensor) -> tuple[th.Tensor, th.Tensor]:
         """SSM flat state (B, flat_state_dim) → (z_mu, z_logvar) via readout + fc_mean/fc_logvar."""
         h_read = self.readout(h)                    # (B, latent_dim)
-        return self.fc_mean(h_read), self.fc_logvar(h_read).clamp(-8, 8)
+        return self.fc_mean(h_read), self.fc_logvar(h_read)
 
     def encode(self, w, mu, skips=None, timestep=None):
         h = self._mamba_step(w, mu)
@@ -541,7 +541,7 @@ class WynerMambaIndependentVAE(nn.Module):
 
     def _h_to_latent(self, h):
         h_read = self.readout(h)                            # (B, latent_dim)
-        return self.fc_mean(h_read), self.fc_logvar(h_read).clamp(-8, 8)
+        return self.fc_mean(h_read), self.fc_logvar(h_read)
 
     def _timestep_encoding(self, timestep, batch_size, device):
         if timestep is not None:
