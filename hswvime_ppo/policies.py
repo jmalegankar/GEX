@@ -174,23 +174,18 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
         return actions, memory, values, log_prob
     
-    def extract_features(
-        self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        timestep: Optional[th.Tensor] = None,
-    ) -> Tuple[th.Tensor, th.Tensor]:
+    def extract_features(self, s_tm1, a_tm1, s_t, memory, timestep=None):
         with th.no_grad():
             s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
-            s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
+            s_t   = preprocess_obs(s_t,   self.observation_space, normalize_images=self.normalize_images)
             mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips, timestep=timestep)
-        # encode returns (B, latent_dim); restore the seq dim for storage and MHA
-        new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
-        features = self.features_extractor(new_memory, mu)
-        return features, new_memory
+
+        # encode now returns (z_mu, new_memory_state) — NOT (z_mu, z_logvar)
+        z_mu, new_memory = self.wyner_feature_extractor.encode(memory, mu, skips, timestep=timestep)
+
+        # z_mu → attention query; new_memory → stored in buffer (no fake seq dim anymore)
+        features = self.features_extractor(z_mu.unsqueeze(1), mu)   # (B,1,latent_dim) for MHA
+        return features, new_memory                                  # new_memory: (B, flat_state_dim)
     
     def get_distribution(
         self,

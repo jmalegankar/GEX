@@ -1,19 +1,20 @@
 """
-MambaCell: a single recurrent step of Mamba-2 (SSD) that mirrors the
-nn.GRUCell API — takes (input, hidden) and returns new_hidden.
+MambaCell: a single recurrent step of Mamba-2 (SSD) with a GRUCell-compatible
+interface — takes (input, hidden) and returns (output, new_hidden).
 
-During rollout collection: called step-by-step, exactly like GRUCell.
-During training: can optionally use the parallel scan over the full
-rollout sequence for better gradient flow (see MambaSequence below).
+Key change from previous version:
+    forward() now returns (y, h_new) instead of just h_new.
+    y: (B, hidden_dim)     — Mamba output, used to compute z_mu/z_logvar
+    h_new: (B, flat_state_dim) — full SSM state, stored as memory in the buffer
 
 Dependencies:
-    pip install mamba-ssm causal-conv1d
+    https://github.com/state-spaces/mamba
 """
 
 from __future__ import annotations
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, Tuple
 
 try:
     from mamba_ssm import Mamba2
@@ -24,118 +25,105 @@ except ImportError:
 
 class MambaCell(nn.Module):
     """
-    Single-step Mamba wrapper with a GRUCell-compatible interface.
+    Single-step Mamba-2 wrapper.
 
-        h_new = MambaCell(input_dim, hidden_dim)(x, h)
+        y, h_new = MambaCell(input_dim, hidden_dim)(x, h)
 
-    The Mamba2 hidden state consists of TWO parts that must both be
-    preserved across steps:
-      - conv_state: (B, conv_channels, d_conv)  — causal-conv buffer
-      - ssm_state:  (B, n_heads, d_head, d_state) — SSM recurrent state
+    The Mamba2 hidden state has two parts that must both be preserved:
+      conv_state: (B, conv_channels, d_conv)
+      ssm_state:  (B, n_heads, d_head, d_state)
 
-    We flatten both into a single (B, flat_state_dim) vector so the caller
-    just sees a GRUCell-like interface.
+    Both are flattened into a single (B, flat_state_dim) vector so the caller
+    sees a clean interface. flat_state_dim >> hidden_dim — keep d_state and
+    d_conv small (16, 2) to control memory usage.
 
     Args:
-        input_dim:   dimensionality of x  (= mu_dim + pos_embed_dim in Wyner)
-        hidden_dim:  d_model for the Mamba2 block
-        d_state:     SSM state size (default 64, Mamba-2 paper recommendation)
-        d_conv:      local conv width (default 4)
-        expand:      inner expansion factor (default 2)
-        n_heads:     number of SSD heads (default 1 keeps hidden_dim clean)
+        input_dim:  dimensionality of x
+        hidden_dim: d_model for the Mamba2 block; also the dim of y
+        d_state:    SSM state size (recommend 16 for RL, not 64)
+        d_conv:     local conv width (recommend 2 for RL, not 4)
+        expand:     inner expansion factor
+        n_heads:    number of SSD heads
     """
 
     def __init__(
         self,
-        input_dim: int,
+        input_dim:  int,
         hidden_dim: int,
-        d_state: int = 64,
-        d_conv: int = 4,
-        expand: int = 2,
-        n_heads: int = 1,
+        d_state:    int = 16,
+        d_conv:     int = 2,
+        expand:     int = 2,
+        n_heads:    int = 1,
     ):
         super().__init__()
         assert _MAMBA_AVAILABLE, (
             "mamba-ssm is not installed. Run: pip install mamba-ssm causal-conv1d"
         )
 
-        self.input_dim = input_dim
+        self.input_dim  = input_dim
         self.hidden_dim = hidden_dim
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.n_heads = n_heads
-        self.d_head = hidden_dim // n_heads
+        self.d_state    = d_state
+        self.d_conv     = d_conv
+        self.n_heads    = n_heads
+        self.d_head     = hidden_dim // n_heads
 
-        # Project input to hidden_dim so Mamba sees a uniform-width stream
         self.input_proj = nn.Linear(input_dim, hidden_dim, bias=False)
 
-        # Mamba2 block — operates on (B, L, d_model) sequences
-        # We always pass L=1 for single-step recurrent use
         self.mamba = Mamba2(
-            d_model=hidden_dim,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-            headdim=self.d_head,
+            d_model  = hidden_dim,
+            d_state  = d_state,
+            d_conv   = d_conv,
+            expand   = expand,
+            headdim  = self.d_head,
         )
 
-        # Derive conv_state shape from the instantiated module.
-        # conv1d output channels = d_ssm + 2*ngroups*d_state (set by Mamba2 internally).
-        # allocate_inference_cache returns conv_state of shape (B, conv_channels, d_conv).
+        # Derive state shapes from a live allocation — don't hardcode.
         _dummy_conv, _dummy_ssm = self.mamba.allocate_inference_cache(1, 1)
         self._conv_state_shape = _dummy_conv.shape[1:]   # (conv_channels, d_conv)
         self._ssm_state_shape  = _dummy_ssm.shape[1:]   # (n_heads, d_head, d_state)
-        self._flat_conv_dim = int(torch.tensor(self._conv_state_shape).prod().item())
-        self._flat_ssm_dim  = int(torch.tensor(self._ssm_state_shape).prod().item())
-        self._flat_state_dim = self._flat_conv_dim + self._flat_ssm_dim
+        self._flat_conv_dim    = int(torch.tensor(self._conv_state_shape).prod().item())
+        self._flat_ssm_dim     = int(torch.tensor(self._ssm_state_shape).prod().item())
+        self._flat_state_dim   = self._flat_conv_dim + self._flat_ssm_dim
 
-    # ------------------------------------------------------------------
-    # Helpers to pack/unpack the full hidden state into/from a flat vector
-    # ------------------------------------------------------------------
+    # ── State packing ─────────────────────────────────────────────────────────
 
     def pack_state(self, conv_state: torch.Tensor, ssm_state: torch.Tensor) -> torch.Tensor:
-        """
-        (B, conv_channels, d_conv) + (B, n_heads, d_head, d_state) → (B, flat_state_dim)
-        """
+        """(B, conv_channels, d_conv) + (B, n_heads, d_head, d_state) → (B, flat_state_dim)"""
         B = conv_state.size(0)
         return torch.cat([conv_state.reshape(B, -1), ssm_state.reshape(B, -1)], dim=-1)
 
-    def unpack_state(
-        self, h: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        (B, flat_state_dim) → (B, conv_channels, d_conv), (B, n_heads, d_head, d_state)
-        """
+    def unpack_state(self, h: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """(B, flat_state_dim) → (B, conv_channels, d_conv), (B, n_heads, d_head, d_state)"""
         B = h.size(0)
-        conv_flat = h[:, :self._flat_conv_dim]
-        ssm_flat  = h[:, self._flat_conv_dim:]
-        conv_state = conv_flat.reshape(B, *self._conv_state_shape)
-        ssm_state  = ssm_flat.reshape(B, *self._ssm_state_shape)
-        return conv_state, ssm_state
+        return (
+            h[:, :self._flat_conv_dim].reshape(B, *self._conv_state_shape),
+            h[:, self._flat_conv_dim:].reshape(B, *self._ssm_state_shape),
+        )
 
-    # ------------------------------------------------------------------
-    # GRUCell-compatible forward
-    # ------------------------------------------------------------------
+    # ── Forward ───────────────────────────────────────────────────────────────
 
-    def forward(self, x: torch.Tensor, h: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, h: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
             x: (B, input_dim)
-            h: (B, flat_state_dim)  — packed (conv_state ++ ssm_state)
+            h: (B, flat_state_dim)  — packed SSM state from previous step
+
         Returns:
-            h_new: (B, flat_state_dim)
+            y:     (B, hidden_dim)      — Mamba output; use this to compute z
+            h_new: (B, flat_state_dim)  — new SSM state; store this in the buffer
         """
-        x_proj = self.input_proj(x)                        # (B, hidden_dim)
-        x_seq  = x_proj.unsqueeze(1)                       # (B, 1, hidden_dim)
+        x_proj = self.input_proj(x).unsqueeze(1)          # (B, 1, hidden_dim)
 
         conv_state, ssm_state = self.unpack_state(h)
         conv_state = conv_state.to(dtype=x.dtype).contiguous()
         ssm_state  = ssm_state.to(dtype=x.dtype).contiguous()
 
-        # Mamba2.step: (B,1,d_model), conv_state, ssm_state → (y, new_conv, new_ssm)
-        _, new_conv_state, new_ssm_state = self.mamba.step(x_seq, conv_state, ssm_state)
+        y, new_conv, new_ssm = self.mamba.step(x_proj, conv_state, ssm_state)
+        y = y.squeeze(1)                                   # (B, hidden_dim)
 
-        return self.pack_state(new_conv_state, new_ssm_state)  # (B, flat_state_dim)
+        return y, self.pack_state(new_conv, new_ssm)
 
     @property
     def flat_state_dim(self) -> int:
@@ -144,17 +132,16 @@ class MambaCell(nn.Module):
 
 class MambaSequence(nn.Module):
     """
-    Parallel (training-time) Mamba scan over a full sequence.
+    Parallel Mamba scan over a full sequence (training-time use only).
 
-    Use this in train() to get proper gradient flow over the entire rollout
-    instead of stepping cell-by-cell.
+    Use this if you reconstruct episode sequences from the buffer for
+    better gradient flow. Not currently wired into the training loop.
 
-        y = MambaSequence(cell)(x_seq)   # x_seq: (B, T, input_dim)
+        y_seq = MambaSequence(cell)(x_seq)   # x_seq: (B, T, input_dim)
 
-    The hidden state is NOT threaded through here — Mamba initialises
-    from zeros internally, which is fine since the rollout buffer stores
-    flattened (B*T, ...) samples, not full sequences. Gradient flow
-    through the parallel scan still beats BPTT-truncated GRU.
+    Note: hidden state is not threaded through here — Mamba initialises
+    from zeros. This is fine when sequences are reconstructed independently
+    per rollout rather than being truly contiguous.
     """
 
     def __init__(self, cell: MambaCell):
@@ -166,8 +153,7 @@ class MambaSequence(nn.Module):
         Args:
             x_seq: (B, T, input_dim)
         Returns:
-            y_seq: (B, T, hidden_dim)  — Mamba output at each step
+            y_seq: (B, T, hidden_dim)
         """
-        x_proj = self.cell.input_proj(x_seq)           # (B, T, hidden_dim)
-        y_seq = self.cell.mamba(x_proj)                # (B, T, hidden_dim) — parallel scan
-        return y_seq
+        x_proj = self.cell.input_proj(x_seq)   # (B, T, hidden_dim)
+        return self.cell.mamba(x_proj)          # (B, T, hidden_dim) — parallel scan

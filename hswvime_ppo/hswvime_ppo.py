@@ -164,7 +164,8 @@ class HSWVimePPO(PPO):
     
     def _setup_learn(self, total_timesteps, callback = None, reset_num_timesteps = True, tb_log_name = "run", progress_bar = False):
         ret = super()._setup_learn(total_timesteps, callback, reset_num_timesteps, tb_log_name, progress_bar)
-        self._last_memory = th.zeros((self.n_envs, *self.memory_shape), device=self.device)
+        flat_state_dim = self.policy.wyner_feature_extractor.flat_state_dim
+        self._last_memory = th.zeros((self.n_envs, flat_state_dim), device=self.device)
         self._prev_last_obs = deepcopy(self._last_obs)
         self._prev_action = np.tile(self.null_action, (self.n_envs, 1))
         self._qa_sampler.reset()
@@ -541,7 +542,7 @@ class HSWVimePPO(PPO):
                 for idx in range(self.rollout_buffer.num_qa):
                     questions = rollout_data.questions[:, idx, ...]
                     recon_next_answers = self.policy.wyner_feature_extractor.decode(
-                        wyner_out.w,
+                        wyner_out.z_mu,
                         None,
                         timestep=questions,
                     )
