@@ -1,281 +1,221 @@
-import warnings
+"""
+LMU Actor-Critic Policy for MiniGrid.
 
-import numpy as np
+Deliberately not subclassing SB3's ActorCriticPolicy — that class assumes
+a specific (obs → features → actor/critic) pipeline that doesn't compose
+cleanly with recurrent state. We expose the interface LMUPPO needs:
+  - forward()         used during rollout collection
+  - evaluate_actions()used during PPO update
+  - predict_values()  used for GAE bootstrap
+"""
+
 import torch as th
 import torch.nn as nn
+from torch.distributions import Categorical
 from gymnasium import spaces
-from stable_baselines3.common.preprocessing import preprocess_obs
-from stable_baselines3.common.distributions import Distribution
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.type_aliases import Schedule
+from typing import Tuple
+
+from lmu import LMUCell  # your lmu.py
 
 
-from typing import Any, Optional, Union, Tuple
+# ---------------------------------------------------------------------------
+# Observation encoder
+# ---------------------------------------------------------------------------
 
-import typing
-
-
-from models.vae import VAEInterface, TransitionSCVAE
-from models.wyner import WynerInterface, WynerVAE
-
-class HSWVIMEFeaturesExtractor(nn.Module):
+class MinigridEncoder(nn.Module):
     """
-    HSWVIME features extractor.
+    Encoder for MiniGrid's Dict observation space:
+        'image'    : Box(0, 255, (H, W, 3), uint8)
+                     Despite the Box declaration, values are categorical integers:
+                       channel 0 — OBJECT_IDX (0–10, 11 types)
+                       channel 1 — COLOR_IDX  (0–5,  6 colors)
+                       channel 2 — STATE      (0–2,  door: open/closed/locked)
+        'direction': Discrete(4)  — agent facing (0=right,1=down,2=left,3=up)
+        'mission'  : ignored
 
-    :param observation_space: The observation space
-    :param features_dim: The number of features extracted.
-        This corresponds to the number of units for the last layer.
+    Pipeline:
+        image  → embed each channel → (B, H, W, emb_dim)
+                 → CNN → (B, cnn_out)
+        direction → embedding → (B, dir_emb_dim)
+        concat + linear → (B, out_dim)
     """
 
-    def __init__(self, observation_space=None, *, wyner_dim: int, mu_dim: int):
+    N_OBJECTS    = 11
+    N_COLORS     = 6
+    N_STATES     = 3
+    N_DIRECTIONS = 4
+
+    def __init__(
+        self,
+        obs_space:   spaces.Dict,
+        out_dim:     int = 64,
+        obj_emb_dim: int = 8,
+        col_emb_dim: int = 4,
+        sta_emb_dim: int = 2,
+        dir_emb_dim: int = 4,
+    ):
         super().__init__()
-        self._features_dim = 2 * mu_dim  # attn_output(mu_dim) concat mu(mu_dim)
-        self.wyner_dim = wyner_dim
-        self.mu_dim = mu_dim
-        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True, kdim=wyner_dim, vdim=wyner_dim)
-    
-    @property
-    def features_dim(self) -> int:
-        return self._features_dim
-        
-    @th.jit.export
-    def forward(self, wyner_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
-        mu_features = mu_features.view(-1, 1, self.mu_dim) # Make it (batch_size, 1, mu_dim)
-        attn_output, _ = self.attn(mu_features, wyner_features, wyner_features, need_weights = False) # Query is mu, key and value are wyner
-        x = th.cat((mu_features, attn_output), dim=-1).squeeze(1) # Concatenate along the feature dimension
-        return x
+        # After SB3's VecTransposeImage the image shape is (C, H, W) = (3, 7, 7)
+        # C=3 are the three categorical channels, not RGB
+        C, H, W = obs_space["image"].shape
 
-class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
+        # Image channel embeddings
+        self.obj_emb = nn.Embedding(self.N_OBJECTS,    obj_emb_dim)
+        self.col_emb = nn.Embedding(self.N_COLORS,     col_emb_dim)
+        self.sta_emb = nn.Embedding(self.N_STATES,     sta_emb_dim)
+        self.dir_emb = nn.Embedding(self.N_DIRECTIONS, dir_emb_dim)
+
+        tile_dim = obj_emb_dim + col_emb_dim + sta_emb_dim
+
+        # Spatial CNN: 3 × (2×2 conv) → H,W: 7→6→5→4 for default 7×7
+        self.cnn = nn.Sequential(
+            nn.Conv2d(tile_dim, 32, kernel_size=2), nn.ReLU(),
+            nn.Conv2d(32,       64, kernel_size=2), nn.ReLU(),
+            nn.Conv2d(64,       64, kernel_size=2), nn.ReLU(),
+            nn.Flatten(),
+        )
+        cnn_out_dim = 64 * (H - 3) * (W - 3)
+
+        self.proj = nn.Sequential(
+            nn.Linear(cnn_out_dim + dir_emb_dim, out_dim),
+            nn.ReLU(),
+        )
+
+        for m in self.modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain("relu"))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, obs: dict) -> th.Tensor:
+        # After VecTransposeImage: image is (B, C, H, W) = (B, 3, H, W)
+        # Channel 0: OBJECT_IDX, channel 1: COLOR_IDX, channel 2: STATE
+        img = obs["image"].long()            # (B, 3, H, W)
+        direction = obs["direction"].long().view(-1)  # (B,)
+
+        obj = self.obj_emb(img[:, 0])       # (B, H, W, obj_emb_dim)
+        col = self.col_emb(img[:, 1])       # (B, H, W, col_emb_dim)
+        sta = self.sta_emb(img[:, 2])       # (B, H, W, sta_emb_dim)
+
+        x = th.cat([obj, col, sta], dim=-1)         # (B, H, W, tile_dim)
+        x = x.permute(0, 3, 1, 2).contiguous()     # (B, tile_dim, H, W)
+        x = self.cnn(x)                             # (B, cnn_out_dim)
+
+        d = self.dir_emb(direction)                 # (B, dir_emb_dim)
+        return self.proj(th.cat([x, d], dim=-1))    # (B, out_dim)
+
+
+# ---------------------------------------------------------------------------
+# LMU Actor-Critic Policy
+# ---------------------------------------------------------------------------
+
+class LMUActorCriticPolicy(nn.Module):
     """
-    Policy class for actor-critic algorithms (has both policy and value prediction).
-    Used by A2C, PPO and the likes.
+    Encoder → LMUCell → actor head + critic head.
 
-    :param observation_space: Observation space
-    :param action_space: Action space
-    :param lr_schedule: Learning rate schedule (could be constant)
-    :param net_arch: The specification of the policy and value networks.
-    :param activation_fn: Activation function
-    :param ortho_init: Whether to use or not orthogonal initialization
-    :param use_sde: Whether to use State Dependent Exploration or not
-    :param log_std_init: Initial value for the log standard deviation
-    :param full_std: Whether to use (n_features x n_actions) parameters
-        for the std instead of only (n_features,) when using gSDE
-    :param use_expln: Use ``expln()`` function instead of ``exp()`` to ensure
-        a positive standard deviation (cf paper). It allows to keep variance
-        above zero and prevent it from growing too fast. In practice, ``exp()`` is usually enough.
-    :param squash_output: Whether to squash the output using a tanh function,
-        this allows to ensure boundaries when using gSDE.
-    :param features_extractor_class: Features extractor to use.
-    :param features_extractor_kwargs: Keyword arguments
-        to pass to the features extractor.
-    :param share_features_extractor: If True, the features extractor is shared between the policy and value networks.
-    :param normalize_images: Whether to normalize images or not,
-         dividing by 255.0 (True by default)
-    :param optimizer_class: The optimizer to use,
-        ``th.optim.Adam`` by default
-    :param optimizer_kwargs: Additional keyword arguments,
-        excluding the learning rate, to pass to the optimizer
+    State convention: (h, m) are the LMU states BEFORE processing the
+    current observation, so that forward() can re-run the LMU step with
+    gradient during the PPO update (matching what's stored in the buffer).
     """
 
     def __init__(
         self,
         observation_space: spaces.Space,
-        action_space: spaces.Space,
-        lr_schedule: Schedule,
-        net_arch: Optional[Union[list[int], dict[str, list[int]]]] = None,
-        activation_fn: type[nn.Module] = nn.Tanh,
-        ortho_init: bool = True,
-        use_sde: bool = False,
-        log_std_init: float = 0.0,
-        full_std: bool = True,
-        use_expln: bool = False,
-        squash_output: bool = False,
-        features_extractor_class: type[HSWVIMEFeaturesExtractor] = HSWVIMEFeaturesExtractor,
-        features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        vae_features_extractor_class: VAEInterface = TransitionSCVAE,
-        vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        wyner_features_extractor_class: WynerInterface = WynerVAE,
-        wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        share_features_extractor: bool = True,
-        normalize_images: bool = True,
-        optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
-        optimizer_kwargs: Optional[dict[str, Any]] = None,
+        action_space:      spaces.Space,
+        lr:                float = 3e-4,
+        encoder_dim:       int = 64,
+        hidden_size:       int = 64,   # LMU n  — nonlinear hidden units
+        memory_size:       int = 32,   # LMU d  — Legendre coefficients
+        theta:             float = 50.0,  # set to expected episode memory horizon
     ):
-        assert share_features_extractor, "HSWVIME does not support separate feature extractors for policy and value networks"
-        # Store as plain attrs before super().__init__() — nn.Module is not yet
-        # initialised so we cannot assign nn.Module instances yet.
-        self.vae_features_extractor_class = vae_features_extractor_class
-        self.vae_features_extractor_kwargs = vae_features_extractor_kwargs or {}
-        self.wyner_features_extractor_class = wyner_features_extractor_class
-        self.wyner_features_extractor_kwargs = wyner_features_extractor_kwargs or {}
+        super().__init__()
+        assert isinstance(action_space, spaces.Discrete), \
+            "LMUActorCriticPolicy currently supports Discrete action spaces only."
 
-        super().__init__(
-            observation_space,
-            action_space,
-            lr_schedule,
-            net_arch,
-            activation_fn,
-            ortho_init,
-            use_sde,
-            log_std_init,
-            full_std,
-            use_expln,
-            squash_output,
-            features_extractor_class,
-            features_extractor_kwargs,
-            share_features_extractor,
-            normalize_images,
-            optimizer_class,
-            optimizer_kwargs,
-        )
-    
-    def make_features_extractor(self):
-        self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(
-            **self.vae_features_extractor_kwargs
-        )
-        self.wyner_feature_extractor: WynerInterface = self.wyner_features_extractor_class(
-            **self.wyner_features_extractor_kwargs
-        )
-        return super().make_features_extractor()
+        self.hidden_size = hidden_size
+        self.memory_size = memory_size
+        n_actions = action_space.n
+
+        self.encoder  = MinigridEncoder(observation_space, encoder_dim)
+        self.lmu_cell = LMUCell(encoder_dim, hidden_size, memory_size, theta)
+
+        # Actor and critic heads (orthogonal init, small gain for actor)
+        self.actor  = nn.Linear(hidden_size, n_actions)
+        self.critic = nn.Linear(hidden_size, 1)
+        nn.init.orthogonal_(self.actor.weight,  gain=0.01)
+        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        nn.init.zeros_(self.actor.bias)
+        nn.init.zeros_(self.critic.bias)
+
+        self.optimizer = th.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
+
+    # ------------------------------------------------------------------
+    # Core forward (used during rollout collection — no gradient needed)
+    # ------------------------------------------------------------------
 
     def forward(
         self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        deterministic: bool = False,
-        timestep: Optional[th.Tensor] = None,
-    ) -> tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
+        obs:    th.Tensor,   # (B, H, W, C)
+        h_prev: th.Tensor,   # (B, hidden_size)
+        m_prev: th.Tensor,   # (B, memory_size)
+    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
         """
-        Forward pass in all the networks (actor and critic)
-
-        :param s_tm1: Previous state
-        :param a_tm1: Previous action
-        :param s_t: Current state
-        :param deterministic: Whether to sample or use deterministic actions
-        :param timestep: Episode timestep indices (B,)
-        :return: action, value and log probability of the action
+        Returns: action, value, log_prob, h_new, m_new
         """
-        # Preprocess the observation if needed
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
-        if self.share_features_extractor:
-            latent_pi = self.mlp_extractor.forward_actor(features.detach())  # don't backprop through features for policy
-            latent_vf = self.mlp_extractor.forward_critic(features)
-        else:
-            pi_features, vf_features = features
-            latent_pi = self.mlp_extractor.forward_actor(pi_features)
-            latent_vf = self.mlp_extractor.forward_critic(vf_features)
-        # Evaluate the values for the given observations
-        values = self.value_net(latent_vf)
-        distribution = self._get_action_dist_from_latent(latent_pi)
-        actions = distribution.get_actions(deterministic=deterministic)
-        log_prob = distribution.log_prob(actions)
-        actions = actions.reshape((-1, *self.action_space.shape))  # type: ignore[misc]
-        return actions, memory, values, log_prob
-    
-    def extract_features(
-        self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        timestep: Optional[th.Tensor] = None,
-    ) -> Tuple[th.Tensor, th.Tensor]:
-        with th.no_grad():
-            s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
-            s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
-            mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips, timestep=timestep)
-        # encode returns (B, latent_dim); restore the seq dim for storage and MHA
-        new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
-        features = self.features_extractor(new_memory, mu)
-        return features, new_memory
-    
-    def get_distribution(
-        self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        timestep: Optional[th.Tensor] = None,
-    ) -> Tuple[Distribution, th.Tensor]:
-        features, memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
-        latent_pi = self.mlp_extractor.forward_actor(features)
-        return self._get_action_dist_from_latent(latent_pi), memory
+        x = self.encoder(obs)
+        h, m = self.lmu_cell(x, h_prev, m_prev)
 
-    def predict_values(
-        self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        timestep: Optional[th.Tensor] = None,
-    ) -> th.Tensor:
-        features, _ = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
-        latent_vf = self.mlp_extractor.forward_critic(features)
-        return self.value_net(latent_vf)
+        logits = self.actor(h)
+        dist   = Categorical(logits=logits)
+        action = dist.sample()
+
+        return action, self.critic(h).squeeze(-1), dist.log_prob(action), h, m
+
+    # ------------------------------------------------------------------
+    # Evaluate stored actions (used during PPO update — needs gradient)
+    # ------------------------------------------------------------------
 
     def evaluate_actions(
         self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        action: th.Tensor,
-        timestep: Optional[th.Tensor] = None,
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        features, new_memory = self.extract_features(s_tm1, a_tm1, s_t, memory, timestep=timestep)
-        latent_vf = self.mlp_extractor.forward_critic(features)
-        values = self.value_net(latent_vf)
-        latent_pi = self.mlp_extractor.forward_actor(features.detach())  # don't backprop through features for policy
-        distribution = self._get_action_dist_from_latent(latent_pi)
-        log_prob = distribution.log_prob(action)
-        return values, log_prob, distribution.entropy(), new_memory
-    
-    def predict(
-        self,
-        s_tm1: th.Tensor,
-        a_tm1: th.Tensor,
-        s_t: th.Tensor,
-        memory: th.Tensor,
-        deterministic: bool = False
+        obs:     th.Tensor,   # (B, H, W, C)
+        lmu_h:   th.Tensor,   # (B, hidden_size)  stored h_{t-1}
+        lmu_m:   th.Tensor,   # (B, memory_size)  stored m_{t-1}
+        actions: th.Tensor,   # (B,) long
     ) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
-        self.set_training_mode(False)
+        """
+        Returns: value (B,), log_prob (B,), entropy (B,)
+        """
+        x = self.encoder(obs)
+        h, _ = self.lmu_cell(x, lmu_h, lmu_m)
 
-        # Check for common mistake that the user does not mix Gym/VecEnv API
-        # Tuple obs are not supported by SB3, so we can safely do that check
-        if isinstance(s_tm1, tuple) and len(s_tm1) == 2 and isinstance(s_tm1[1], dict):
-            raise ValueError(
-                "You have passed a tuple to the predict() function instead of a Numpy array or a Dict. "
-                "You are probably mixing Gym API with SB3 VecEnv API: `obs, info = env.reset()` (Gym) "
-                "vs `obs = vec_env.reset()` (SB3 VecEnv). "
-                "See related issue https://github.com/DLR-RM/stable-baselines3/issues/1694 "
-                "and documentation for more information: https://stable-baselines3.readthedocs.io/en/master/guide/vec_envs.html#vecenv-api-vs-gym-api"
-            )
+        logits   = self.actor(h)
+        dist     = Categorical(logits=logits)
+        log_prob = dist.log_prob(actions)
+        entropy  = dist.entropy()
+        value    = self.critic(h).squeeze(-1)
 
-        s_tm1, vectorized_env = self.obs_to_tensor(s_tm1)
-        s_t, _ = self.obs_to_tensor(s_t)
-        a_tm1 = th.as_tensor(a_tm1, device=s_tm1.device)
+        return value, log_prob, entropy
 
-        with th.no_grad():
-            distribution, memory = self.get_distribution(s_tm1, a_tm1, s_t, memory)
-            actions = distribution.get_actions(deterministic=deterministic)
-        
-        actions = actions.cpu().numpy().reshape((-1, *self.action_space.shape))  # type: ignore[misc, assignment]
+    # ------------------------------------------------------------------
+    # Value-only (used for GAE bootstrap at end of rollout)
+    # ------------------------------------------------------------------
 
-        if isinstance(self.action_space, spaces.Box):
-            if self.squash_output:
-                # Rescale to proper domain when using squashing
-                actions = self.unscale_action(actions)  # type: ignore[assignment, arg-type]
-            else:
-                # Actions could be on arbitrary scale, so clip the actions to avoid
-                # out of bound error (e.g. if sampling from a Gaussian distribution)
-                actions = np.clip(actions, self.action_space.low, self.action_space.high)  # type: ignore[assignment, arg-type]
+    def predict_values(
+        self,
+        obs:    th.Tensor,
+        lmu_h:  th.Tensor,
+        lmu_m:  th.Tensor,
+    ) -> th.Tensor:
+        x = self.encoder(obs)
+        h, _ = self.lmu_cell(x, lmu_h, lmu_m)
+        return self.critic(h).squeeze(-1)
 
-        # Remove batch dimension if needed
-        if not vectorized_env:
-            assert isinstance(actions, np.ndarray)
-            actions = actions.squeeze(axis=0)  # type: ignore[assignment]
+    def initial_state(
+        self, n_envs: int, device: th.device
+    ) -> Tuple[th.Tensor, th.Tensor]:
+        h = th.zeros(n_envs, self.hidden_size, device=device)
+        m = th.zeros(n_envs, self.memory_size,  device=device)
+        return h, m
 
-        return actions, memory  # type: ignore[return-value]
+    def set_training_mode(self, mode: bool) -> None:
+        self.train(mode)
