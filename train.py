@@ -9,7 +9,7 @@ from models.embeddings import CategoricalGridWithDirEmbedding
 from models.config import SCVAEConfig
 from models.episodic_memory import BatchedNoveltyMemory
 from models.vae import TransitionSCVAE
-from models.wyner import WynerVAE, WynerIndependentVAE
+from models.wyner import WynerMambaIndependentVAE, WynerVAE, WynerIndependentVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
@@ -149,7 +149,7 @@ def parse_args():
                    help="Dimension of sinusoidal positional embedding for timestep in Wyner.")
 
     # Logging
-    p.add_argument("--tensorboard_log", type=str, default="runs/histogram")
+    p.add_argument("--tensorboard_log", type=str, default="runs/mamba")
     p.add_argument("--verbose",         type=int, default=1)
 
     # Rendering
@@ -254,7 +254,7 @@ def main():
                 latent_dim=args.vae_latent_dim,
             ),
         },
-        wyner_features_extractor_class=WynerIndependentVAE,
+        wyner_features_extractor_class=WynerMambaIndependentVAE,
         wyner_features_extractor_kwargs={
             "recon_dim":      recon_dim,
             "mu_dim":         args.vae_latent_dim,
