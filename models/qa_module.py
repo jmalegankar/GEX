@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.special import erf
-from hswvime_ppo.buffer import TransitionRolloutBuffer
+from lmu_ppo.buffer import TransitionRolloutBuffer
 
 from typing import Optional
 

@@ -10,8 +10,8 @@ from models.config import SCVAEConfig
 from models.episodic_memory import BatchedNoveltyMemory
 from models.vae import TransitionSCVAE
 from models.wyner import WynerMambaIndependentVAE, WynerVAE, WynerIndependentVAE
-from hswvime_ppo.hswvime_ppo import HSWVimePPO
-from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
+from lmu_ppo.hswvime_ppo import HSWVimePPO
+from lmu_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
 import minigrid
 
