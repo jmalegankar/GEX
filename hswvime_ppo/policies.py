@@ -16,7 +16,7 @@ import typing
 
 
 from models.vae import VAEInterface, TransitionSCVAE
-from models.wyner import WynerInterface, WynerVAE
+from models.lmu import LMUCell
 
 class HSWVIMEFeaturesExtractor(nn.Module):
     """
@@ -27,21 +27,21 @@ class HSWVIMEFeaturesExtractor(nn.Module):
         This corresponds to the number of units for the last layer.
     """
 
-    def __init__(self, observation_space=None, *, wyner_dim: int, mu_dim: int):
+    def __init__(self, observation_space=None, *, hidden_dim: int, mu_dim: int):
         super().__init__()
         self._features_dim = 2 * mu_dim  # attn_output(mu_dim) concat mu(mu_dim)
-        self.wyner_dim = wyner_dim
+        self.hidden_dim = hidden_dim
         self.mu_dim = mu_dim
-        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True, kdim=wyner_dim, vdim=wyner_dim)
+        self.attn = nn.MultiheadAttention(mu_dim, num_heads=1, batch_first=True, kdim=hidden_dim, vdim=hidden_dim)
     
     @property
     def features_dim(self) -> int:
         return self._features_dim
         
     @th.jit.export
-    def forward(self, wyner_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
+    def forward(self, h_features: th.Tensor, mu_features: th.Tensor) -> th.Tensor:
         mu_features = mu_features.view(-1, 1, self.mu_dim) # Make it (batch_size, 1, mu_dim)
-        attn_output, _ = self.attn(mu_features, wyner_features, wyner_features, need_weights = False) # Query is mu, key and value are wyner
+        attn_output, _ = self.attn(mu_features, h_features, h_features, need_weights = False) # Query is mu, key and value are h
         x = th.cat((mu_features, attn_output), dim=-1).squeeze(1) # Concatenate along the feature dimension
         return x
 
@@ -94,8 +94,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         features_extractor_kwargs: Optional[dict[str, Any]] = None,
         vae_features_extractor_class: VAEInterface = TransitionSCVAE,
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
-        wyner_features_extractor_class: WynerInterface = WynerVAE,
-        wyner_features_extractor_kwargs: Optional[dict[str, Any]] = None,
+        lmu_kwargs: Optional[dict[str, Any]] = None,
         share_features_extractor: bool = True,
         normalize_images: bool = True,
         optimizer_class: type[th.optim.Optimizer] = th.optim.Adam,
@@ -106,8 +105,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         # initialised so we cannot assign nn.Module instances yet.
         self.vae_features_extractor_class = vae_features_extractor_class
         self.vae_features_extractor_kwargs = vae_features_extractor_kwargs or {}
-        self.wyner_features_extractor_class = wyner_features_extractor_class
-        self.wyner_features_extractor_kwargs = wyner_features_extractor_kwargs or {}
+        self.lmu_kwargs = lmu_kwargs or {}
 
         super().__init__(
             observation_space,
@@ -133,8 +131,11 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         self.vae_feature_extractor: VAEInterface = self.vae_features_extractor_class(
             **self.vae_features_extractor_kwargs
         )
-        self.wyner_feature_extractor: WynerInterface = self.wyner_features_extractor_class(
-            **self.wyner_features_extractor_kwargs
+        self.lmu_cell = LMUCell(
+            input_dim=self.lmu_kwargs["mu_dim"],
+            hidden_dim=self.lmu_kwargs["hidden_dim"],
+            order=self.lmu_kwargs["order"],
+            theta=self.lmu_kwargs["theta"],
         )
         return super().make_features_extractor()
 
@@ -185,11 +186,12 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         with th.no_grad():
             s_tm1 = preprocess_obs(s_tm1, self.observation_space, normalize_images=self.normalize_images)
             s_t = preprocess_obs(s_t, self.observation_space, normalize_images=self.normalize_images)
-            mu, _, skips = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
-        new_memory, _ = self.wyner_feature_extractor.encode(memory, mu, skips, timestep=timestep)
-        # encode returns (B, latent_dim); restore the seq dim for storage and MHA
-        new_memory = new_memory.unsqueeze(1)  # (B, 1, latent_dim)
-        features = self.features_extractor(new_memory, mu)
+            mu, _, _ = self.vae_feature_extractor.encode(s_tm1, a_tm1, s_t)
+        flat = memory.squeeze(1)                          # (B, flat_state_dim)
+        new_flat = self.lmu_cell(mu, flat)               # (B, flat_state_dim)
+        h_t = self.lmu_cell.unpack_h(new_flat)           # (B, hidden_dim)
+        new_memory = new_flat.unsqueeze(1)               # (B, 1, flat_state_dim)
+        features = self.features_extractor(h_t.unsqueeze(1), mu)
         return features, new_memory
     
     def get_distribution(

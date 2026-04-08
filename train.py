@@ -7,9 +7,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from envs.wrappers import DoorButtonTrainingWrapper, MiniGridTrainingWrapper
 from models.embeddings import CategoricalGridWithDirEmbedding
 from models.config import SCVAEConfig
-from models.episodic_memory import BatchedNoveltyMemory
 from models.vae import TransitionSCVAE
-from models.wyner import WynerVAE, WynerIndependentVAE
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
@@ -85,15 +83,6 @@ def build_vae(embedding, act_dim: int, latent_dim: int, conv_channels, hidden_di
     return TransitionSCVAE(embedding, cfg)
 
 
-def build_wyner(recon_dim: int, mu_dim: int, latent_dim: int, decode_hidden: int):
-    return WynerVAE(
-        recon_dim=recon_dim,
-        mu_dim=mu_dim,
-        latent_dim=latent_dim,
-        latent_tokens=1,
-        decode_hidden=decode_hidden,
-    )
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="Train HSWVimePPO on a grid environment.")
@@ -127,15 +116,11 @@ def parse_args():
     # Loss coefficients 
     p.add_argument("--vae_recon_coef",  type=float, default=1.0)
     p.add_argument("--vae_kl_coef",     type=float, default=0.01)
-    p.add_argument("--wyner_recon_coef",type=float, default=1.0)
-    p.add_argument("--wyner_kl_coef",   type=float, default=0.01)
     p.add_argument("--intrinsic_scale", type=float, default=0.0)
     p.add_argument("--kl_use_schedule", action="store_true",
                    help="Enable KL coefficient annealing from 0 to target over kl_anneal_steps.")
     p.add_argument("--kl_anneal_steps", type=int, default=50_000,
                    help="Number of timesteps to anneal KL coefficient from 0 to target.")
-    p.add_argument("--free_bits",       type=float, default=0.0,
-                   help="Free bits threshold for Wyner KL (0 to disable).")
 
     # Model architecture
     p.add_argument("--embed_per_channel", type=int, default=4)
@@ -143,10 +128,11 @@ def parse_args():
     p.add_argument("--vae_latent_dim",    type=int, default=32)
     p.add_argument("--vae_hidden_dim",    type=int, default=256)
     p.add_argument("--vae_action_embed",  type=int, default=32)
-    p.add_argument("--wyner_latent_dim",  type=int, default=64)
-    p.add_argument("--wyner_decode_hidden", type=int, default=128)
-    p.add_argument("--pos_embed_dim",      type=int, default=16,
-                   help="Dimension of sinusoidal positional embedding for timestep in Wyner.")
+    p.add_argument("--wyner_latent_dim",  type=int, default=64,
+                   help="LMU hidden_dim (h_t dimension).")
+    p.add_argument("--lmu_order",         type=int, default=4)
+    p.add_argument("--lmu_theta",         type=float, default=500.0,
+                   help="LMU theta; set to episode horizon (max_steps).")
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default="runs/histogram")
@@ -197,26 +183,24 @@ def main():
         action_embed_dim=args.vae_action_embed,
     )
 
-    # recon_dim = 2 * conv_out + action_embed
-    recon_dim = 2 * conv_channels[-1] + args.vae_action_embed
-
-    wyner = build_wyner(
-        recon_dim=recon_dim,
-        mu_dim=args.vae_latent_dim,
-        latent_dim=args.wyner_latent_dim,
-        decode_hidden=args.wyner_decode_hidden,
-    )
-
-    memory_shape = (1, args.wyner_latent_dim)
+    # LMU flat state = hidden_dim + order  (h concat m, scalar-u formulation)
+    flat_state_dim = args.wyner_latent_dim + args.lmu_order
+    memory_shape = (1, flat_state_dim)
 
     # 3. Policy kwargs
     policy_kwargs = {
         "features_extractor_class":  HSWVIMEFeaturesExtractor,
         "features_extractor_kwargs": {
-            "wyner_dim": args.wyner_latent_dim,
-            "mu_dim":    args.vae_latent_dim,
+            "hidden_dim": args.wyner_latent_dim,
+            "mu_dim":     args.vae_latent_dim,
         },
         "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
+        "lmu_kwargs": {
+            "mu_dim":     args.vae_latent_dim,
+            "hidden_dim": args.wyner_latent_dim,
+            "order":      args.lmu_order,
+            "theta":      args.lmu_theta,
+        },
     }
 
     # null_action is passed to the GRU on the very first step (before any real action)
@@ -236,9 +220,6 @@ def main():
         ent_coef=args.ent_coef,
         vae_recon_coef=args.vae_recon_coef,
         vae_kl_coef=args.vae_kl_coef,
-        wyner_recon_coef=args.wyner_recon_coef,
-        wyner_kl_coef=args.wyner_kl_coef,
-        intrinsic_scale=args.intrinsic_scale,
         kl_use_schedule=args.kl_use_schedule,
         kl_anneal_steps=args.kl_anneal_steps,
         memory_shape=memory_shape,
@@ -254,21 +235,6 @@ def main():
                 latent_dim=args.vae_latent_dim,
             ),
         },
-        wyner_features_extractor_class=WynerIndependentVAE,
-        wyner_features_extractor_kwargs={
-            "recon_dim":      recon_dim,
-            "mu_dim":         args.vae_latent_dim,
-            "latent_dim":     args.wyner_latent_dim,
-            "latent_tokens":  1,
-            "decode_hidden":  args.wyner_decode_hidden,
-            "pos_embed_dim":  args.pos_embed_dim,
-            "free_bits":      args.free_bits,
-        },
-        episodic_memory_class=BatchedNoveltyMemory,
-        episodic_memory_kwargs={
-            "input_dim": args.vae_latent_dim,
-            "hash_dim": 63,  # Max hash_dim for safe int64 bit-packing
-        },
         tensorboard_log=args.tensorboard_log,
         verbose=args.verbose,
         seed=args.seed,
@@ -282,9 +248,8 @@ def main():
         f"  env_size={args.env_size}  view_size={args.view_size}  max_steps={args.max_steps}\n"
         f"  lr={args.lr}  n_steps={args.n_steps}  batch={args.batch_size}  epochs={args.n_epochs}\n"
         f"  gamma={args.gamma}  gae={args.gae_lambda}  ent={args.ent_coef}  seed={args.seed}\n"
-        f"  vae_latent={args.vae_latent_dim}  wyner_latent={args.wyner_latent_dim}\n"
+        f"  vae_latent={args.vae_latent_dim}  lmu_hidden={args.wyner_latent_dim}  lmu_order={args.lmu_order}  lmu_theta={args.lmu_theta}\n"
         f"  vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}"
-        f"  wyner_recon={args.wyner_recon_coef}  wyner_kl={args.wyner_kl_coef}"
         f"  intrinsic={args.intrinsic_scale}"
     )
     model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=render_callback)
