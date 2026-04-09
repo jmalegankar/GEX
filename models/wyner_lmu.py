@@ -550,14 +550,6 @@ class WynerLMUVAE(nn.Module):
             recon_next_loss=recon_next_loss,
         )
 
-    # def step(self, w: th.Tensor, mu: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
-    #     """For rollout: run LMU, return (z_mu, packed_new_state, m_t)."""
-    #     w_flat = w.squeeze(1) if w.dim() == 3 else w
-    #     h_prev, m_prev = self.unpack_state(w_flat)
-    #     h_t, m_t = self.lmu(mu, h_prev, m_prev)
-    #     packed = self.pack_state(h_t, m_t)
-    #     return h_t, m_t, packed
-
 
 # ═══════════════════════════════════════════════════════════════════════
 # Quick smoke test
