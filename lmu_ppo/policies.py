@@ -155,21 +155,21 @@ class LMUActorCriticPolicy(nn.Module):
 
     def forward(
         self,
-        obs:    th.Tensor,   # (B, H, W, C)
-        h_prev: th.Tensor,   # (B, hidden_size)
-        m_prev: th.Tensor,   # (B, memory_size)
-    ) -> Tuple[th.Tensor, th.Tensor, th.Tensor, th.Tensor, th.Tensor]:
-        """
-        Returns: action, value, log_prob, h_new, m_new
-        """
+        obs: th.Tensor,
+        h_prev: th.Tensor,
+        m_prev: th.Tensor,
+    ):
         x = self.encoder(obs)
-        h, m = self.lmu_cell(x, h_prev, m_prev)
+        h, m, u = self.lmu_cell(x, h_prev, m_prev)
 
         logits = self.actor(h)
         dist   = Categorical(logits=logits)
         action = dist.sample()
 
-        return action, self.critic(h).squeeze(-1), dist.log_prob(action), h, m
+        value    = self.critic(h).squeeze(-1)
+        log_prob = dist.log_prob(action)
+
+        return action, value, log_prob, h, m, u, logits
 
     # ------------------------------------------------------------------
     # Evaluate stored actions (used during PPO update — needs gradient)
@@ -186,7 +186,7 @@ class LMUActorCriticPolicy(nn.Module):
         Returns: value (B,), log_prob (B,), entropy (B,)
         """
         x = self.encoder(obs)
-        h, _ = self.lmu_cell(x, lmu_h, lmu_m)
+        h, _, _ = self.lmu_cell(x, lmu_h, lmu_m)
 
         logits   = self.actor(h)
         dist     = Categorical(logits=logits)
@@ -207,7 +207,7 @@ class LMUActorCriticPolicy(nn.Module):
         lmu_m:  th.Tensor,
     ) -> th.Tensor:
         x = self.encoder(obs)
-        h, _ = self.lmu_cell(x, lmu_h, lmu_m)
+        h, _, _= self.lmu_cell(x, lmu_h, lmu_m)
         return self.critic(h).squeeze(-1)
 
     def initial_state(

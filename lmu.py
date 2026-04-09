@@ -127,7 +127,7 @@ class LMUCell(nn.Module):
         # Nonlinear hidden update
         h = torch.tanh(self.W_x(x) + self.W_h(h_prev) + self.W_m(m))  # (batch, n)
 
-        return h, m
+        return h, m, u
 
     def initial_state(self, batch_size: int, device: torch.device):
         """Return zeroed (h, m) state tuple."""

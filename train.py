@@ -56,9 +56,9 @@ def main():
 
     env_id = ENV_IDS[args.env]
 
-    train_env = SubprocVecEnv([
+    train_env = VecTransposeImage(SubprocVecEnv([
         make_env(env_id, args.seed, i) for i in range(args.n_envs)
-    ])
+    ]))
     eval_env = VecTransposeImage(DummyVecEnv([make_env(env_id, args.seed + 1000)]))
 
     eval_cb = EvalCallback(
