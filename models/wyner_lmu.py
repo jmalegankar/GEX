@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.signal import cont2discrete
 
+import math
+
 from typing import Optional, List, Tuple
 
 
@@ -29,6 +31,7 @@ def get_AB(d: int, theta: float = 1.0):
 # LMU Cell
 # ═══════════════════════════════════════════════════════════════════════
 
+# TODO: Vectorize cell for multiple dimensions
 class LMUCell(nn.Module):
     """
     Single-step LMU. State = (h, m).
@@ -42,6 +45,7 @@ class LMUCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.memory_size = memory_size
+        self.theta = theta
 
         A, B = get_AB(memory_size, theta)
         self.register_buffer("A", th.from_numpy(A))  # (d, d)
@@ -57,6 +61,15 @@ class LMUCell(nn.Module):
 
         self._init_weights()
 
+        C = np.zeros((memory_size, memory_size), dtype=np.float32)
+        for i in range(memory_size):
+            for j in range(i + 1):
+                # Combine the (-1)^i from the outer loop and (-r)^j from the inner loop
+                sign = (-1)**(i + j)
+                C[i, j] = sign * math.comb(i, j) * math.comb(i + j, j)
+        
+        self.register_buffer("C", th.from_numpy(C))
+
     def _init_weights(self):
         nn.init.zeros_(self.e_m.weight)
         for layer in (self.W_x, self.W_h, self.W_m):
@@ -70,7 +83,19 @@ class LMUCell(nn.Module):
         m_new = m @ self.A.T + u * self.B.T                # (B, d)
         h_new = th.tanh(self.W_x(x) + self.W_h(h) + self.W_m(m_new))
         return h_new, m_new
+    
+    def recon_data(self, m: th.Tensor, timestep: th.Tensor) -> th.Tensor:
+        r = (timestep / self.theta).frac()
+        j_powers = th.arange(self.memory_size)                       # Shape: [d]
+        
+        # Broadcasting: [num_points, 1] ** [1, d] -> [num_points, d]
+        R = r.unsqueeze(1) ** j_powers.unsqueeze(0)      
+        
+        # 3. Compute the final Legendre matrix via batch matrix multiplication
+        # P = R * C^T  -> Shape: [num_points, d]
+        P = th.matmul(R, self.C.T)
 
+        return P * m
 
 # ═══════════════════════════════════════════════════════════════════════
 # Prior network: conv1d + attention over (h_{t-1}, m_{t-1})
@@ -176,20 +201,16 @@ class LegendreReconDecoder(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        memory_size: int,
-        mu_dim: int,
+        memory_dim: int,
         recon_dim: int,
         decode_hidden: int = 128,
     ):
         super().__init__()
         self.mu_dim = mu_dim
 
-        # Legendre readout: Equation 3 LMU paper (TODO)
-        self.legendre_readout = nn.Linear(memory_size, mu_dim)
-
         # Gated residual: f(recon_mu_x, h_t) + recon_mu_x
         self.gate_net = nn.Sequential(
-            nn.Linear(mu_dim + hidden_size, decode_hidden),
+            nn.Linear(memory_dim + hidden_size, decode_hidden),
             nn.ReLU(),
             nn.Linear(decode_hidden, mu_dim),
         )
@@ -203,16 +224,14 @@ class LegendreReconDecoder(nn.Module):
             nn.Linear(decode_hidden, recon_dim),
         )
 
-    def forward(self, h: th.Tensor, m: th.Tensor) -> th.Tensor:
+    def forward(self, h: th.Tensor, u: th.Tensor) -> th.Tensor:
         """
         h: (B, hidden_size)  — nonlinear hidden state
-        m: (B, memory_size)  — Legendre coefficients
         Returns: (B, recon_dim)
         """
-        recon_mu = self.legendre_readout(m)                       # (B, mu_dim)
-        combined = th.cat([recon_mu, h], dim=-1)                  # (B, mu_dim + hidden)
-        residual = self.gate_net(combined)                        # (B, mu_dim)
-        fused = residual + recon_mu                               # gated residual
+        combined = th.cat([u, h], dim=-1)                  # (B, memory_dim + hidden)
+        residual = self.gate_net(combined)                        # (B, memory_dim)
+        fused = residual + u                               # gated residual
         return self.mlp(fused)                                    # (B, recon_dim)
 
 
@@ -296,8 +315,6 @@ class WynerLMUOutput:
         w: th.Tensor,              # posterior mean (= h_t)
         logvar: th.Tensor,
         recon: th.Tensor,
-        h: th.Tensor,              # LMU hidden state
-        m: th.Tensor,              # LMU memory (Legendre coefficients)
         recon_next: Optional[th.Tensor] = None,
         prior_mu: Optional[th.Tensor] = None,
         prior_logvar: Optional[th.Tensor] = None,
@@ -305,8 +322,6 @@ class WynerLMUOutput:
         self.w = w
         self.logvar = logvar
         self.recon = recon
-        self.h = h
-        self.m = m
         self.recon_next = recon_next
         self.prior_mu = prior_mu
         self.prior_logvar = prior_logvar
@@ -474,7 +489,9 @@ class WynerLMUVAE(nn.Module):
             Automatically detects and unpacks when needed.
             """
             h, m = self.unpack_state(z)
-            return self.decoder(h, m)
+            # Reconstruct mu using m at timesteps
+            u = self.lmu.recon_data(m, timestep)
+            return self.decoder(h, u)
 
     # ── Forward ───────────────────────────────────────────────
 
@@ -492,35 +509,25 @@ class WynerLMUVAE(nn.Module):
         # Prior from previous state (BEFORE LMU update)
         prior_mu, prior_logvar = self.prior_net(h_prev, m_prev)
 
-        # LMU step
-        h_t, m_t = self.lmu(mu, h_prev, m_prev)
-
-        # Posterior
-        z_mu = self.pack_state(h_t, m_t)
-        z_logvar = self.fc_logvar(z_mu.unsqueeze(1))
+        # LMU encode
+        z_mu, z_logvar = self.encode(w, mu, skips, timestep)
 
         # Sample
         std = th.exp(0.5 * z_logvar)
         z = z_mu + th.randn_like(std) * std
 
         # Decode current
-        recon = self.deocde(z, m_t)
+        recon = self.deocde(z, mu, timestep)
 
         # Decode next (if mu_next provided, step LMU again)
         recon_next = None
         if mu_next is not None:
-            h_tp1, m_tp1 = self.lmu(mu_next, h_t, m_t)
-            recon_next = self._decode_from_state(h_tp1, m_tp1)
-
-        # Pack new state as w for storage: use z_mu (= h_t) and m_t
-        new_w = self.pack_state(z_mu, m_t)
+            recon_next = self.decode(z, mu_next, timestep+1)
 
         return WynerLMUOutput(
-            w=new_w,
+            w=z,
             logvar=z_logvar,
             recon=recon,
-            h=h_t,
-            m=m_t,
             recon_next=recon_next,
             prior_mu=prior_mu,
             prior_logvar=prior_logvar,

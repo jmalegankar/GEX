@@ -12,8 +12,7 @@ from stable_baselines3.common.type_aliases import Schedule
 
 from typing import Any, Optional, Union, Tuple
 
-import typing
-
+from models.wyner_lmu import LMUActionFeatures
 
 from models.vae import VAEInterface, TransitionSCVAE
 from models.wyner import WynerInterface, WynerVAE
@@ -90,7 +89,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         full_std: bool = True,
         use_expln: bool = False,
         squash_output: bool = False,
-        features_extractor_class: type[HSWVIMEFeaturesExtractor] = HSWVIMEFeaturesExtractor,
+        features_extractor_class: type[HSWVIMEFeaturesExtractor] = LMUActionFeatures,
         features_extractor_kwargs: Optional[dict[str, Any]] = None,
         vae_features_extractor_class: VAEInterface = TransitionSCVAE,
         vae_features_extractor_kwargs: Optional[dict[str, Any]] = None,
