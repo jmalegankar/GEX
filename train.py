@@ -149,6 +149,8 @@ def parse_args():
                    help="LMU window length (time-steps).")
     p.add_argument("--lmu_conv_channels", type=int, default=32,
                    help="Conv1d channels for LMU action features.")
+    p.add_argument("--lmu_n_channels", type=int, default=8,
+                   help="Number of parallel LMU channels (equiv. to batch size in LMU features extractor).")
 
     # Logging
     p.add_argument("--tensorboard_log", type=str, default="runs/lmu")
@@ -211,6 +213,7 @@ def main():
             "theta":               args.lmu_theta,
             "decode_hidden":       args.wyner_decode_hidden,
             "free_bits":           args.free_bits,
+            "n_channels":          args.lmu_n_channels,
         }
         # packed state = h (latent_dim) + m (memory_size)
         memory_shape = (1, args.wyner_latent_dim + args.lmu_memory_size)
@@ -221,6 +224,7 @@ def main():
             "memory_size":   args.lmu_memory_size,
             "mu_dim":        args.vae_latent_dim,
             "conv_channels": args.lmu_conv_channels,
+            "n_channels":    args.lmu_n_channels,
         }
 
     elif args.wyner_backend == "mamba":
@@ -234,8 +238,8 @@ def main():
             "pos_embed_dim":  args.pos_embed_dim,
             "free_bits":      args.free_bits,
         }
-        # Mamba: need to instantiate to get flat_state_dim — use wyner_latent_dim as fallback
-        memory_shape = (1, args.wyner_latent_dim)
+        
+        memory_shape = (1, args.wyner_latent_dim + args.lmu_n_channels * args.lmu_memory_size)
 
         features_extractor_class = HSWVIMEFeaturesExtractor
         features_extractor_kwargs = {
