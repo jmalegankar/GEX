@@ -175,6 +175,10 @@ def build_jit_fns(policy, vf_coef: float, ent_coef: float):
         (loss, aux), grads = grad_fn(train_state.params)
 
         grad_norm = optax.global_norm(grads)
+        # W_m gradient: tells us if TBPTT-1 is reaching the memory readout layer
+        wm_grad_norm = optax.global_norm(
+            grads["params"]["lmu_cell"]["W_m"]["kernel"]
+        )
         train_state = train_state.apply_gradients(grads=grads)
 
         pg_loss, v_loss, ent_loss, approx_kl, clip_frac, expl_var, entropy = aux
@@ -189,6 +193,7 @@ def build_jit_fns(policy, vf_coef: float, ent_coef: float):
             "train/expl_var": expl_var,
             "train/entropy": entropy,
             "train/grad_norm": grad_norm,
+            "debug/wm_grad":   wm_grad_norm,  # must be > 0 for memory readout to learn
         }
 
         return train_state, metrics
@@ -441,7 +446,7 @@ def train(args):
         all_metrics = []
         indices = np.arange(N)
         for _epoch in range(args.n_epochs):
-            np.random.shuffle(indices)
+            # np.random.shuffle(indices)
             for start in range(0, N, args.batch_size):
                 idx = indices[start : start + args.batch_size]
                 if len(idx) < args.batch_size:
@@ -475,9 +480,12 @@ def train(args):
             mean_kl  = np.mean([d["train/approx_kl"]  for d in all_metrics])
             mean_gn  = np.mean([d["train/grad_norm"]   for d in all_metrics])
             mean_ev  = np.mean([d["train/expl_var"]    for d in all_metrics])
+            mean_wm  = np.mean([d["debug/wm_grad"]     for d in all_metrics])
+            adv_std  = float(np.std(flat_adv))
             print(f"  update {update:4d} / {total_updates}  "
                   f"steps={total_steps:>9,}  fps={fps:.0f}  "
-                  f"kl={mean_kl:.4f}  grad={mean_gn:.2f}  ev={mean_ev:.3f}")
+                  f"kl={mean_kl:.4f}  grad={mean_gn:.2f}  ev={mean_ev:.3f}  "
+                  f"wm_g={mean_wm:.4f}  adv_std={adv_std:.3f}")
 
         # ---- Periodic evaluation --------------------------------------------
         if update % eval_every == 0:
