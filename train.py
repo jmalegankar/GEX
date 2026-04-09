@@ -10,6 +10,7 @@ from models.config import SCVAEConfig
 from models.episodic_memory import BatchedNoveltyMemory
 from models.vae import TransitionSCVAE
 from models.wyner import WynerMambaIndependentVAE, WynerVAE, WynerIndependentVAE
+from models.wyner_lmu import WynerLMUVAE, LMUActionFeatures
 from hswvime_ppo.hswvime_ppo import HSWVimePPO
 from hswvime_ppo.policies import HSWVIMEActorCriticPolicy, HSWVIMEFeaturesExtractor
 
@@ -85,16 +86,6 @@ def build_vae(embedding, act_dim: int, latent_dim: int, conv_channels, hidden_di
     return TransitionSCVAE(embedding, cfg)
 
 
-def build_wyner(recon_dim: int, mu_dim: int, latent_dim: int, decode_hidden: int):
-    return WynerVAE(
-        recon_dim=recon_dim,
-        mu_dim=mu_dim,
-        latent_dim=latent_dim,
-        latent_tokens=1,
-        decode_hidden=decode_hidden,
-    )
-
-
 def parse_args():
     p = argparse.ArgumentParser(description="Train HSWVimePPO on a grid environment.")
 
@@ -148,8 +139,19 @@ def parse_args():
     p.add_argument("--pos_embed_dim",      type=int, default=16,
                    help="Dimension of sinusoidal positional embedding for timestep in Wyner.")
 
+    # ── LMU-specific ──────────────────────────────────────────
+    p.add_argument("--wyner_backend", type=str, default="lmu",
+                   choices=["gru", "mamba", "lmu"],
+                   help="Wyner backbone: gru, mamba, or lmu.")
+    p.add_argument("--lmu_memory_size", type=int, default=64,
+                   help="Number of Legendre coefficients (LMU memory dimension).")
+    p.add_argument("--lmu_theta", type=float, default=100.0,
+                   help="LMU window length (time-steps).")
+    p.add_argument("--lmu_conv_channels", type=int, default=32,
+                   help="Conv1d channels for LMU action features.")
+
     # Logging
-    p.add_argument("--tensorboard_log", type=str, default="runs/mamba")
+    p.add_argument("--tensorboard_log", type=str, default="runs/lmu")
     p.add_argument("--verbose",         type=int, default=1)
 
     # Rendering
@@ -177,8 +179,7 @@ def main():
 
     # Probe one env to get obs/action dims
     _probe = env_fn()
-    obs_h, obs_w, _ = _probe.observation_space.shape   # (H, W, 4)
-    # Discrete actions are stored as raw indices (B, 1), not one-hot.
+    obs_h, obs_w, _ = _probe.observation_space.shape
     act_dim = _probe.action_space.n if isinstance(_probe.action_space, gymnasium.spaces.Discrete) else _probe.action_space.shape[0]
     _probe.close()
 
@@ -186,40 +187,87 @@ def main():
 
     # ── 2. Build models ───────────────────────────────────────────────────────
     embedding = build_embedding(obs_h, obs_w, args.embed_per_channel, args.dir_embed_dim)
-
     conv_channels = [32, 64, 128]
-    vae = build_vae(
-        embedding,
+
+    vae_cfg = SCVAEConfig(
         act_dim=act_dim,
-        latent_dim=args.vae_latent_dim,
+        action_embed_dim=args.vae_action_embed,
         conv_channels=conv_channels,
         hidden_dim=args.vae_hidden_dim,
-        action_embed_dim=args.vae_action_embed,
+        latent_dim=args.vae_latent_dim,
     )
 
     # recon_dim = 2 * conv_out + action_embed
     recon_dim = 2 * conv_channels[-1] + args.vae_action_embed
 
-    wyner = build_wyner(
-        recon_dim=recon_dim,
-        mu_dim=args.vae_latent_dim,
-        latent_dim=args.wyner_latent_dim,
-        decode_hidden=args.wyner_decode_hidden,
-    )
+    # ── Select Wyner backend + matching features extractor ────────────────────
+    if args.wyner_backend == "lmu":
+        wyner_class = WynerLMUVAE
+        wyner_kwargs = {
+            "recon_dim":           recon_dim,
+            "mu_dim":              args.vae_latent_dim,
+            "latent_dim":          args.wyner_latent_dim,
+            "memory_size":         args.lmu_memory_size,
+            "theta":               args.lmu_theta,
+            "decode_hidden":       args.wyner_decode_hidden,
+            "free_bits":           args.free_bits,
+        }
+        # packed state = h (latent_dim) + m (memory_size)
+        memory_shape = (1, args.wyner_latent_dim + args.lmu_memory_size)
 
-    memory_shape = (1, args.wyner_latent_dim)
+        features_extractor_class = LMUActionFeatures
+        features_extractor_kwargs = {
+            "hidden_size":   args.wyner_latent_dim,
+            "memory_size":   args.lmu_memory_size,
+            "mu_dim":        args.vae_latent_dim,
+            "conv_channels": args.lmu_conv_channels,
+        }
+
+    elif args.wyner_backend == "mamba":
+        wyner_class = WynerMambaIndependentVAE
+        wyner_kwargs = {
+            "recon_dim":      recon_dim,
+            "mu_dim":         args.vae_latent_dim,
+            "latent_dim":     args.wyner_latent_dim,
+            "latent_tokens":  1,
+            "decode_hidden":  args.wyner_decode_hidden,
+            "pos_embed_dim":  args.pos_embed_dim,
+            "free_bits":      args.free_bits,
+        }
+        # Mamba: need to instantiate to get flat_state_dim — use wyner_latent_dim as fallback
+        memory_shape = (1, args.wyner_latent_dim)
+
+        features_extractor_class = HSWVIMEFeaturesExtractor
+        features_extractor_kwargs = {
+            "wyner_dim": args.wyner_latent_dim,
+            "mu_dim":    args.vae_latent_dim,
+        }
+
+    else:  # gru
+        wyner_class = WynerVAE
+        wyner_kwargs = {
+            "recon_dim":      recon_dim,
+            "mu_dim":         args.vae_latent_dim,
+            "latent_dim":     args.wyner_latent_dim,
+            "latent_tokens":  1,
+            "decode_hidden":  args.wyner_decode_hidden,
+            "free_bits":      args.free_bits,
+        }
+        memory_shape = (1, args.wyner_latent_dim)
+
+        features_extractor_class = HSWVIMEFeaturesExtractor
+        features_extractor_kwargs = {
+            "wyner_dim": args.wyner_latent_dim,
+            "mu_dim":    args.vae_latent_dim,
+        }
 
     # 3. Policy kwargs
     policy_kwargs = {
-        "features_extractor_class":  HSWVIMEFeaturesExtractor,
-        "features_extractor_kwargs": {
-            "wyner_dim": args.wyner_latent_dim,
-            "mu_dim":    args.vae_latent_dim,
-        },
+        "features_extractor_class":  features_extractor_class,
+        "features_extractor_kwargs": features_extractor_kwargs,
         "net_arch": [dict(pi=[256, 256], vf=[256, 256])],
     }
 
-    # null_action is passed to the GRU on the very first step (before any real action)
     null_action = np.zeros(1, dtype=np.float32)
 
     # 4. Instantiate agent
@@ -246,28 +294,14 @@ def main():
         vae_features_extractor_class=TransitionSCVAE,
         vae_features_extractor_kwargs={
             "embedding": embedding,
-            "cfg": SCVAEConfig(
-                act_dim=act_dim,
-                action_embed_dim=args.vae_action_embed,
-                conv_channels=conv_channels,
-                hidden_dim=args.vae_hidden_dim,
-                latent_dim=args.vae_latent_dim,
-            ),
+            "cfg": vae_cfg,
         },
-        wyner_features_extractor_class=WynerMambaIndependentVAE,
-        wyner_features_extractor_kwargs={
-            "recon_dim":      recon_dim,
-            "mu_dim":         args.vae_latent_dim,
-            "latent_dim":     args.wyner_latent_dim,
-            "latent_tokens":  1,
-            "decode_hidden":  args.wyner_decode_hidden,
-            "pos_embed_dim":  args.pos_embed_dim,
-            "free_bits":      args.free_bits,
-        },
+        wyner_features_extractor_class=wyner_class,
+        wyner_features_extractor_kwargs=wyner_kwargs,
         episodic_memory_class=BatchedNoveltyMemory,
         episodic_memory_kwargs={
             "input_dim": args.vae_latent_dim,
-            "hash_dim": 63,  # Max hash_dim for safe int64 bit-packing
+            "hash_dim": 63,
         },
         tensorboard_log=args.tensorboard_log,
         verbose=args.verbose,
@@ -279,14 +313,21 @@ def main():
     print(
         f"Training on '{args.env}' for {args.total_timesteps:,} timesteps "
         f"with {args.n_envs} envs on device '{args.device}'.\n"
+        f"  wyner_backend={args.wyner_backend}\n"
         f"  env_size={args.env_size}  view_size={args.view_size}  max_steps={args.max_steps}\n"
         f"  lr={args.lr}  n_steps={args.n_steps}  batch={args.batch_size}  epochs={args.n_epochs}\n"
         f"  gamma={args.gamma}  gae={args.gae_lambda}  ent={args.ent_coef}  seed={args.seed}\n"
         f"  vae_latent={args.vae_latent_dim}  wyner_latent={args.wyner_latent_dim}\n"
+        f"  memory_shape={memory_shape}\n"
         f"  vae_recon={args.vae_recon_coef}  vae_kl={args.vae_kl_coef}"
         f"  wyner_recon={args.wyner_recon_coef}  wyner_kl={args.wyner_kl_coef}"
         f"  intrinsic={args.intrinsic_scale}"
     )
+    if args.wyner_backend == "lmu":
+        print(
+            f"  lmu_memory_size={args.lmu_memory_size}  lmu_theta={args.lmu_theta}"
+            f"  lmu_conv_channels={args.lmu_conv_channels}"
+        )
     model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=render_callback)
 
     print("Done.")
