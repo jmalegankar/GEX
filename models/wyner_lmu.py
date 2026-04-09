@@ -124,8 +124,16 @@ class LMUPriorNetwork(nn.Module):
             nn.ReLU(),
         )
         self.fc_mean = nn.Linear(128, latent_dim)
-        self.fc_logvar = nn.Linear(128, latent_dim)
-        nn.init.zeros_(self.fc_logvar.bias)
+        _prior_pool_out = 8
+        _prior_conv_ch = 32
+        self.fc_logvar = nn.Sequential(
+            nn.Conv1d(1, _prior_conv_ch, kernel_size=3, padding=1),
+            nn.AdaptiveAvgPool1d(_prior_pool_out),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(_prior_conv_ch * _prior_pool_out, latent_dim),
+        )
+        nn.init.zeros_(self.fc_logvar[-1].bias)
 
     def forward(self, h_prev: th.Tensor, m_prev: th.Tensor) -> Tuple[th.Tensor, th.Tensor]:
         """
@@ -146,7 +154,7 @@ class LMUPriorNetwork(nn.Module):
         # Combine with h_prev for final projection
         combined = th.cat([attn_out, h_prev], dim=-1)
         feat = self.fc(combined)
-        return self.fc_mean(feat), self.fc_logvar(feat)
+        return self.fc_mean(feat), self.fc_logvar(feat.unsqueeze(1))
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -380,9 +388,17 @@ class WynerLMUVAE(nn.Module):
 
         # ── Posterior ─────────────────────────────────────────
         # Mean = h_t directly → no projection needed (dim = latent_dim)
-        # Logvar from [h_t, m_t]
-        self.fc_logvar = nn.Linear(latent_dim + memory_size, latent_dim)
-        nn.init.zeros_(self.fc_logvar.bias)
+        # Logvar from [h_t, m_t] via conv → pool → relu → FC
+        _post_pool_out = 8
+        _post_conv_ch = 32
+        self.fc_logvar = nn.Sequential(
+            nn.Conv1d(1, _post_conv_ch, kernel_size=3, padding=1),
+            nn.AdaptiveAvgPool1d(_post_pool_out),
+            nn.ReLU(inplace=True),
+            nn.Flatten(),
+            nn.Linear(_post_conv_ch * _post_pool_out, latent_dim),
+        )
+        nn.init.zeros_(self.fc_logvar[-1].bias)
 
         # ── Prior ─────────────────────────────────────────────
         self.prior_net = LMUPriorNetwork(
@@ -438,8 +454,7 @@ class WynerLMUVAE(nn.Module):
         h_t, m_t = self.lmu(mu, h_prev, m_prev)
 
         z_mu = self.pack_state(h_t, m_t)
-
-        z_logvar = self.fc_logvar(th.cat(z_mu, dim=-1))
+        z_logvar = self.fc_logvar(z_mu.unsqueeze(1))
 
         return z_mu, z_logvar
 
@@ -482,7 +497,7 @@ class WynerLMUVAE(nn.Module):
 
         # Posterior
         z_mu = self.pack_state(h_t, m_t)
-        z_logvar = self.fc_logvar(th.cat(z_mu, dim=-1))
+        z_logvar = self.fc_logvar(z_mu.unsqueeze(1))
 
         # Sample
         std = th.exp(0.5 * z_logvar)
