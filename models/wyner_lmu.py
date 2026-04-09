@@ -165,7 +165,7 @@ class MultiInputLMUCell(nn.Module):
         P = th.matmul(R, self.C.T)                                 # (B, d)
 
         # Broadcast across channels: P (B, 1, d) * m (B, p, d) → (B, p, d)
-        return P.unsqueeze(1) * m                                  # (B, p, d)
+        return (P.unsqueeze(1) * m).sum(dim=2)                     # (B, p)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -271,38 +271,38 @@ class LegendreReconDecoder(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        memory_flat_dim: int,     # p * d
+        lmu_channels: int,
         recon_dim: int,
         decode_hidden: int = 128,
     ):
         super().__init__()
-        self.memory_flat_dim = memory_flat_dim
+        self.lmu_channels = lmu_channels
 
         # Gated residual: f(u, h) + u
         self.gate_net = nn.Sequential(
-            nn.Linear(memory_flat_dim + hidden_size, decode_hidden),
+            nn.Linear(lmu_channels + hidden_size, decode_hidden),
             nn.ReLU(),
-            nn.Linear(decode_hidden, memory_flat_dim),
+            nn.Linear(decode_hidden, lmu_channels),
         )
 
         # Final MLP → recon_dim
         self.mlp = nn.Sequential(
-            nn.Linear(memory_flat_dim, decode_hidden),
+            nn.Linear(lmu_channels, decode_hidden),
             nn.ReLU(),
             nn.Linear(decode_hidden, decode_hidden),
             nn.ReLU(),
             nn.Linear(decode_hidden, recon_dim),
         )
 
-    def forward(self, h: th.Tensor, u_flat: th.Tensor) -> th.Tensor:
+    def forward(self, h: th.Tensor, u: th.Tensor) -> th.Tensor:
         """
         h:      (B, hidden_size)
-        u_flat: (B, p*d) — Legendre-reconstructed signal, flattened
+        u_flat: (B, p) — Legendre-reconstructed signal, flattened
         Returns: (B, recon_dim)
         """
-        combined = th.cat([u_flat, h], dim=-1)
+        combined = th.cat([u, h], dim=-1)
         residual = self.gate_net(combined)
-        fused = residual + u_flat
+        fused = residual + u
         return self.mlp(fused)
 
 
@@ -375,13 +375,15 @@ class LMUActionFeatures(nn.Module):
     def features_dim(self) -> int:
         return self._features_dim
 
-    def forward(self, h: th.Tensor, m: th.Tensor, mu: th.Tensor) -> th.Tensor:
+    def forward(self, mem: th.Tensor, mu: th.Tensor) -> th.Tensor:
         """
-        h:  (B, hidden_size)
-        m:  (B, p, d)
+        mem: (B, h_dim + m_dim* n_channels)
         mu: (B, mu_dim)
         Returns: (B, 3 * conv_channels)
         """
+        mem = mem.squeeze(1)
+        h = mem[..., :self.hidden_size]
+        m = mem[..., self.hidden_size:].view(-1, self.n_channels, self.memory_size)
         return th.cat([
             self.m_head(m),                      # m is already (B, p, d)
             self.h_head(h.unsqueeze(1)),          # (B, 1, hidden_size)
@@ -517,7 +519,7 @@ class WynerLMUVAE(nn.Module):
         # ── Decoder ───────────────────────────────────────────
         self.decoder = LegendreReconDecoder(
             hidden_size=latent_dim,
-            memory_flat_dim=self._flat_mem_dim,
+            lmu_channels=n_channels,
             recon_dim=recon_dim,
             decode_hidden=decode_hidden,
         )
@@ -536,7 +538,7 @@ class WynerLMUVAE(nn.Module):
         """
         h = packed[..., :self.latent_dim]
         m_flat = packed[..., self.latent_dim:]
-        m = m_flat.reshape(-1, self.n_channels, self.memory_size)
+        m = m_flat.view(-1, self.n_channels, self.memory_size)
         return h, m
 
 
@@ -573,14 +575,8 @@ class WynerLMUVAE(nn.Module):
         """
         h, m = self.unpack_state(z)
 
-        if timestep is not None:
-            u = self.lmu.recon_data(m, timestep)                   # (B, p, d)
-        else:
-            # Fallback: use raw memory (no polynomial evaluation)
-            u = m
-
-        u_flat = u.reshape(u.size(0), -1)                         # (B, p*d)
-        return self.decoder(h, u_flat)
+        u = self.lmu.recon_data(m, timestep)                   # (B, p)
+        return self.decoder(h, u)
 
     # ── Forward ───────────────────────────────────────────────
 

@@ -143,7 +143,7 @@ def parse_args():
     p.add_argument("--wyner_backend", type=str, default="lmu",
                    choices=["gru", "mamba", "lmu"],
                    help="Wyner backbone: gru, mamba, or lmu.")
-    p.add_argument("--lmu_memory_size", type=int, default=64,
+    p.add_argument("--lmu_memory_size", type=int, default=16,
                    help="Number of Legendre coefficients (LMU memory dimension).")
     p.add_argument("--lmu_theta", type=float, default=100.0,
                    help="LMU window length (time-steps).")
@@ -216,7 +216,7 @@ def main():
             "n_channels":          args.lmu_n_channels,
         }
         # packed state = h (latent_dim) + m (memory_size)
-        memory_shape = (1, args.wyner_latent_dim + args.lmu_memory_size)
+        memory_shape = (1, args.wyner_latent_dim + args.lmu_n_channels * args.lmu_memory_size)
 
         features_extractor_class = LMUActionFeatures
         features_extractor_kwargs = {
