@@ -231,6 +231,7 @@ class HSWVIMEActorCriticPolicy(ActorCriticPolicy):
         latent_vf = self.mlp_extractor.forward_critic(features)
         values = self.value_net(latent_vf)
         latent_pi = self.mlp_extractor.forward_actor(features.detach())  # don't backprop through features for policy
+        latent_pi = th.nan_to_num(latent_pi, nan=0.0, posinf=0.0, neginf=0.0)
         distribution = self._get_action_dist_from_latent(latent_pi)
         log_prob = distribution.log_prob(action)
         return values, log_prob, distribution.entropy(), new_memory

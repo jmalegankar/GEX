@@ -412,6 +412,11 @@ class HSWVimePPO(PPO):
                     break
 
                 # Optimization step
+                if not th.isfinite(loss):
+                    if self.verbose >= 1:
+                        print(f"  Skipping NaN/Inf loss in batch (loss={loss.item()})")
+                    continue
+
                 self.policy.optimizer.zero_grad()
                 loss.backward()
 

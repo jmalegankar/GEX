@@ -100,7 +100,7 @@ def parse_args():
     p.add_argument("--render", action="store_true", help="Render the environment during training.")
 
     # Training 
-    p.add_argument("--total_timesteps", type=int, default=500_000)
+    p.add_argument("--total_timesteps", type=int, default=20_000_000)
     p.add_argument("--n_envs",          type=int, default=4)
     p.add_argument("--n_steps",         type=int, default=512,
                    help="Steps per env per rollout (total = n_steps * n_envs).")
@@ -109,14 +109,14 @@ def parse_args():
     p.add_argument("--lr",              type=float, default=3e-4)
     p.add_argument("--gamma",           type=float, default=0.99)
     p.add_argument("--gae_lambda",      type=float, default=0.95)
-    p.add_argument("--ent_coef",        type=float, default=0.0)
+    p.add_argument("--ent_coef",        type=float, default=0.01)
     p.add_argument("--seed",            type=int,   default=0)
     p.add_argument("--device",          type=str,   default="auto")
 
     # Loss coefficients 
     p.add_argument("--vae_recon_coef",  type=float, default=1.0)
     p.add_argument("--vae_kl_coef",     type=float, default=0.01)
-    p.add_argument("--intrinsic_scale", type=float, default=0.0)
+    p.add_argument("--intrinsic_scale", type=float, default=0.1)
     p.add_argument("--kl_use_schedule", action="store_true",
                    help="Enable KL coefficient annealing from 0 to target over kl_anneal_steps.")
     p.add_argument("--kl_anneal_steps", type=int, default=50_000,
@@ -130,7 +130,7 @@ def parse_args():
     p.add_argument("--vae_action_embed",  type=int, default=32)
     p.add_argument("--wyner_latent_dim",  type=int, default=64,
                    help="LMU hidden_dim (h_t dimension).")
-    p.add_argument("--lmu_order",         type=int, default=4)
+    p.add_argument("--lmu_order",         type=int, default=16)
     p.add_argument("--lmu_theta",         type=float, default=500.0,
                    help="LMU theta; set to episode horizon (max_steps).")
 

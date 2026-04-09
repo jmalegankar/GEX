@@ -95,6 +95,7 @@ class LMUCell(nn.Module):
 
         # Linear memory update: m_t = Ā m_{t-1} + B̄ u_t
         m_new = m @ self.A.T + u * self.B.T             # (B, order)
+        m_new = m_new.clamp(-1e3, 1e3)                  # prevent unbounded growth
 
         # Nonlinear hidden update
         h_new = torch.tanh(self.W_x(x) + self.W_h(h) + self.W_m(m_new))  # (B, hidden_dim)
