@@ -176,7 +176,7 @@ class LegendreReconDecoder(nn.Module):
         super().__init__()
         self.mu_dim = mu_dim
 
-        # Legendre readout: m_t → reconstructed mu_x
+        # Legendre readout: Equation 3 LMU paper (TODO)
         self.legendre_readout = nn.Linear(memory_size, mu_dim)
 
         # Gated residual: f(recon_mu_x, h_t) + recon_mu_x
@@ -185,7 +185,6 @@ class LegendreReconDecoder(nn.Module):
             nn.ReLU(),
             nn.Linear(decode_hidden, mu_dim),
         )
-        self.gate = nn.Linear(mu_dim + hidden_size, mu_dim)
 
         # Final MLP → recon_dim
         self.mlp = nn.Sequential(
@@ -204,9 +203,8 @@ class LegendreReconDecoder(nn.Module):
         """
         recon_mu = self.legendre_readout(m)                       # (B, mu_dim)
         combined = th.cat([recon_mu, h], dim=-1)                  # (B, mu_dim + hidden)
-        g = th.sigmoid(self.gate(combined))                       # (B, mu_dim)
         residual = self.gate_net(combined)                        # (B, mu_dim)
-        fused = g * residual + recon_mu                           # gated residual
+        fused = residual + recon_mu                               # gated residual
         return self.mlp(fused)                                    # (B, recon_dim)
 
 
@@ -439,9 +437,9 @@ class WynerLMUVAE(nn.Module):
         # LMU step
         h_t, m_t = self.lmu(mu, h_prev, m_prev)
 
-        # Posterior
-        z_mu = h_t                                                # no projection
-        z_logvar = self.fc_logvar(th.cat([h_t, m_t], dim=-1))
+        z_mu = self.pack_state(h_t, m_t)
+
+        z_logvar = self.fc_logvar(th.cat(z_mu, dim=-1))
 
         return z_mu, z_logvar
 
@@ -458,19 +456,10 @@ class WynerLMUVAE(nn.Module):
 
             z can be either:
             - (B, packed_state_dim) = packed (h, m) from forward()'s w output
-            - (B, latent_dim)       = a raw latent sample
             Automatically detects and unpacks when needed.
             """
-            if z.shape[-1] == self.packed_state_dim:
-                h, m = self.unpack_state(z)
-            else:
-                h = z
-                m = th.zeros(z.size(0), self.memory_size, device=z.device)
+            h, m = self.unpack_state(z)
             return self.decoder(h, m)
-
-    def _decode_from_state(self, h: th.Tensor, m: th.Tensor) -> th.Tensor:
-        """Full decode using both h and m."""
-        return self.decoder(h, m)
 
     # ── Forward ───────────────────────────────────────────────
 
@@ -492,15 +481,15 @@ class WynerLMUVAE(nn.Module):
         h_t, m_t = self.lmu(mu, h_prev, m_prev)
 
         # Posterior
-        z_mu = h_t
-        z_logvar = self.fc_logvar(th.cat([h_t, m_t], dim=-1))
+        z_mu = self.pack_state(h_t, m_t)
+        z_logvar = self.fc_logvar(th.cat(z_mu, dim=-1))
 
         # Sample
         std = th.exp(0.5 * z_logvar)
         z = z_mu + th.randn_like(std) * std
 
         # Decode current
-        recon = self._decode_from_state(z, m_t)
+        recon = self.deocde(z, m_t)
 
         # Decode next (if mu_next provided, step LMU again)
         recon_next = None
@@ -561,13 +550,13 @@ class WynerLMUVAE(nn.Module):
             recon_next_loss=recon_next_loss,
         )
 
-    def step(self, w: th.Tensor, mu: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
-        """For rollout: run LMU, return (z_mu, packed_new_state, m_t)."""
-        w_flat = w.squeeze(1) if w.dim() == 3 else w
-        h_prev, m_prev = self.unpack_state(w_flat)
-        h_t, m_t = self.lmu(mu, h_prev, m_prev)
-        packed = self.pack_state(h_t, m_t)
-        return h_t, m_t, packed
+    # def step(self, w: th.Tensor, mu: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    #     """For rollout: run LMU, return (z_mu, packed_new_state, m_t)."""
+    #     w_flat = w.squeeze(1) if w.dim() == 3 else w
+    #     h_prev, m_prev = self.unpack_state(w_flat)
+    #     h_t, m_t = self.lmu(mu, h_prev, m_prev)
+    #     packed = self.pack_state(h_t, m_t)
+    #     return h_t, m_t, packed
 
 
 # ═══════════════════════════════════════════════════════════════════════
