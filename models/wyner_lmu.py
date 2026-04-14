@@ -599,8 +599,7 @@ class WynerLMUVAE(nn.Module):
 
         # Sample (reparameterize only the latent slice; remainder of packed state is deterministic)
         std = th.exp(0.5 * z_logvar)
-        z = z_mu.clone()
-        z[:, :std.size(1)] = z_mu[:, :std.size(1)] + th.randn_like(std) * std
+        z = z_mu + th.randn_like(std) * std
 
         # Decode current
         recon = self.decode(z, mu, timestep)
