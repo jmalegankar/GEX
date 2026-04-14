@@ -18,19 +18,21 @@ class LMUCell(nn.Module):
         self.hidden_size = hidden_size
         self.memory_size = memory_size
         self.num_units = num_units
-        self.theta = theta
+        self.theta = float(theta)
 
         # Precompute the A and B matrices for the Legendre Memory Unit
-        A = th.zeros(memory_size, memory_size, dtype=th.float32)
+        A = th.zeros(memory_size, memory_size, dtype=th.int32)
         for i in range(memory_size):
             for j in range(memory_size):
                 if i < j:
                     A[i, j] = -2*i - 1
                 else:
                     A[i, j] = (-1 ** ((i-j+1)%2)) * (2*i + 1)
+        A = A / self.theta + th.diag(th.ones(memory_size, dtype=th.float32))
         B = th.zeros(memory_size, dtype=th.int32)
         for i in range(memory_size):
             B[i] = (2*i + 1)*(-1 ** (i%2))
+        B = B / self.theta
         self.register_buffer('A', A.view(1, memory_size, memory_size))
         self.register_buffer('B', B.view(memory_size, 1))
 
@@ -86,7 +88,9 @@ class LMUCell(nn.Module):
         ) # (batch_size, 1, num_units), None
 
         # Update the memory using the LMU equations
-        u_t = u_t.squeeze(1) # (batch_size, num_units)
+        u_t = u_t.squeeze(1) + input_proj # (batch_size, num_units)
+        # Normalize u_t for stability
+        u_t = u_t / (u_t.norm(dim=-1, keepdim=True) + 1e-8)
         new_memory = th.matmul(self.A, memory) + self.B * u_t.unsqueeze(1) # (batch_size, memory_size, num_units)
         kv = th.cat(
             (hidden, new_memory, input_proj.unsqueeze(1)),
@@ -105,7 +109,8 @@ class LMUCell(nn.Module):
         timesteps: th.Tensor, # (batch_size, num_timesteps)
     ) -> th.Tensor: # (batch_size, num_timesteps, num_units)
         # Reconstruct the input from the memory using the precomputed permutation matrix
-        timesteps = -2 * timesteps / self.theta # (batch_size, num_timesteps)
+        timesteps = -2 * (timesteps / self.theta).frac() # (batch_size, num_timesteps)
+        timesteps = timesteps.to(th.float32)
         timesteps = timesteps.unsqueeze(2).repeat(1, 1, self.memory_size) # (batch_size, num_timesteps, memory_size)
         # Create exponentials for the reconstruction
         timesteps = timesteps ** th.arange(self.memory_size, device=memory.device).view(1, 1, -1) # (batch_size, num_timesteps, memory_size)
@@ -113,6 +118,8 @@ class LMUCell(nn.Module):
         P = (self.P * timesteps.unsqueeze(2)).sum(dim=-1) # (batch_size, num_timesteps, memory_size)
         # Perform the reconstruction
         recon = (P.unsqueeze(-1) * memory.unsqueeze(1)).sum(dim=2) # (batch_size, num_timesteps, num_units)
+        # Print recon norm values
+        recon_norm = recon.norm(dim=-1)
         return recon
 
 
@@ -205,7 +212,7 @@ class WynerVAE(nn.Module):
         h, m = w[..., :self.lmu_cell.hidden_size, :], w[..., self.lmu_cell.hidden_size:, :]
         new_h, new_m = self.lmu_cell(input=mu, hidden=h, memory=m)
         z_mu = th.cat((new_h, new_m), dim=-2) # (batch_size, hidden_size + memory_size, num_units)
-        z_logvar = self.log_var(z_mu, z_mu, z_mu, need_weights=False)[0] # (batch_size, hidden_size + memory_size, num_units)
+        z_logvar = th.zeros_like(z_mu)
         return z_mu, z_logvar
     
     def decode(self, z: th.Tensor, timestep: Optional[th.Tensor] = None) -> th.Tensor:
@@ -241,8 +248,13 @@ class WynerVAE(nn.Module):
             prior_logvar=prior_logvar,
         )
     
-    def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor], recon_next_target: Optional[th.Tensor]) -> WynerLoss:
-        kl_loss = -0.5 * th.sum(1 + output.logvar - output.w.pow(2) - output.logvar.exp())
+    def loss(self, output: WynerOutput, recon_target: Optional[th.Tensor] = None, recon_next_target: Optional[th.Tensor] = None) -> WynerLoss:
+        kl_per_dim = 0.5 * (
+                output.prior_logvar - output.logvar
+                + (output.logvar - output.prior_logvar).exp() + (output.w - output.prior_mu).pow(2) / output.prior_logvar.exp()
+                - 1.0
+            ) # (batch_size, hidden_size + memory_size, num_units)
+        kl_loss = kl_per_dim.reshape(kl_per_dim.size(0), -1).mean(dim=-1) 
         recon_loss = None
         recon_next_loss = None
         if output.recon is not None and recon_target is not None:
