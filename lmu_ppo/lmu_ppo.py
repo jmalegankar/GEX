@@ -293,49 +293,93 @@ class LMUPPO(PPO):
         clip_fractions, approx_kl_divs, grad_norms = [], [], []
 
         continue_training = True
+
+        # 🔥 IMPORTANT: use raw (unflattened) buffer
+        obs_buf = self.rollout_buffer.observations
+        actions_buf = self.rollout_buffer.actions
+        values_buf = self.rollout_buffer.values
+        log_probs_buf = self.rollout_buffer.log_probs
+        advantages_buf = self.rollout_buffer.advantages
+        returns_buf = self.rollout_buffer.returns
+
         for epoch in range(self.n_epochs):
-            for batch in self.rollout_buffer.get(self.batch_size):
-                actions = batch.actions.long().flatten()
 
-                values, log_prob, entropy = self.policy.evaluate_actions(
-                    batch.observations,
-                    batch.lmu_h,
-                    batch.lmu_m,
-                    actions,
-                )
+            # 🔥 FULL BPTT: loop over environments
+            for env_idx in range(self.n_envs):
 
-                advantages = batch.advantages
-                if self.normalize_advantage and len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                # init LMU state
+                h, m = self.policy.initial_state(1, self.device)
 
-                # Policy loss (clipped surrogate)
-                ratio          = th.exp(log_prob - batch.old_log_prob)
-                policy_loss    = -th.min(
-                    advantages * ratio,
-                    advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
-                ).mean()
+                policy_loss = 0.0
+                value_loss = 0.0
+                entropy_loss = 0.0
 
-                # Value loss
-                if self.clip_range_vf is None:
-                    values_pred = values
-                else:
-                    values_pred = batch.old_values + th.clamp(
-                        values - batch.old_values, -clip_range_vf, clip_range_vf
+                log_probs_list = []
+                old_log_probs_list = []
+
+                # 🔥 unroll FULL trajectory
+                for t in range(self.n_steps):
+
+                    obs_t = {
+                        k: th.as_tensor(obs_buf[k][t, env_idx]).unsqueeze(0).to(self.device)
+                        for k in obs_buf
+                    }
+
+                    action_t = th.as_tensor(actions_buf[t, env_idx]).long().to(self.device)
+                    old_log_prob_t = th.as_tensor(log_probs_buf[t, env_idx]).to(self.device)
+                    advantage_t = th.as_tensor(advantages_buf[t, env_idx]).to(self.device)
+                    return_t = th.as_tensor(returns_buf[t, env_idx]).to(self.device)
+                    old_value_t = th.as_tensor(values_buf[t, env_idx]).to(self.device)
+
+                    # forward
+                    x = self.policy.encoder(obs_t)
+                    h, m = self.policy.lmu_cell(x, h, m)
+
+                    logits = self.policy.actor(h)
+                    dist = th.distributions.Categorical(logits=logits)
+
+                    log_prob = dist.log_prob(action_t)
+                    entropy = dist.entropy()
+                    value = self.policy.critic(h).squeeze(-1)
+
+                    log_probs_list.append(log_prob)
+                    old_log_probs_list.append(old_log_prob_t)
+
+                    # PPO ratio
+                    ratio = th.exp(log_prob - old_log_prob_t)
+
+                    # policy loss
+                    policy_loss += -th.min(
+                        advantage_t * ratio,
+                        advantage_t * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
                     )
-                value_loss = F.mse_loss(batch.returns, values_pred)
 
-                # Entropy bonus
-                entropy_loss = -entropy.mean()
+                    # value loss
+                    if self.clip_range_vf is None:
+                        values_pred = value
+                    else:
+                        values_pred = old_value_t + th.clamp(
+                            value - old_value_t, -clip_range_vf, clip_range_vf
+                        )
+
+                    value_loss += F.mse_loss(return_t, values_pred)
+
+                    entropy_loss += -entropy
+
+                # 🔥 normalize over trajectory length
+                policy_loss = policy_loss.mean()
+                value_loss = value_loss.mean()
+                entropy_loss = entropy_loss.mean()
 
                 loss = (
                     policy_loss
-                    + self.ent_coef  * entropy_loss
-                    + self.vf_coef   * value_loss
+                    + self.ent_coef * entropy_loss
+                    + self.vf_coef * value_loss
                 )
 
-                # Early stopping on KL divergence
+                # KL for logging
                 with th.no_grad():
-                    log_ratio     = log_prob - batch.old_log_prob
+                    log_ratio = th.stack(log_probs_list) - th.stack(old_log_probs_list)
                     approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).item()
                     approx_kl_divs.append(approx_kl_div)
 
@@ -345,19 +389,20 @@ class LMUPPO(PPO):
                         print(f"  Early stopping at epoch {epoch}, approx KL={approx_kl_div:.3f}")
                     break
 
+                # backward
                 self.policy.optimizer.zero_grad()
                 loss.backward()
+
                 grad_norm = th.nn.utils.clip_grad_norm_(
                     self.policy.parameters(), self.max_grad_norm
                 )
+
                 self.policy.optimizer.step()
 
+                # logging
                 pg_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
-                clip_fractions.append(
-                    th.mean((th.abs(ratio - 1) > clip_range).float()).item()
-                )
                 grad_norms.append(grad_norm.item())
 
             self._n_updates += 1
@@ -369,13 +414,12 @@ class LMUPPO(PPO):
             self.rollout_buffer.returns.flatten(),
         )
 
-        self.logger.record("train/policy_loss",       np.mean(pg_losses))
-        self.logger.record("train/value_loss",        np.mean(value_losses))
-        self.logger.record("train/entropy_loss",      np.mean(entropy_losses))
-        self.logger.record("train/approx_kl",         np.mean(approx_kl_divs))
-        self.logger.record("train/clip_fraction",     np.mean(clip_fractions))
-        self.logger.record("train/grad_norm",         np.mean(grad_norms))
-        self.logger.record("train/explained_variance",explained_var)
-        self.logger.record("train/n_updates",         self._n_updates, exclude="tensorboard")
-        self.logger.record("train/learning_rate",     lr)
-        self.logger.record("train/clip_range",        clip_range)
+        self.logger.record("train/policy_loss",        np.mean(pg_losses))
+        self.logger.record("train/value_loss",         np.mean(value_losses))
+        self.logger.record("train/entropy_loss",       np.mean(entropy_losses))
+        self.logger.record("train/approx_kl",          np.mean(approx_kl_divs))
+        self.logger.record("train/grad_norm",          np.mean(grad_norms))
+        self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/n_updates",          self._n_updates, exclude="tensorboard")
+        self.logger.record("train/learning_rate",      lr)
+        self.logger.record("train/clip_range",         clip_range)

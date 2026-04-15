@@ -68,7 +68,7 @@ def main():
     parser.add_argument("--n_steps",     type=int, default=512)
     parser.add_argument("--batch_size",  type=int, default=256)
     parser.add_argument("--n_epochs",    type=int, default=4)
-    parser.add_argument("--lr",          type=float, default=3e-4)
+    parser.add_argument("--lr",          type=float, default=1e-4)
     parser.add_argument("--tb_log",      default="runs/lmu_ppo")
     parser.add_argument("--device",      default="auto")
     args = parser.parse_args()
