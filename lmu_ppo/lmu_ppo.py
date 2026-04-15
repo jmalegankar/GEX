@@ -325,12 +325,16 @@ class LMUPPO(PPO):
                         for k in obs_buf
                     }
 
+                    # action_t = th.as_tensor(actions_buf[t, env_idx]).long().to(self.device)
+                    # old_log_prob_t = th.as_tensor(log_probs_buf[t, env_idx]).to(self.device)
+                    # advantage_t = th.as_tensor(advantages_buf[t, env_idx]).to(self.device)
+                    # return_t = th.as_tensor(returns_buf[t, env_idx]).to(self.device)
+                    # old_value_t = th.as_tensor(values_buf[t, env_idx]).to(self.device)
                     action_t = th.as_tensor(actions_buf[t, env_idx]).long().to(self.device)
-                    old_log_prob_t = th.as_tensor(log_probs_buf[t, env_idx]).to(self.device)
-                    advantage_t = th.as_tensor(advantages_buf[t, env_idx]).to(self.device)
-                    return_t = th.as_tensor(returns_buf[t, env_idx]).to(self.device)
-                    old_value_t = th.as_tensor(values_buf[t, env_idx]).to(self.device)
-
+                    old_log_prob_t = th.as_tensor(log_probs_buf[t, env_idx]).to(self.device).view(-1)
+                    advantage_t = th.as_tensor(advantages_buf[t, env_idx]).to(self.device).view(-1)
+                    return_t = th.as_tensor(returns_buf[t, env_idx]).to(self.device).view(-1)
+                    old_value_t = th.as_tensor(values_buf[t, env_idx]).to(self.device).view(-1)
                     # forward
                     x = self.policy.encoder(obs_t)
                     h, m = self.policy.lmu_cell(x, h, m)
@@ -338,9 +342,9 @@ class LMUPPO(PPO):
                     logits = self.policy.actor(h)
                     dist = th.distributions.Categorical(logits=logits)
 
-                    log_prob = dist.log_prob(action_t)
-                    entropy = dist.entropy()
-                    value = self.policy.critic(h).squeeze(-1)
+                    log_prob = dist.log_prob(action_t).view(-1)
+                    entropy = dist.entropy().view(-1)
+                    value = self.policy.critic(h).view(-1)
 
                     log_probs_list.append(log_prob)
                     old_log_probs_list.append(old_log_prob_t)

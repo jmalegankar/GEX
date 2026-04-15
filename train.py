@@ -42,7 +42,7 @@ THETA = {
 # memory_size  (d): Legendre polynomial degree — more = finer temporal resolution
 ARCH = {
     "MemoryS5":  dict(hidden_size=64,  memory_size=32),
-    "MemoryS7":  dict(hidden_size=64,  memory_size=32),
+    "MemoryS7":  dict(hidden_size=64,  memory_size=64),
     "MemoryS9":  dict(hidden_size=128, memory_size=48),
     "MemoryS11": dict(hidden_size=128, memory_size=64),
     "MemoryS13": dict(hidden_size=128, memory_size=64),
@@ -63,11 +63,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env",         default="MemoryS7", choices=list(ENV_IDS))
     parser.add_argument("--seed",        type=int, default=0)
-    parser.add_argument("--n_envs",      type=int, default=8)
+    parser.add_argument("--n_envs",      type=int, default=4)
     parser.add_argument("--total_steps", type=int, default=2_000_000)
-    parser.add_argument("--n_steps",     type=int, default=512)
+    parser.add_argument("--n_steps",     type=int, default=128)
     parser.add_argument("--batch_size",  type=int, default=256)
-    parser.add_argument("--n_epochs",    type=int, default=4)
+    parser.add_argument("--n_epochs",    type=int, default=3)
     parser.add_argument("--lr",          type=float, default=1e-4)
     parser.add_argument("--tb_log",      default="runs/lmu_ppo")
     parser.add_argument("--device",      default="auto")
@@ -99,8 +99,8 @@ def main():
         memory_size=arch["memory_size"],
         theta=theta,
         # Credit assignment
-        gamma=0.999,
-        gae_lambda=0.99,
+        gamma=0.995,
+        gae_lambda=0.98,
         # PPO
         n_steps=args.n_steps,
         batch_size=args.batch_size,
