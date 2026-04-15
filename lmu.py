@@ -1,71 +1,90 @@
 """
-Legendre Memory Unit (LMU) — PyTorch implementation
-Based on: Voelker et al., NeurIPS 2019
+Multichannel Legendre Memory Unit (LMU) — PyTorch implementation.
 
+Core idea (S4-style):
+    Run C independent scalar LMUs in parallel, one per input feature,
+    sharing the same frozen (Ā, B̄) matrices.
+
+    Old (scalar bottleneck):
+        u : (B, 1)     — all C features funnel through one number
+        m : (B, d)     — d Legendre coeffs for the whole vector
+
+    New (multichannel):
+        u : (B, C)     — one scalar per feature channel
+        m : (B, d, C)  — d Legendre coeffs × C independent channels
+
+Equations per channel c  (Voelker 2019, Eq. 4 + 6 + 7):
+    u_c  = eₓ[c]·x_c  +  Eₕ[:,c]·h  +  eₘ·m[:,c]    scalar encoding
+    m_c' = Ā m_c + B̄ u_c                               linear memory update
+    y    = Cₚᵣₒⱼ·m'                                    per-channel readout
+    h'   = tanh(Wₓ(x) + Wₕ(h) + Wₘ(y))               shared nonlinear hidden
+
+Vectorised shapes:
+    u    = x⊙eₓ  +  hEₕ  +  einsum('d,bdc→bc', eₘ, m)   (B, C)
+    m'   = einsum('ij,bjc→bic', Ā, m)  +  B̄·u.unsqueeze(1)  (B, d, C)
+    y    = einsum('d,bdc→bc', Cₚᵣₒⱼ, m')                    (B, C)
+    h'   = tanh(Wₓ(x) + Wₕ(h) + Wₘ(y))                     (B, n)
+
+Broadcasting proof for memory update:
+    B̄         : (d, 1)  → padded by PyTorch to (1, d, 1)
+    u.unsqueeze(1) : (B, 1, C)
+    product        : (B, d, C)  element [b,i,c] = B̄[i] · u[b,c]  ✓
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 from scipy.signal import cont2discrete
+from typing import Tuple
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def get_AB(d: int, theta: float = 1.0):
+def get_AB(d: int, theta: float) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Construct the continuous-time A ∈ ℝ^{d×d}, B ∈ ℝ^{d×1} matrices
-    from the Padé approximant of an ideal delay line (paper eq. 2),
-    then discretise via zero-order hold (ZOH) with dt=1.
+    Build continuous-time (A, B) from Voelker 2019 Eq. 2, then ZOH-discretise.
 
-    Scalar u_t is intentional: the Legendre basis decomposition depends
-    on the linear dynamics of A, B being preserved exactly. Expanding to
-    vector u_t via repeated B columns collapses to a scalar sum and adds
-    no memory capacity — use larger d or multiple cells instead.
+    A_ij = (2i+1) * { -1           if i < j
+                    { (-1)^{i-j+1}  if i ≥ j
 
-    Args:
-        d     : memory dimension
-        theta : window length (time-steps); set to episode horizon or tuned
+    B_i  = (2i+1) * (-1)^i
 
-    Returns:
-        A_d, B_d : discretised numpy arrays
+    ZOH via scipy.signal.cont2discrete gives exact Ā, B̄ for dt=1.
+    Returns float32 arrays of shape (d, d) and (d, 1).
     """
     Q = np.arange(d, dtype=float)
-    R = (2 * Q + 1)[:, None]                              # (d, 1)
-    j, i = np.meshgrid(Q, Q)
+    R = (2 * Q + 1)[:, None]          # (d, 1)
+    j, i = np.meshgrid(Q, Q)          # i=row, j=col  (both (d,d))
 
-    # Continuous A
     A = R * np.where(i < j, -1.0, (-1.0) ** (i - j + 1))
     A /= theta
-
-    # Continuous B (scalar input — preserved from paper)
-    B = R * ((-1.0) ** Q)[:, None]
+    B = R * ((-1.0) ** Q)[:, None]    # (d, 1)
     B /= theta
 
-    # ZOH discretisation via scipy (only runs once at init)
-    C = np.zeros((1, d))
-    D = np.zeros((1,))
-    A_d, B_d, _, _, _ = cont2discrete((A, B, C, D), dt=1.0, method="zoh")
-    return A_d.astype(np.float32), B_d.astype(np.float32)
+    # ZOH: Ā = expm(A·dt),  B̄ = Ā (A⁻¹ B - A⁻¹ B e^{-Adt})  (computed by scipy)
+    C_dummy = np.zeros((1, d))
+    D_dummy = np.zeros((1,))
+    Ad, Bd, _, _, _ = cont2discrete((A, B, C_dummy, D_dummy), dt=1.0, method='zoh')
+    return Ad.astype(np.float32), Bd.astype(np.float32)
 
-
-# ---------------------------------------------------------------------------
-# LMU Cell  (single time-step, for use in RL rollout loops)
-# ---------------------------------------------------------------------------
 
 class LMUCell(nn.Module):
     """
-    One step of the LMU:
+    One step of the multichannel LMU.
 
-        u_t = e_x x_t + e_h h_{t-1} + e_m m_{t-1}   (scalar per sample)
-        m_t = Ā m_{t-1} + B̄ u_t                      (linear memory update)
-        h_t = tanh(W_x x_t + W_h h_{t-1} + W_m m_t)  (nonlinear hidden state)
+    Args:
+        input_size  (C): encoder output dim — one independent channel per feature
+        hidden_size (n): nonlinear hidden state units
+        memory_size (d): Legendre polynomial degree (more = finer temporal resolution)
+        theta          : memory window length in time-steps
+                         Set to ~max episode length.  Error ∝ θω/d.
 
-    State tuple: (h, m)
-      h : (batch, hidden_size)
-      m : (batch, memory_size)
+    State shapes:
+        h : (B, n)      shared nonlinear hidden state
+        m : (B, d, C)   d Legendre coefficients × C independent channels
+
+    Hyperparameter guidance:
+        theta  — MemoryS7: ~100,  MemoryS13: ~200  (cover full episode)
+        d      — 32–64 (32 is a reasonable start; increase if memory is shallow)
+        n      — 64–128 (controls nonlinear capacity, independent of d)
     """
 
     def __init__(
@@ -73,141 +92,172 @@ class LMUCell(nn.Module):
         input_size:  int,
         hidden_size: int,
         memory_size: int,
-        theta:       float = 1.0,
+        theta:       float,
     ):
         super().__init__()
-        self.input_size  = input_size
-        self.hidden_size = hidden_size   # n  — nonlinear units
-        self.memory_size = memory_size   # d  — Legendre coefficients
+        self.input_size  = input_size   # C
+        self.hidden_size = hidden_size  # n
+        self.memory_size = memory_size  # d
 
-        # Fixed (non-trainable) memory matrices
-        A, B = get_AB(memory_size, theta)
-        self.register_buffer("A", torch.from_numpy(A))   # (d, d)
-        self.register_buffer("B", torch.from_numpy(B))   # (d, 1)
+        # ── Fixed memory matrices (frozen, not trained) ───────────────────
+        # Ā: (d, d)   B̄: (d, 1)
+        # These encode the Legendre projection; training them destroys the
+        # theoretical guarantees (Voelker 2019 §3).
+        Ad, Bd = get_AB(memory_size, theta)
+        self.register_buffer('A', torch.from_numpy(Ad))   # (d, d)
+        self.register_buffer('B', torch.from_numpy(Bd))   # (d, 1)
 
-        # Encoding vectors — project inputs into the scalar u written to memory
-        self.e_x = nn.Linear(input_size,  1, bias=False)
-        self.e_h = nn.Linear(hidden_size, 1, bias=False)
-        self.e_m = nn.Linear(memory_size, 1, bias=False)
+        # ── Encoding: (x, h, m) → u per channel ──────────────────────────
 
-        # Hidden state kernels
+        # eₓ ∈ ℝ^C — one scalar weight per input channel
+        # u_from_x[b, c] = eₓ[c] * x[b, c]
+        self.e_x = nn.Parameter(torch.empty(input_size))
+
+        # Eₕ ∈ ℝ^{n×C} — hidden state → per-channel scalar
+        # u_from_h[b, c] = Σ_i Eₕ[c, i] * h[b, i]  (Linear(n→C, no bias))
+        self.E_h = nn.Linear(hidden_size, input_size, bias=False)
+
+        # eₘ ∈ ℝ^d — memory readout for encoding, shared across channels
+        # u_from_m[b, c] = Σ_i eₘ[i] * m[b, i, c]
+        # MUST be initialised to 0 (prevents unstable memory feedback at init,
+        # per Voelker 2019 §3: "memory's feedback encoders initialised to eₘ=0")
+        self.e_m = nn.Parameter(torch.zeros(memory_size))
+
+        # ── Memory readout for hidden update ─────────────────────────────
+        # Cₚᵣₒⱼ ∈ ℝ^d — contracts d-dim memory → scalar per channel
+        # Equivalent to the C output matrix in SSM notation: y = C m
+        # y[b, c] = Σ_i Cₚᵣₒⱼ[i] * m_new[b, i, c]
+        self.C_proj = nn.Parameter(torch.empty(memory_size))
+
+        # ── Hidden state kernels ─────────────────────────────────────────
+        # Wₓ: C → n  (input → hidden)
+        # Wₕ: n → n  (hidden recurrence, no bias to avoid double-counting)
+        # Wₘ: C → n  (memory readout y → hidden)
         self.W_x = nn.Linear(input_size,  hidden_size, bias=True)
         self.W_h = nn.Linear(hidden_size, hidden_size, bias=False)
-        self.W_m = nn.Linear(memory_size, hidden_size, bias=False)
+        self.W_m = nn.Linear(input_size,  hidden_size, bias=False)
 
         self._reset_parameters()
 
     def _reset_parameters(self):
-        # e_m = 0: prevents memory feedback at init
-        nn.init.zeros_(self.e_m.weight)
-        # Xavier normal for hidden kernels (per paper §3)
+        # eₓ: LeCun uniform (fan_in=1 per element → U[-1, 1])
+        nn.init.uniform_(self.e_x, -1.0, 1.0)
+        # Eₕ: Xavier normal (per Voelker 2019 §3)
+        nn.init.xavier_normal_(self.E_h.weight)
+        # e_m already zeros from __init__; do not reinit here
+        # Cₚᵣₒⱼ: uniform ± 1/√d  (small to not dominate at init)
+        nn.init.uniform_(self.C_proj,
+                         -1.0 / self.memory_size ** 0.5,
+                          1.0 / self.memory_size ** 0.5)
+        # Hidden kernels: Xavier normal (per paper §3)
         for layer in (self.W_x, self.W_h, self.W_m):
             nn.init.xavier_normal_(layer.weight)
-        # LeCun uniform for encoding vectors (fan_in = weight columns)
-        for layer in (self.e_x, self.e_h):
-            fan_in = layer.weight.shape[1]
-            nn.init.uniform_(
-                layer.weight,
-                -1.0 / fan_in ** 0.5,
-                 1.0 / fan_in ** 0.5,
-            )
+        nn.init.zeros_(self.W_x.bias)
 
     def forward(
         self,
-        x:      torch.Tensor,   # (batch, input_size)
-        h_prev: torch.Tensor,   # (batch, hidden_size)
-        m_prev: torch.Tensor,   # (batch, memory_size)
-    ):
-        # Scalar signal written to memory per sample
-        u = self.e_x(x) + self.e_h(h_prev) + self.e_m(m_prev)  # (batch, 1)
+        x:      torch.Tensor,   # (B, C)
+        h_prev: torch.Tensor,   # (B, n)
+        m_prev: torch.Tensor,   # (B, d, C)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            h_new : (B, n)
+            m_new : (B, d, C)
+        """
 
-        # Linear memory update  m_t = Ā m_{t-1} + B̄ u_t
-        m = m_prev @ self.A.T + u * self.B.T                    # (batch, d)
+        # ── Step 1: compute u ∈ (B, C) ───────────────────────────────────
+        # Each channel c gets an independent scalar:
+        #   u_c = eₓ[c]·x_c  +  Eₕ[:,c]·h  +  eₘ·m[:,c]
 
-        # Nonlinear hidden update
-        h = torch.tanh(self.W_x(x) + self.W_h(h_prev) + self.W_m(m))  # (batch, n)
+        u_x = x * self.e_x                                    # (B, C) element-wise
+        u_h = self.E_h(h_prev)                                # (B, C) via Linear(n→C)
+        u_m = torch.einsum('d,bdc->bc', self.e_m, m_prev)    # (B, C) dot over d-dim
+        u   = u_x + u_h + u_m                                 # (B, C)
 
-        return h, m, u
+        # ── Step 2: Legendre memory update ───────────────────────────────
+        # m'[b,i,c] = Σ_j Ā[i,j] m[b,j,c]  +  B̄[i] · u[b,c]
+        #
+        # einsum('ij,bjc->bic'): matrix-multiply Ā over the d dimension,
+        #   independently for every batch element b and channel c.
+        # B̄: (d, 1), u.unsqueeze(1): (B, 1, C)
+        # PyTorch pads B̄ to (1, d, 1) → broadcast to (B, d, C)  ✓
+        Am    = torch.einsum('ij,bjc->bic', self.A, m_prev)   # (B, d, C)
+        Bu    = self.B * u.unsqueeze(1)                        # (B, d, C)
+        m_new = Am + Bu                                        # (B, d, C)
 
-    def initial_state(self, batch_size: int, device: torch.device):
-        """Return zeroed (h, m) state tuple."""
-        h = torch.zeros(batch_size, self.hidden_size, device=device)
-        m = torch.zeros(batch_size, self.memory_size, device=device)
+        # ── Step 3: memory readout → y ∈ (B, C) ─────────────────────────
+        # y[b,c] = Σ_i Cₚᵣₒⱼ[i] · m_new[b,i,c]
+        # (SSM C-matrix: maps d-dim Legendre state → scalar per channel)
+        y = torch.einsum('d,bdc->bc', self.C_proj, m_new)     # (B, C)
+
+        # ── Step 4: nonlinear hidden update ──────────────────────────────
+        # h' = tanh(Wₓ x + Wₕ h + Wₘ y)
+        h_new = torch.tanh(
+            self.W_x(x) + self.W_h(h_prev) + self.W_m(y)
+        )                                                      # (B, n)
+
+        return h_new, m_new
+
+    def initial_state(
+        self, n: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Zero initial state.  n = batch_size or n_envs."""
+        h = torch.zeros(n, self.hidden_size, device=device)
+        m = torch.zeros(n, self.memory_size, self.input_size, device=device)
         return h, m
 
 
-# ---------------------------------------------------------------------------
-# LMU  (sequence wrapper — useful for offline / supervised use)
-# ---------------------------------------------------------------------------
-
 class LMU(nn.Module):
     """
-    Runs LMUCell over a full sequence.
-
-    Input  : x  (batch, seq_len, input_size)
-    Output : out (batch, seq_len, hidden_size),  final state (h, m)
+    Sequence wrapper around LMUCell.
+    Input  : x  (B, T, C)
+    Output : out (B, T, n),  final_state (h, m)
     """
-
-    def __init__(
-        self,
-        input_size:  int,
-        hidden_size: int,
-        memory_size: int,
-        theta:       float = 1.0,
-    ):
+    def __init__(self, input_size, hidden_size, memory_size, theta):
         super().__init__()
         self.cell = LMUCell(input_size, hidden_size, memory_size, theta)
 
-    @property
-    def hidden_size(self):
-        return self.cell.hidden_size
-
-    @property
-    def memory_size(self):
-        return self.cell.memory_size
-
-    def forward(self, x: torch.Tensor, state=None):
+    def forward(
+        self,
+        x:     torch.Tensor,
+        state: Tuple[torch.Tensor, torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, T, _ = x.shape
-        device   = x.device
-
-        if state is None:
-            h, m = self.cell.initial_state(B, device)
-        else:
-            h, m = state
-
-        outputs = []
+        h, m = state if state is not None else self.cell.initial_state(B, x.device)
+        outs = []
         for t in range(T):
             h, m = self.cell(x[:, t], h, m)
-            outputs.append(h)
+            outs.append(h)
+        return torch.stack(outs, dim=1), (h, m)
 
-        return torch.stack(outputs, dim=1), (h, m)
 
+# if __name__ == '__main__':
+#     torch.manual_seed(0)
+#     B, C, n, d = 4, 64, 128, 32
+#     theta = 100.0  # MemoryS7; use 200 for MemoryS13
 
-# ---------------------------------------------------------------------------
-# Quick sanity check
-# ---------------------------------------------------------------------------
+#     cell = LMUCell(C, n, d, theta)
 
-if __name__ == "__main__":
-    torch.manual_seed(0)
-    # device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    B, T, input_size = 4, 64, 16
-    hidden_size      = 64
-    memory_size      = 32
-    theta            = float(T)   # window = full sequence length
+#     # Sanity: spectral radius of Ā must be < 1 for stability
+#     rho = torch.linalg.eigvals(cell.A).abs().max().item()
+#     assert rho < 1.0, f"Unstable Ā: spectral radius {rho:.4f}"
+#     print(f"Ā spectral radius: {rho:.6f}  ✓ stable")
 
-    model = LMU(input_size, hidden_size, memory_size, theta=theta).to(device)
-    x     = torch.randn(B, T, input_size, device=device)
+#     # A, B must be non-trainable
+#     assert not cell.A.requires_grad and not cell.B.requires_grad
 
-    out, (h_final, m_final) = model(x)
+#     h, m = cell.initial_state(B, torch.device('cpu'))
+#     x = torch.randn(B, C)
+#     h_new, m_new = cell(x, h, m)
+#     assert h_new.shape == (B, n),    f"h shape: {h_new.shape}"
+#     assert m_new.shape == (B, d, C), f"m shape: {m_new.shape}"
+#     print(f"h: {tuple(h_new.shape)}  m: {tuple(m_new.shape)}  ✓")
 
-    print(f"Input  : {tuple(x.shape)}")
-    print(f"Output : {tuple(out.shape)}")
-    print(f"h_final: {tuple(h_final.shape)}")
-    print(f"m_final: {tuple(m_final.shape)}")
-    print(f"A norm : {model.cell.A.norm():.4f}  (should be < 1 for stable memory)")
-
-    # Check A, B are frozen
-    assert not model.cell.A.requires_grad, "A must not be trainable"
-    assert not model.cell.B.requires_grad, "B must not be trainable"
-    print("All checks passed.")
+#     # Sequence wrapper
+#     model = LMU(C, n, d, theta)
+#     seq = torch.randn(B, 50, C)
+#     out, (h_f, m_f) = model(seq)
+#     assert out.shape == (B, 50, n)
+#     print(f"LMU sequence output: {tuple(out.shape)}  ✓")
+#     print("All checks passed.")

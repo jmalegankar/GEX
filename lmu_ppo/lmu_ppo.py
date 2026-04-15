@@ -129,6 +129,7 @@ class LMUPPO(PPO):
             action_space=self.action_space,
             hidden_size=self.hidden_size,
             memory_size=self.memory_size,
+            encoder_dim=self.encoder_dim,
             device=self.device,
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
@@ -161,18 +162,6 @@ class LMUPPO(PPO):
     # ------------------------------------------------------------------
     # Rollout collection
     # ------------------------------------------------------------------
-
-
-
-    def _ball_visible(self, obs):
-        img = obs["image"]
-        if img.shape[1] == 3:   # (B,C,H,W)
-            obj = img[:, 0]
-        else:
-            obj = img[..., 0]
-        return (obj == 6).any(axis=(1,2))  # ball only
-
-
     def collect_rollouts(
         self,
         env,
@@ -186,22 +175,12 @@ class LMUPPO(PPO):
         rollout_buffer.reset()
         callback.on_rollout_start()
 
-        # buffers
-        buf_s1, buf_s3, buf_s4, buf_s5 = [], [], [], []
-        buf_ball = []
-
-        prev_logits = [None] * self.n_envs
-        prev_values = [None] * self.n_envs
-        prev_m      = None
-
-        rollout_idx = getattr(self, "_rollout_idx", 0)
-
         n_steps = 0
         while n_steps < n_rollout_steps:
 
             with th.no_grad():
                 obs_t = obs_as_tensor(self._last_obs, self.device)
-                actions, values, log_probs, h_new, m_new, u_t, logits_t = self.policy.forward(
+                actions, values, log_probs, h_new, m_new, logits_t = self.policy.forward(
                     obs_t, self._lmu_h, self._lmu_m
                 )
 
@@ -209,61 +188,6 @@ class LMUPPO(PPO):
             new_obs, rewards, dones, infos = env.step(actions_np)
             self.num_timesteps += env.num_envs
 
-            # ---------------- S1 ----------------
-            B = self.policy.lmu_cell.B
-            Bu = u_t * B.T
-            s1_raw = Bu.pow(2).sum(-1).mean().item()
-
-            # ---------------- S3 ----------------
-            if prev_m is not None:
-                dm = m_new - prev_m
-                denom = (prev_m.pow(2).sum(-1) + 1e-8)
-                s3_raw = (dm.pow(2).sum(-1) / denom).mean().item()
-            else:
-                s3_raw = 0.0
-
-            # ---------------- S4 (TRUE KL) ----------------
-            s4_vals = []
-            for ei in range(self.n_envs):
-                if prev_logits[ei] is not None:
-                    pi_t   = Categorical(logits=logits_t[ei:ei+1])
-                    pi_tm1 = Categorical(logits=prev_logits[ei])
-                    s4_vals.append(kl_divergence(pi_t, pi_tm1).item())
-
-            s4_raw = float(np.mean(s4_vals)) if s4_vals else 0.0
-
-            # ---------------- S5 ----------------
-            s5_vals = []
-            for ei in range(self.n_envs):
-                if prev_values[ei] is not None:
-                    s5_vals.append(abs(values[ei].item() - prev_values[ei]))
-
-            s5_raw = float(np.mean(s5_vals)) if s5_vals else 0.0
-
-            # ---------------- GT ----------------
-            buf_ball.append(self._ball_visible(self._last_obs).astype(np.float32))
-
-            # ---------------- STORE ----------------
-            buf_s1.append(s1_raw)
-            buf_s3.append(s3_raw)
-            buf_s4.append(s4_raw)
-            buf_s5.append(s5_raw)
-
-            # ---------------- UPDATE PREV ----------------
-            logits_cpu = logits_t.detach().cpu()
-            values_cpu = values.detach().cpu().numpy()
-
-            for ei in range(self.n_envs):
-                if dones[ei]:
-                    prev_logits[ei] = None
-                    prev_values[ei] = None
-                else:
-                    prev_logits[ei] = logits_cpu[ei:ei+1]
-                    prev_values[ei] = values_cpu[ei]
-
-            prev_m = m_new
-
-            # ---------------- PPO STUFF ----------------
             callback.update_locals(locals())
             if not callback.on_step():
                 return False
@@ -293,24 +217,6 @@ class LMUPPO(PPO):
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
-        # ---------------- SAVE ----------------
-        os.makedirs("runs/surprise_logs", exist_ok=True)
-        path = f"runs/surprise_logs/rollout_{rollout_idx:06d}.npz"
-
-        np.savez_compressed(
-            path,
-            s1=np.array(buf_s1),
-            s3=np.array(buf_s3),
-            s4=np.array(buf_s4),
-            s5=np.array(buf_s5),
-            ball_visible=np.array(buf_ball),
-            timestep=self.num_timesteps,
-        )
-
-        self._rollout_idx = rollout_idx + 1
-        print(f"[Surprise] Saved rollout → {path}")
-
-        # ---------------- RETURNS ----------------
         with th.no_grad():
             obs_t = obs_as_tensor(new_obs, self.device)
             values = self.policy.predict_values(obs_t, self._lmu_h, self._lmu_m)
@@ -320,9 +226,6 @@ class LMUPPO(PPO):
         callback.on_rollout_end()
         return True
 
-    # ------------------------------------------------------------------
-    # PPO update
-    # ------------------------------------------------------------------
   # ------------------------------------------------------------------
     # PPO update
     # ------------------------------------------------------------------
@@ -364,7 +267,7 @@ class LMUPPO(PPO):
             m[dones] = 0.0
 
         with th.no_grad():
-            actions, _, _, h_new, m_new, u_new, logits = self.policy.forward(obs_tensor, h, m)
+            actions, _, _, h_new, m_new, logits_t = self.policy.forward(obs_tensor, h, m)
 
         actions = actions.cpu().numpy()
 

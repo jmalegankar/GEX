@@ -1,14 +1,14 @@
 """
-Stage 1: LMU-PPO baseline on MiniGrid-MemoryS5/S7.
+LMU-PPO baseline on MiniGrid-Memory envs.
 
 Run:
-    python train.py --env MemoryS5 --seed 0
-    python train.py --env MemoryS7 --seed 0
+    python train.py --env MemoryS7  --seed 0
+    python train.py --env MemoryS13 --seed 0
 """
 
 import argparse
 import gymnasium as gym
-import minigrid
+import minigrid  # noqa: F401 — registers MiniGrid envs
 from gymnasium.wrappers import FilterObservation
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecTransposeImage
 from stable_baselines3.common.monitor import Monitor
@@ -18,18 +18,34 @@ from lmu_ppo.lmu_ppo import LMUPPO
 
 
 ENV_IDS = {
+    "MemoryS5":  "MiniGrid-MemoryS5-v0",
     "MemoryS7":  "MiniGrid-MemoryS7-v0",
     "MemoryS9":  "MiniGrid-MemoryS9-v0",
     "MemoryS11": "MiniGrid-MemoryS11-v0",
     "MemoryS13": "MiniGrid-MemoryS13-v0",
 }
 
-# Approximate episode length for each env → used as theta
+# theta = expected episode memory horizon (steps).
+# Reconstruction error ∝ theta*omega/d, so theta should cover the full
+# episode — the agent may need to remember the ball from step 1 to the end.
+# MiniGrid max_steps ≈ 5*(size+2) for Memory envs.
 THETA = {
-    "MemoryS7":  50.0,
-    "MemoryS9":  75.0,
-    "MemoryS11": 100.0,
-    "MemoryS13": 150.0,
+    "MemoryS5":   64,
+    "MemoryS7":  100,
+    "MemoryS9":  120,
+    "MemoryS11": 160,
+    "MemoryS13": 200,
+}
+
+# Per-env architecture: harder envs get more capacity.
+# hidden_size (n): nonlinear processing units
+# memory_size  (d): Legendre polynomial degree — more = finer temporal resolution
+ARCH = {
+    "MemoryS5":  dict(hidden_size=64,  memory_size=32),
+    "MemoryS7":  dict(hidden_size=64,  memory_size=32),
+    "MemoryS9":  dict(hidden_size=128, memory_size=48),
+    "MemoryS11": dict(hidden_size=128, memory_size=64),
+    "MemoryS13": dict(hidden_size=128, memory_size=64),
 }
 
 
@@ -45,21 +61,28 @@ def make_env(env_id: str, seed: int, rank: int = 0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env",        default="MemoryS7", choices=list(ENV_IDS))
-    parser.add_argument("--seed",       type=int, default=0)
-    parser.add_argument("--n_envs",     type=int, default=8)
-    parser.add_argument("--total_steps",type=int, default=2_000_000)
-    parser.add_argument("--n_steps",    type=int, default=512)   # steps per env per rollout
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--tb_log",     default="runs/lmu_ppo")
+    parser.add_argument("--env",         default="MemoryS7", choices=list(ENV_IDS))
+    parser.add_argument("--seed",        type=int, default=0)
+    parser.add_argument("--n_envs",      type=int, default=8)
+    parser.add_argument("--total_steps", type=int, default=2_000_000)
+    parser.add_argument("--n_steps",     type=int, default=512)
+    parser.add_argument("--batch_size",  type=int, default=256)
+    parser.add_argument("--n_epochs",    type=int, default=4)
+    parser.add_argument("--lr",          type=float, default=3e-4)
+    parser.add_argument("--tb_log",      default="runs/lmu_ppo")
+    parser.add_argument("--device",      default="auto")
     args = parser.parse_args()
 
     env_id = ENV_IDS[args.env]
+    arch   = ARCH[args.env]
+    theta  = THETA[args.env]
 
     train_env = VecTransposeImage(SubprocVecEnv([
         make_env(env_id, args.seed, i) for i in range(args.n_envs)
     ]))
-    eval_env = VecTransposeImage(DummyVecEnv([make_env(env_id, args.seed + 1000)]))
+    eval_env = VecTransposeImage(DummyVecEnv([
+        make_env(env_id, args.seed + 1000)
+    ]))
 
     eval_cb = EvalCallback(
         eval_env,
@@ -70,20 +93,20 @@ def main():
 
     model = LMUPPO(
         env=train_env,
-        # Credit assignment — the whole point of Stage 1
-        gamma=0.999,
-        gae_lambda=0.95,
         # Architecture
         encoder_dim=64,
-        hidden_size=64,
-        memory_size=32,
-        theta=THETA[args.env],
+        hidden_size=arch["hidden_size"],
+        memory_size=arch["memory_size"],
+        theta=theta,
+        # Credit assignment
+        gamma=0.999,
+        gae_lambda=0.99,
         # PPO
         n_steps=args.n_steps,
         batch_size=args.batch_size,
-        n_epochs=4,
-        lr=3e-4,
-        ent_coef=0.01,
+        n_epochs=args.n_epochs,
+        lr=args.lr,
+        ent_coef=0.001,
         vf_coef=0.5,
         max_grad_norm=0.5,
         clip_range=0.2,
@@ -91,12 +114,16 @@ def main():
         tensorboard_log=args.tb_log,
         verbose=1,
         seed=args.seed,
-        device="auto",
+        device=args.device,
     )
 
-    print(f"\nTraining LMU-PPO on {env_id}  |  seed={args.seed}")
-    print(f"  hidden={model.hidden_size}  memory={model.memory_size}  theta={model.theta}")
-    print(f"  gamma={model.gamma}  n_envs={args.n_envs}  total_steps={args.total_steps:,}\n")
+    total_params = sum(p.numel() for p in model.policy.parameters())
+    print(f"\nLMU-PPO  ·  {env_id}  ·  seed={args.seed}")
+    print(f"  encoder_dim={model.encoder_dim}  hidden={model.hidden_size}"
+          f"  memory={model.memory_size}  theta={model.theta}")
+    print(f"  gamma={model.gamma}  n_envs={args.n_envs}"
+          f"  total_steps={args.total_steps:,}")
+    print(f"  policy params: {total_params:,}\n")
 
     model.learn(
         total_timesteps=args.total_steps,
@@ -105,7 +132,10 @@ def main():
         progress_bar=True,
     )
 
-    model.save(f"lmu_ppo_{args.env}_s{args.seed}")
+    save_path = f"lmu_ppo_{args.env}_s{args.seed}"
+    model.save(save_path)
+    print(f"\nSaved → {save_path}")
+
     train_env.close()
     eval_env.close()
 
