@@ -64,6 +64,8 @@ class LMUPPO(PPO):
         hidden_size:        int = 64,
         memory_size:        int = 32,
         theta:              float = 50.0,
+        chunk_len:         int = 16,           # for TBPTT; no effect if chunk_len >= n_steps
+        n_chunks_per_batch: int = 16,           # for TBPTT; total batch size = chunk_len * n_chunks_per_batch
         # SB3 plumbing
         tensorboard_log:    Optional[str] = None,
         verbose:            int = 1,
@@ -75,6 +77,8 @@ class LMUPPO(PPO):
         self.hidden_size  = hidden_size
         self.memory_size  = memory_size
         self.theta        = theta
+        self.chunk_len    = chunk_len
+        self.n_chunks_per_batch = n_chunks_per_batch
 
         # SB3's PPO.__init__ calls _setup_model at the end — we pass a dummy
         # policy string so it doesn't crash before we override _setup_model.
@@ -83,7 +87,7 @@ class LMUPPO(PPO):
             env=env,
             learning_rate=lr,
             n_steps=n_steps,
-            batch_size=batch_size,
+            batch_size=n_chunks_per_batch * chunk_len,
             n_epochs=n_epochs,
             gamma=gamma,
             gae_lambda=gae_lambda,
@@ -130,6 +134,7 @@ class LMUPPO(PPO):
             hidden_size=self.hidden_size,
             memory_size=self.memory_size,
             encoder_dim=self.encoder_dim,
+            chunk_len=self.chunk_len, 
             device=self.device,
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
@@ -144,6 +149,7 @@ class LMUPPO(PPO):
         # LMU state per env — initialised in _setup_learn
         self._lmu_h: Optional[th.Tensor] = None
         self._lmu_m: Optional[th.Tensor] = None
+        
 
     # ------------------------------------------------------------------
     # Learn setup  (called at the start of .learn())
@@ -277,10 +283,11 @@ class LMUPPO(PPO):
 
         return actions, (h_new, m_new)
     
+
     def train(self) -> None:
         self.policy.set_training_mode(True)
 
-        # Update learning rate
+        # Anneal lr and clip_range according to remaining fraction of training
         lr = self.lr_schedule(self._current_progress_remaining)
         for pg in self.policy.optimizer.param_groups:
             pg["lr"] = lr
@@ -289,124 +296,100 @@ class LMUPPO(PPO):
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
 
+        # Metrics accumulated across all mini-batches this update
         pg_losses, value_losses, entropy_losses = [], [], []
         clip_fractions, approx_kl_divs, grad_norms = [], [], []
 
         continue_training = True
-
-        # 🔥 IMPORTANT: use raw (unflattened) buffer
-        obs_buf = self.rollout_buffer.observations
-        actions_buf = self.rollout_buffer.actions
-        values_buf = self.rollout_buffer.values
-        log_probs_buf = self.rollout_buffer.log_probs
-        advantages_buf = self.rollout_buffer.advantages
-        returns_buf = self.rollout_buffer.returns
-
         for epoch in range(self.n_epochs):
 
-            # 🔥 FULL BPTT: loop over environments
-            for env_idx in range(self.n_envs):
+            # get() shuffles chunks and yields batches of n_chunks_per_batch.
+            # Each batch is a dict of (n_chunks, chunk_len, ...) tensors.
+            for batch in self.rollout_buffer.get(self.n_chunks_per_batch):
+                # Shapes coming out of the buffer:
+                #   batch.observations    : dict, each value (n_chunks, K, ...)
+                #   batch.actions         : (n_chunks, K)        long
+                #   batch.lmu_h           : (n_chunks, n)        chunk-start h
+                #   batch.lmu_m           : (n_chunks, d, C)     chunk-start m
+                #   batch.episode_starts  : (n_chunks, K)        float32
+                #   batch.advantages      : (n_chunks * K,)      pre-flattened
+                #   batch.returns         : (n_chunks * K,)
+                #   batch.old_values      : (n_chunks * K,)
+                #   batch.old_log_prob    : (n_chunks * K,)
 
-                # init LMU state
-                h, m = self.policy.initial_state(1, self.device)
+                # Re-run K LMU steps with full gradient.
+                # Returns are flattened: (n_chunks * K,)
+                values, log_prob, entropy = self.policy.evaluate_actions(
+                    obs_seq=batch.observations,
+                    lmu_h=batch.lmu_h,
+                    lmu_m=batch.lmu_m,
+                    episode_starts=batch.episode_starts,
+                    actions_seq=batch.actions,
+                )
 
-                policy_loss = 0.0
-                value_loss = 0.0
-                entropy_loss = 0.0
+                # Normalise advantages over this mini-batch (standard PPO trick)
+                advantages = batch.advantages
+                if self.normalize_advantage and len(advantages) > 1:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                log_probs_list = []
-                old_log_probs_list = []
+                # ── Policy loss (clipped PPO surrogate) ───────────────────
+                # ratio = π_θ(a|s) / π_θ_old(a|s)
+                ratio       = th.exp(log_prob - batch.old_log_prob)
+                policy_loss = -th.min(
+                    advantages * ratio,
+                    advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range),
+                ).mean()
 
-                # 🔥 unroll FULL trajectory
-                for t in range(self.n_steps):
-
-                    obs_t = {
-                        k: th.as_tensor(obs_buf[k][t, env_idx]).unsqueeze(0).to(self.device)
-                        for k in obs_buf
-                    }
-
-                    # action_t = th.as_tensor(actions_buf[t, env_idx]).long().to(self.device)
-                    # old_log_prob_t = th.as_tensor(log_probs_buf[t, env_idx]).to(self.device)
-                    # advantage_t = th.as_tensor(advantages_buf[t, env_idx]).to(self.device)
-                    # return_t = th.as_tensor(returns_buf[t, env_idx]).to(self.device)
-                    # old_value_t = th.as_tensor(values_buf[t, env_idx]).to(self.device)
-                    action_t = th.as_tensor(actions_buf[t, env_idx]).long().to(self.device)
-                    old_log_prob_t = th.as_tensor(log_probs_buf[t, env_idx]).to(self.device).view(-1)
-                    advantage_t = th.as_tensor(advantages_buf[t, env_idx]).to(self.device).view(-1)
-                    return_t = th.as_tensor(returns_buf[t, env_idx]).to(self.device).view(-1)
-                    old_value_t = th.as_tensor(values_buf[t, env_idx]).to(self.device).view(-1)
-                    # forward
-                    x = self.policy.encoder(obs_t)
-                    h, m = self.policy.lmu_cell(x, h, m)
-
-                    logits = self.policy.actor(h)
-                    dist = th.distributions.Categorical(logits=logits)
-
-                    log_prob = dist.log_prob(action_t).view(-1)
-                    entropy = dist.entropy().view(-1)
-                    value = self.policy.critic(h).view(-1)
-
-                    log_probs_list.append(log_prob)
-                    old_log_probs_list.append(old_log_prob_t)
-
-                    # PPO ratio
-                    ratio = th.exp(log_prob - old_log_prob_t)
-
-                    # policy loss
-                    policy_loss += -th.min(
-                        advantage_t * ratio,
-                        advantage_t * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                # ── Value loss ────────────────────────────────────────────
+                if self.clip_range_vf is None:
+                    values_pred = values
+                else:
+                    # Optionally clip value predictions to stay near old estimate
+                    values_pred = batch.old_values + th.clamp(
+                        values - batch.old_values, -clip_range_vf, clip_range_vf
                     )
+                value_loss = F.mse_loss(batch.returns, values_pred)
 
-                    # value loss
-                    if self.clip_range_vf is None:
-                        values_pred = value
-                    else:
-                        values_pred = old_value_t + th.clamp(
-                            value - old_value_t, -clip_range_vf, clip_range_vf
-                        )
-
-                    value_loss += F.mse_loss(return_t, values_pred)
-
-                    entropy_loss += -entropy
-
-                # 🔥 normalize over trajectory length
-                policy_loss = policy_loss.mean()
-                value_loss = value_loss.mean()
-                entropy_loss = entropy_loss.mean()
+                # ── Entropy bonus (encourages exploration) ────────────────
+                entropy_loss = -entropy.mean()
 
                 loss = (
                     policy_loss
                     + self.ent_coef * entropy_loss
-                    + self.vf_coef * value_loss
+                    + self.vf_coef  * value_loss
                 )
 
-                # KL for logging
+                # ── Early stopping on approximate KL divergence ───────────
+                # Computed before the gradient step so it reflects the update
+                # we're about to apply, not the one we already applied.
                 with th.no_grad():
-                    log_ratio = th.stack(log_probs_list) - th.stack(old_log_probs_list)
+                    log_ratio     = log_prob - batch.old_log_prob
+                    # Approximation: KL ≈ E[(r - 1) - log r]
                     approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).item()
                     approx_kl_divs.append(approx_kl_div)
 
                 if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
                     continue_training = False
                     if self.verbose >= 1:
-                        print(f"  Early stopping at epoch {epoch}, approx KL={approx_kl_div:.3f}")
+                        print(f"  Early stopping epoch {epoch}, KL={approx_kl_div:.3f}")
                     break
 
-                # backward
+                # ── Gradient step ─────────────────────────────────────────
                 self.policy.optimizer.zero_grad()
                 loss.backward()
-
+                # Clip gradient norm — important with TBPTT since gradients
+                # accumulate over K steps and can be larger than single-step PPO
                 grad_norm = th.nn.utils.clip_grad_norm_(
                     self.policy.parameters(), self.max_grad_norm
                 )
-
                 self.policy.optimizer.step()
 
-                # logging
                 pg_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
+                clip_fractions.append(
+                    th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+                )
                 grad_norms.append(grad_norm.item())
 
             self._n_updates += 1
@@ -422,6 +405,7 @@ class LMUPPO(PPO):
         self.logger.record("train/value_loss",         np.mean(value_losses))
         self.logger.record("train/entropy_loss",       np.mean(entropy_losses))
         self.logger.record("train/approx_kl",          np.mean(approx_kl_divs))
+        self.logger.record("train/clip_fraction",      np.mean(clip_fractions))
         self.logger.record("train/grad_norm",          np.mean(grad_norms))
         self.logger.record("train/explained_variance", explained_var)
         self.logger.record("train/n_updates",          self._n_updates, exclude="tensorboard")

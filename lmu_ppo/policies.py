@@ -1,35 +1,33 @@
 """
-LMU Actor-Critic Policy for MiniGrid.
+LMU Actor-Critic Policy — TBPTT version.
 
-State shapes (multichannel LMU):
-    h : (B, hidden_size)              — flat hidden, fed directly to actor/critic
-    m : (B, memory_size, encoder_dim) — d Legendre coeffs × C channels
+The only method that changes meaningfully is evaluate_actions.
+Previously it ran 1 LMU step per sample.  Now it unrolls K steps,
+with gradient flowing back through the entire chunk.
 
-The actor/critic heads are unchanged — they still read from h (B, n).
-The only architectural difference is that m is now 3D and initial_state
-returns a 3D tensor for m.
+Episode boundary handling:
+    episode_starts[b, k] == 1 means obs[b, k] is the first obs of a new episode.
+    Before processing step k, we zero h and m for any env where this is True.
+    This is equivalent to h = h * (1 - reset), m = m * (1 - reset).
+    Gradient does NOT flow through a reset (the multiplication kills it), so
+    episodes are independent in the backward pass — correct TBPTT behaviour.
 """
 
 import torch
 import torch.nn as nn
 from torch.distributions import Categorical
 from gymnasium import spaces
-from typing import Tuple
+from typing import Dict, Tuple
 
 from lmu import LMUCell
 
 
 class MinigridEncoder(nn.Module):
     """
-    Encoder for MiniGrid Dict observation space.
-
-    'image'    : (C=3, H, W) after VecTransposeImage — three categorical channels:
-                   ch0 = OBJECT_IDX (0–10)
-                   ch1 = COLOR_IDX  (0–5)
-                   ch2 = STATE      (0–2)
-    'direction': Discrete(4)
-
-    Output: (B, out_dim)  — fed as x_t to LMUCell each step.
+    Encoder for MiniGrid Dict obs (unchanged from previous version).
+    image: (B, 3, H, W) categorical channels after VecTransposeImage
+    direction: (B,) Discrete(4)
+    Output: (B, out_dim)
     """
 
     N_OBJECTS    = 11
@@ -72,38 +70,23 @@ class MinigridEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, obs: dict) -> torch.Tensor:
-        img = obs['image'].long()                    # (B, 3, H, W)
-        dir_ = obs['direction'].long().view(-1)      # (B,)
-
-        obj = self.obj_emb(img[:, 0])               # (B, H, W, obj_emb_dim)
-        col = self.col_emb(img[:, 1])
-        sta = self.sta_emb(img[:, 2])
-
-        x = torch.cat([obj, col, sta], dim=-1)       # (B, H, W, tile_dim)
-        x = x.permute(0, 3, 1, 2).contiguous()      # (B, tile_dim, H, W)
-        x = self.cnn(x)                              # (B, cnn_out)
-
-        d = self.dir_emb(dir_)                       # (B, dir_emb_dim)
-        return self.proj(torch.cat([x, d], dim=-1))  # (B, out_dim=C)
+    def forward(self, obs: Dict[str, torch.Tensor]) -> torch.Tensor:
+        img  = obs['image'].long()
+        dir_ = obs['direction'].long().view(-1)
+        obj  = self.obj_emb(img[:, 0])
+        col  = self.col_emb(img[:, 1])
+        sta  = self.sta_emb(img[:, 2])
+        x    = torch.cat([obj, col, sta], dim=-1).permute(0, 3, 1, 2).contiguous()
+        return self.proj(torch.cat([self.cnn(x), self.dir_emb(dir_)], dim=-1))
 
 
 class LMUActorCriticPolicy(nn.Module):
     """
-    MinigridEncoder → LMUCell → actor head + critic head.
+    MinigridEncoder → LMUCell → actor + critic.
 
-    LMU state convention:
-        h : (B, n)      — hidden state BEFORE processing current obs
-        m : (B, d, C)   — memory BEFORE processing current obs
-
-    Storing pre-step states allows re-running the LMU with gradient during
-    the PPO update (exact same computation, gradient flows through the cell).
-
-    Recommended hyperparameters:
-        encoder_dim (C) : 64
-        hidden_size (n) : 64–128
-        memory_size (d) : 32–64
-        theta           : 100 for MemoryS7, 200 for MemoryS13
+    State convention (unchanged):
+        h : (B, n)      stored BEFORE processing current obs
+        m : (B, d, C)   stored BEFORE processing current obs
     """
 
     def __init__(
@@ -111,9 +94,9 @@ class LMUActorCriticPolicy(nn.Module):
         observation_space: spaces.Space,
         action_space:      spaces.Space,
         lr:                float = 3e-4,
-        encoder_dim:       int = 64,    # C — LMU channel dimension
-        hidden_size:       int = 64,    # n
-        memory_size:       int = 32,    # d
+        encoder_dim:       int = 64,
+        hidden_size:       int = 64,
+        memory_size:       int = 32,
         theta:             float = 100.0,
     ):
         super().__init__()
@@ -121,15 +104,12 @@ class LMUActorCriticPolicy(nn.Module):
 
         self.hidden_size = hidden_size
         self.memory_size = memory_size
-        self.encoder_dim = encoder_dim  # needed by buffer for m shape
+        self.encoder_dim = encoder_dim
         n_actions = action_space.n
 
         self.encoder  = MinigridEncoder(observation_space, encoder_dim)
         self.lmu_cell = LMUCell(encoder_dim, hidden_size, memory_size, theta)
-        #                        C             n            d
 
-        # Actor and critic heads read from h: (B, n) — unchanged from before.
-        # The multichannel LMU doesn't change what goes into these heads.
         self.actor  = nn.Linear(hidden_size, n_actions)
         self.critic = nn.Linear(hidden_size, 1)
         nn.init.orthogonal_(self.actor.weight,  gain=0.01)
@@ -139,67 +119,86 @@ class LMUActorCriticPolicy(nn.Module):
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
 
+    # ── rollout (single step, no grad needed) ────────────────────────────────
+
     def forward(
         self,
-        obs:    dict,
+        obs:    Dict[str, torch.Tensor],
         h_prev: torch.Tensor,   # (B, n)
         m_prev: torch.Tensor,   # (B, d, C)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Used during rollout collection (no gradient needed).
-
-        Returns:
-            action   : (B,)
-            value    : (B,)
-            log_prob : (B,)
-            h_new    : (B, n)
-            m_new    : (B, d, C)
-            logits   : (B, n_actions)  — kept for optional KL logging
-        """
-        x = self.encoder(obs)                       # (B, C)
-        h, m = self.lmu_cell(x, h_prev, m_prev)     # (B, n),  (B, d, C)
-
-        logits   = self.actor(h)                    # (B, n_actions)
+        x = self.encoder(obs)
+        h, m     = self.lmu_cell(x, h_prev, m_prev)
+        logits   = self.actor(h)
         dist     = Categorical(logits=logits)
-        action   = dist.sample()                    # (B,)
-        log_prob = dist.log_prob(action)            # (B,)
-        value    = self.critic(h).squeeze(-1)       # (B,)
-
+        action   = dist.sample()
+        log_prob = dist.log_prob(action)
+        value    = self.critic(h).squeeze(-1)
         return action, value, log_prob, h, m, logits
+
+    # ── PPO update (K-step unroll, full gradient) ─────────────────────────────
 
     def evaluate_actions(
         self,
-        obs:     dict,
-        lmu_h:   torch.Tensor,   # (B, n)    stored h_{t-1} from buffer
-        lmu_m:   torch.Tensor,   # (B, d, C) stored m_{t-1} from buffer
-        actions: torch.Tensor,   # (B,) long
+        obs_seq:        Dict[str, torch.Tensor],  # each (B, K, ...)
+        lmu_h:          torch.Tensor,             # (B, n)       chunk-start state
+        lmu_m:          torch.Tensor,             # (B, d, C)    chunk-start state
+        episode_starts: torch.Tensor,             # (B, K)  float32
+        actions_seq:    torch.Tensor,             # (B, K)  long
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Re-runs the LMU step with gradient for the PPO update.
-        The stored (h, m) are the states BEFORE obs_t, so this exactly
-        replicates the rollout computation.
+        Unrolls K LMU steps with full gradient.
 
-        Returns: value (B,), log_prob (B,), entropy (B,)
+        Episode boundary handling:
+            Before step k, zero h and m wherever episode_starts[:, k] == 1.
+            Multiplication by (1 - reset) is differentiable but kills gradient
+            at the boundary — correct: no grad flows between episodes.
+
+            reset_h : (B, 1)     broadcasts over hidden dim
+            reset_m : (B, 1, 1)  broadcasts over (d, C)
+
+        Returns (flattened over B*K):
+            values   : (B*K,)
+            log_probs: (B*K,)
+            entropy  : (B*K,)
         """
-        x = self.encoder(obs)                        # (B, C)
-        h, _ = self.lmu_cell(x, lmu_h, lmu_m)       # (B, n)  — m_new unused here
+        B, K = episode_starts.shape
+        h, m = lmu_h, lmu_m
 
-        logits   = self.actor(h)                     # (B, n_actions)
-        dist     = Categorical(logits=logits)
-        log_prob = dist.log_prob(actions)            # (B,)
-        entropy  = dist.entropy()                    # (B,)
-        value    = self.critic(h).squeeze(-1)        # (B,)
+        all_values, all_log_probs, all_entropy = [], [], []
 
-        return value, log_prob, entropy
+        for k in range(K):
+            # Zero state at episode boundaries (no grad through reset)
+            reset    = episode_starts[:, k:k+1]              # (B, 1)
+            h = h * (1.0 - reset)                            # (B, n)
+            m = m * (1.0 - reset.unsqueeze(-1))              # (B, d, C)
+
+            obs_k = {key: obs_seq[key][:, k] for key in obs_seq}
+            x     = self.encoder(obs_k)                      # (B, C)
+            h, m  = self.lmu_cell(x, h, m)                  # (B,n), (B,d,C)
+
+            logits   = self.actor(h)                         # (B, n_actions)
+            dist     = Categorical(logits=logits)
+            all_log_probs.append(dist.log_prob(actions_seq[:, k]))
+            all_entropy.append(dist.entropy())
+            all_values.append(self.critic(h).squeeze(-1))
+
+        # (B, K) → (B*K,)
+        values    = torch.stack(all_values,    dim=1).reshape(B * K)
+        log_probs = torch.stack(all_log_probs, dim=1).reshape(B * K)
+        entropy   = torch.stack(all_entropy,   dim=1).reshape(B * K)
+
+        return values, log_probs, entropy
+
+    # ── GAE bootstrap (single step, no grad needed) ──────────────────────────
 
     def predict_values(
         self,
-        obs:   dict,
-        lmu_h: torch.Tensor,   # (B, n)
-        lmu_m: torch.Tensor,   # (B, d, C)
+        obs:   Dict[str, torch.Tensor],
+        lmu_h: torch.Tensor,
+        lmu_m: torch.Tensor,
     ) -> torch.Tensor:
-        """GAE bootstrap at end of rollout."""
         x = self.encoder(obs)
         h, _ = self.lmu_cell(x, lmu_h, lmu_m)
         return self.critic(h).squeeze(-1)
@@ -207,11 +206,6 @@ class LMUActorCriticPolicy(nn.Module):
     def initial_state(
         self, n_envs: int, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns zeroed (h, m).
-            h : (n_envs, hidden_size)
-            m : (n_envs, memory_size, encoder_dim)   ← 3D now
-        """
         return self.lmu_cell.initial_state(n_envs, device)
 
     def set_training_mode(self, mode: bool) -> None:

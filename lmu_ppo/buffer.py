@@ -1,16 +1,22 @@
 """
-Rollout buffer for multichannel LMU-PPO.
+TBPTT rollout buffer for LMU-PPO.
 
-Only change from the single-channel version:
-    lmu_m shape: (buffer_size, n_envs, memory_size, encoder_dim)
-                                                     ^^^^^^^^^^^
-    encoder_dim = C = LMUCell.input_size
-    (was (buffer_size, n_envs, memory_size) for flat single-channel m)
+Key change from single-step buffer:
+    get() yields (B, K, ...) sequence chunks instead of (B, ...) flat transitions.
+    Only the LMU state at each chunk's START is stored — the cell is re-run for
+    K steps with gradient during evaluate_actions, so intra-chunk states are
+    recomputed on the fly.
 
-Everything else — h shape, sampling logic, GAE — is unchanged.
+    episode_starts is included in each sample so evaluate_actions can zero-out
+    state at episode boundaries within a chunk (no gradient bleeds across episodes).
+
+Chunk construction:
+    buffer stores (T, n_envs, ...) arrays.
+    get() enumerates all valid chunk starts (t, env) where t+K <= T,
+    shuffles them, then yields batches of B chunks as (B, K, ...) tensors.
 """
 
-from typing import Dict, Generator, NamedTuple, Optional, Tuple
+from typing import Dict, Generator, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch as th
@@ -20,27 +26,30 @@ from stable_baselines3.common.vec_env import VecNormalize
 
 
 class LMURolloutBufferSamples(NamedTuple):
-    observations: Dict[str, th.Tensor]  # {'image': (B,C,H,W), 'direction': (B,)}
-    actions:      th.Tensor             # (B,)
-    old_values:   th.Tensor             # (B,)
-    old_log_prob: th.Tensor             # (B,)
-    advantages:   th.Tensor             # (B,)
-    returns:      th.Tensor             # (B,)
-    lmu_h:        th.Tensor             # (B, hidden_size)
-    lmu_m:        th.Tensor             # (B, memory_size, encoder_dim)  ← 3D
+    observations:  Dict[str, th.Tensor]  # each (B, K, ...)
+    actions:       th.Tensor             # (B, K)       long
+    old_values:    th.Tensor             # (B*K,)
+    old_log_prob:  th.Tensor             # (B*K,)
+    advantages:    th.Tensor             # (B*K,)
+    returns:       th.Tensor             # (B*K,)
+    lmu_h:         th.Tensor             # (B, hidden_size)              — chunk-start state
+    lmu_m:         th.Tensor             # (B, memory_size, encoder_dim) — chunk-start state
+    episode_starts: th.Tensor            # (B, K)  float32  1=new episode
 
 
 class LMURolloutBuffer(DictRolloutBuffer):
     """
-    Extends SB3's DictRolloutBuffer with multichannel LMU state storage.
+    DictRolloutBuffer extended with:
+      - per-step LMU state storage (lmu_h, lmu_m)
+      - episode_starts tracking (already in parent as self.episode_starts)
+      - chunk-based get() for TBPTT
 
-    New parameter vs old version:
-        encoder_dim — the C dimension of m: (B, d, C)
-                      Should equal policy.encoder_dim (= LMUCell.input_size)
+    Arrays are kept in (T, n_envs, ...) layout throughout — we never call
+    swap_and_flatten so the sequential structure is preserved for chunk indexing.
     """
 
-    lmu_h: np.ndarray   # (buffer_size, n_envs, hidden_size)
-    lmu_m: np.ndarray   # (buffer_size, n_envs, memory_size, encoder_dim)
+    lmu_h: np.ndarray   # (T, n_envs, hidden_size)
+    lmu_m: np.ndarray   # (T, n_envs, memory_size, encoder_dim)
 
     def __init__(
         self,
@@ -49,8 +58,9 @@ class LMURolloutBuffer(DictRolloutBuffer):
         action_space:      spaces.Space,
         hidden_size:       int,
         memory_size:       int,
-        encoder_dim:       int,         # ← new: C dimension of memory state
-        device:            str = 'auto',
+        encoder_dim:       int,
+        chunk_len:         int,
+        device:            str = "auto",
         gamma:             float = 0.99,
         gae_lambda:        float = 0.95,
         n_envs:            int = 1,
@@ -58,6 +68,12 @@ class LMURolloutBuffer(DictRolloutBuffer):
         self.hidden_size = hidden_size
         self.memory_size = memory_size
         self.encoder_dim = encoder_dim
+        self.chunk_len   = chunk_len
+
+        assert buffer_size % chunk_len == 0, (
+            f"buffer_size ({buffer_size}) must be divisible by chunk_len ({chunk_len})"
+        )
+
         super().__init__(
             buffer_size, observation_space, action_space,
             device, gamma, gae_lambda, n_envs,
@@ -90,39 +106,89 @@ class LMURolloutBuffer(DictRolloutBuffer):
         super().add(obs, action, reward, episode_start, value, log_prob)
 
     def get(
-        self, batch_size: Optional[int] = None
+        self, n_chunks: Optional[int] = None
     ) -> Generator[LMURolloutBufferSamples, None, None]:
-        assert self.full
-        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        """
+        Yield batches of sequence chunks for TBPTT.
 
-        if not self.generator_ready:
-            for key in self.observations:
-                self.observations[key] = self.swap_and_flatten(self.observations[key])
-            for attr in ['actions', 'values', 'log_probs', 'advantages', 'returns',
-                         'lmu_h', 'lmu_m']:
-                self.__dict__[attr] = self.swap_and_flatten(self.__dict__[attr])
-            self.generator_ready = True
+        n_chunks : number of chunks per yielded batch.
+                   None = one giant batch (all chunks at once).
+                   Typical value: (buffer_size // chunk_len * n_envs) // 4
 
-        batch_size = batch_size or (self.buffer_size * self.n_envs)
-        start = 0
-        while start < self.buffer_size * self.n_envs:
-            yield self._get_samples(indices[start : start + batch_size])
-            start += batch_size
+        Each yielded batch contains n_chunks independent sequences of
+        length chunk_len, drawn from random (env, time) positions.
+        The effective number of transitions per batch = n_chunks * chunk_len.
+        """
+        assert self.full, "Buffer must be full before sampling."
+        K = self.chunk_len
+        n_chunks_per_env = self.buffer_size // K  # non-overlapping chunks per env
+
+        # All valid (chunk_start_timestep, env_idx) pairs.
+        # Each pair identifies the start of one independent K-step sequence.
+        all_chunks = [
+            (t * K, e)
+            for e in range(self.n_envs)
+            for t in range(n_chunks_per_env)
+        ]
+        np.random.shuffle(all_chunks)
+
+        # Default: one batch containing every chunk (full-buffer update)
+        n_chunks = n_chunks or len(all_chunks)
+        for start in range(0, len(all_chunks), n_chunks):
+            yield self._get_samples(all_chunks[start : start + n_chunks])
 
     def _get_samples(
         self,
-        batch_inds: np.ndarray,
+        chunks: List[Tuple[int, int]],
         env: Optional[VecNormalize] = None,
     ) -> LMURolloutBufferSamples:
-        obs = {k: self.to_torch(self.observations[k][batch_inds])
-               for k in self.observations}
+        """
+        chunks : list of (t_start, env_idx) tuples
+        Returns a batch where every sequential field has shape (B, K, ...).
+        """
+        K = self.chunk_len
+        B = len(chunks)
+
+        t_starts = np.array([c[0] for c in chunks], dtype=np.int64)  # (B,)
+        envs     = np.array([c[1] for c in chunks], dtype=np.int64)  # (B,)
+
+        # Time indices for all steps in each chunk: (B, K)
+        # t_idx[b, k] = t_starts[b] + k
+        t_idx = t_starts[:, None] + np.arange(K, dtype=np.int64)[None, :]
+
+        # ── observations  dict of (B, K, ...) ────────────────────────────
+        # self.observations[key]: (T, n_envs, ...)
+        # Fancy index with (B, K) for time and (B, 1)→(B, K) broadcast for env.
+        obs = {
+            key: self.to_torch(self.observations[key][t_idx, envs[:, None]])
+            for key in self.observations
+        }
+
+        # ── initial LMU state at chunk start  (B, ...) ───────────────────
+        lmu_h = self.to_torch(self.lmu_h[t_starts, envs])       # (B, n)
+        lmu_m = self.to_torch(self.lmu_m[t_starts, envs])       # (B, d, C)
+
+        # ── episode_starts  (B, K)  float32 ──────────────────────────────
+        # episode_starts[b, k] = 1 if obs[b, k] begins a new episode → zero h,m
+        ep_starts = self.to_torch(
+            self.episode_starts[t_idx, envs[:, None]].astype(np.float32)
+        )
+
+        # ── per-step scalars  (B, K) → flatten to (B*K,) for PPO losses ──
+        actions    = self.to_torch(self.actions[t_idx, envs[:, None]])   # (B,K,1)
+        advantages = self.to_torch(self.advantages[t_idx, envs[:, None]])
+        returns    = self.to_torch(self.returns[t_idx, envs[:, None]])
+        old_vals   = self.to_torch(self.values[t_idx, envs[:, None]])
+        old_lp     = self.to_torch(self.log_probs[t_idx, envs[:, None]])
+
         return LMURolloutBufferSamples(
             observations=obs,
-            actions=self.to_torch(self.actions[batch_inds]).long().flatten(),
-            old_values=self.to_torch(self.values[batch_inds].flatten()),
-            old_log_prob=self.to_torch(self.log_probs[batch_inds].flatten()),
-            advantages=self.to_torch(self.advantages[batch_inds].flatten()),
-            returns=self.to_torch(self.returns[batch_inds].flatten()),
-            lmu_h=self.to_torch(self.lmu_h[batch_inds]),   # (B, n)
-            lmu_m=self.to_torch(self.lmu_m[batch_inds]),   # (B, d, C)
+            actions=actions.long().squeeze(-1),          # (B, K)
+            old_values=old_vals.reshape(B * K),
+            old_log_prob=old_lp.reshape(B * K),
+            advantages=advantages.reshape(B * K),
+            returns=returns.reshape(B * K),
+            lmu_h=lmu_h,
+            lmu_m=lmu_m,
+            episode_starts=ep_starts,                    # (B, K)
         )
