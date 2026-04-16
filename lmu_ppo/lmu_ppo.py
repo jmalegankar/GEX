@@ -46,6 +46,7 @@ class LMUPPO(PPO):
     def __init__(
         self,
         env:                GymEnv,
+        policy=None,        # accepted but ignored — LMUPPO always uses LMUActorCriticPolicy
         lr:                 Union[float, Schedule] = 3e-4,
         n_steps:            int = 2048,
         batch_size:         int = 256,
@@ -71,6 +72,7 @@ class LMUPPO(PPO):
         verbose:            int = 1,
         seed:               Optional[int] = None,
         device:             Union[th.device, str] = "auto",
+        _init_setup_model:  bool = True,        # set False by SB3's load(); it calls _setup_model itself
     ):
         # Store arch params before super().__init__ so _setup_model can use them
         self.encoder_dim  = encoder_dim
@@ -80,8 +82,6 @@ class LMUPPO(PPO):
         self.chunk_len    = chunk_len
         self.n_chunks_per_batch = n_chunks_per_batch
 
-        # SB3's PPO.__init__ calls _setup_model at the end — we pass a dummy
-        # policy string so it doesn't crash before we override _setup_model.
         super().__init__(
             policy="MultiInputPolicy",  # placeholder; overridden in _setup_model
             env=env,
@@ -102,9 +102,10 @@ class LMUPPO(PPO):
             verbose=verbose,
             seed=seed,
             device=device,
-            _init_setup_model=False,  # we call it ourselves below
+            _init_setup_model=False,  # always defer; we control the call below
         )
-        self._setup_model()
+        if _init_setup_model:
+            self._setup_model()
 
     # ------------------------------------------------------------------
     # Model setup

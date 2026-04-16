@@ -19,6 +19,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import EvalCallback
 
 from lmu_ppo.lmu_ppo import LMUPPO
+from mem_start import MemoryStartWrapper
 
 
 ENV_IDS = {
@@ -74,6 +75,7 @@ FULL_BPTT_CHUNK = {
 def make_env(env_id: str, seed: int, rank: int = 0):
     def _init():
         env = gym.make(env_id)
+        env = MemoryStartWrapper(env)
         env = FilterObservation(env, filter_keys=["image", "direction"])
         env = Monitor(env)
         env.reset(seed=seed + rank)
@@ -143,7 +145,7 @@ def main():
         n_chunks_per_batch=args.n_chunks_per_batch,
         n_epochs=args.n_epochs,
         lr=args.lr,
-        ent_coef=0.05,
+        ent_coef=0.01,
         vf_coef=1.0,
         max_grad_norm=0.5,
         clip_range=0.2,

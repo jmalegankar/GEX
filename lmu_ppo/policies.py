@@ -110,32 +110,52 @@ class LMUActorCriticPolicy(nn.Module):
         self.encoder  = MinigridEncoder(observation_space, encoder_dim)
         self.lmu_cell = LMUCell(encoder_dim, hidden_size, memory_size, theta)
 
-        # Actor reads h only — action depends on current context, not raw memory
-        self.actor = nn.Linear(hidden_size, n_actions)
+        # Both actor and critic receive cat([h, m_pooled]) directly.
+        #
+        # Why actor also needs m_pooled:
+        #   The LMU's C_proj readout (m → y → W_m → h) collapses during
+        #   training because C_proj and W_m are coupled — if C_proj is small,
+        #   W_m sees noise and doesn't learn; Adam then shrinks C_proj further.
+        #   In practice h ends up dominated by W_x(x) + W_h(h) (current obs
+        #   + recurrence) with almost no memory signal. The actor acting on h
+        #   alone is effectively memoryless.
+        #
+        #   Giving both heads direct access to m.mean(d) → (B, C) bypasses
+        #   the C_proj bottleneck entirely. C_proj + W_m remain as an auxiliary
+        #   pathway that can still learn, but the primary memory signal is
+        #   direct. The actor can now condition on ball identity from step 1
+        #   even before C_proj has learned anything useful.
+        #
+        # head_in = hidden_size + encoder_dim  (h concat m_pooled)
+        head_in = hidden_size + encoder_dim
+
+        # Actor: linear over head_in → n_actions.
+        # Small orthogonal gain (0.01) keeps initial policy near-uniform.
+        self.actor = nn.Linear(head_in, n_actions)
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
 
-        # Critic gets both h AND m (mean-pooled over d).
-        # h alone is insufficient early in training: it encodes m only through
-        # C_proj @ m, which starts random. The critic would see garbage until
-        # C_proj learns, keeping explained_variance ≈ 0 indefinitely.
-        # Direct access to mean(m, dim=d) → (B, C) lets the critic read the
-        # Legendre history immediately, independent of C_proj learning.
-        #
-        # critic_input: cat([h, m.mean(d)]) → (B, hidden_size + encoder_dim)
-        #
-        # Two-layer MLP so the critic can learn a nonlinear combination of
-        # current context (h) and memory history (m_pooled).
-        critic_in = hidden_size + encoder_dim
+        # Critic: two-layer MLP — nonlinearity lets it threshold on memory
+        # content ("did we see the ball?") not just linearly combine features.
         self.critic = nn.Sequential(
-            nn.Linear(critic_in, critic_in // 2),
+            nn.Linear(head_in, head_in // 2),
             nn.Tanh(),
-            nn.Linear(critic_in // 2, 1),
+            nn.Linear(head_in // 2, 1),
         )
         nn.init.orthogonal_(self.critic[0].weight, gain=1.0)
         nn.init.zeros_(self.critic[0].bias)
         nn.init.orthogonal_(self.critic[2].weight, gain=1.0)
         nn.init.zeros_(self.critic[2].bias)
+
+        # Re-initialise C_proj larger so the W_m pathway isn't dead from the
+        # start. Previously ±1/√d ≈ ±0.177 shrank to ~0.04 during training.
+        # Orthogonal init preserves gradient magnitude through the readout.
+        nn.init.orthogonal_(
+            self.lmu_cell.C_proj.unsqueeze(0)   # orthogonal needs 2D
+        )
+        self.lmu_cell.C_proj = nn.Parameter(
+            self.lmu_cell.C_proj.squeeze(0)
+        )
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
 
@@ -163,7 +183,7 @@ class LMUActorCriticPolicy(nn.Module):
                torch.Tensor, torch.Tensor, torch.Tensor]:
         x = self.encoder(obs)
         h, m     = self.lmu_cell(x, h_prev, m_prev)
-        logits   = self.actor(h)
+        logits   = self.actor(self._critic_input(h, m))   # actor now sees memory too
         dist     = Categorical(logits=logits)
         action   = dist.sample()
         log_prob = dist.log_prob(action)
@@ -211,11 +231,12 @@ class LMUActorCriticPolicy(nn.Module):
             x     = self.encoder(obs_k)                      # (B, C)
             h, m  = self.lmu_cell(x, h, m)                  # (B,n), (B,d,C)
 
-            logits   = self.actor(h)                         # (B, n_actions)
-            dist     = Categorical(logits=logits)
+            head    = self._critic_input(h, m)             # (B, n+C) — shared input
+            logits  = self.actor(head)
+            dist    = Categorical(logits=logits)
             all_log_probs.append(dist.log_prob(actions_seq[:, k]))
             all_entropy.append(dist.entropy())
-            all_values.append(self.critic(self._critic_input(h, m)).squeeze(-1))
+            all_values.append(self.critic(head).squeeze(-1))
 
         # (B, K) → (B*K,)
         values    = torch.stack(all_values,    dim=1).reshape(B * K)
