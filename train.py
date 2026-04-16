@@ -83,7 +83,7 @@ def make_env(env_id: str, seed: int, rank: int = 0):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env",         default="MemoryS7", choices=list(ENV_IDS))
+    parser.add_argument("--env",         default="MemoryS11", choices=list(ENV_IDS))
     parser.add_argument("--seed",        type=int,   default=0)
     parser.add_argument("--n_envs",      type=int,   default=16)
     parser.add_argument("--total_steps", type=int,   default=2_000_000)
@@ -143,8 +143,8 @@ def main():
         n_chunks_per_batch=args.n_chunks_per_batch,
         n_epochs=args.n_epochs,
         lr=args.lr,
-        ent_coef=0.01,
-        vf_coef=0.5,
+        ent_coef=0.05,
+        vf_coef=1.0,
         max_grad_norm=0.5,
         clip_range=0.2,
         tensorboard_log=args.tb_log,

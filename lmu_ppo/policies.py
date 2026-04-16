@@ -110,14 +110,47 @@ class LMUActorCriticPolicy(nn.Module):
         self.encoder  = MinigridEncoder(observation_space, encoder_dim)
         self.lmu_cell = LMUCell(encoder_dim, hidden_size, memory_size, theta)
 
-        self.actor  = nn.Linear(hidden_size, n_actions)
-        self.critic = nn.Linear(hidden_size, 1)
-        nn.init.orthogonal_(self.actor.weight,  gain=0.01)
-        nn.init.orthogonal_(self.critic.weight, gain=1.0)
+        # Actor reads h only — action depends on current context, not raw memory
+        self.actor = nn.Linear(hidden_size, n_actions)
+        nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
-        nn.init.zeros_(self.critic.bias)
+
+        # Critic gets both h AND m (mean-pooled over d).
+        # h alone is insufficient early in training: it encodes m only through
+        # C_proj @ m, which starts random. The critic would see garbage until
+        # C_proj learns, keeping explained_variance ≈ 0 indefinitely.
+        # Direct access to mean(m, dim=d) → (B, C) lets the critic read the
+        # Legendre history immediately, independent of C_proj learning.
+        #
+        # critic_input: cat([h, m.mean(d)]) → (B, hidden_size + encoder_dim)
+        #
+        # Two-layer MLP so the critic can learn a nonlinear combination of
+        # current context (h) and memory history (m_pooled).
+        critic_in = hidden_size + encoder_dim
+        self.critic = nn.Sequential(
+            nn.Linear(critic_in, critic_in // 2),
+            nn.Tanh(),
+            nn.Linear(critic_in // 2, 1),
+        )
+        nn.init.orthogonal_(self.critic[0].weight, gain=1.0)
+        nn.init.zeros_(self.critic[0].bias)
+        nn.init.orthogonal_(self.critic[2].weight, gain=1.0)
+        nn.init.zeros_(self.critic[2].bias)
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _critic_input(self, h: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        """
+        Concatenate h and mean-pooled m for the critic.
+
+        h : (B, n)
+        m : (B, d, C)
+        → (B, n + C)
+        """
+        m_pooled = m.mean(dim=1)          # (B, d, C) → (B, C), pool over Legendre dim
+        return torch.cat([h, m_pooled], dim=-1)
 
     # ── rollout (single step, no grad needed) ────────────────────────────────
 
@@ -134,7 +167,7 @@ class LMUActorCriticPolicy(nn.Module):
         dist     = Categorical(logits=logits)
         action   = dist.sample()
         log_prob = dist.log_prob(action)
-        value    = self.critic(h).squeeze(-1)
+        value    = self.critic(self._critic_input(h, m)).squeeze(-1)
         return action, value, log_prob, h, m, logits
 
     # ── PPO update (K-step unroll, full gradient) ─────────────────────────────
@@ -182,7 +215,7 @@ class LMUActorCriticPolicy(nn.Module):
             dist     = Categorical(logits=logits)
             all_log_probs.append(dist.log_prob(actions_seq[:, k]))
             all_entropy.append(dist.entropy())
-            all_values.append(self.critic(h).squeeze(-1))
+            all_values.append(self.critic(self._critic_input(h, m)).squeeze(-1))
 
         # (B, K) → (B*K,)
         values    = torch.stack(all_values,    dim=1).reshape(B * K)
@@ -200,8 +233,8 @@ class LMUActorCriticPolicy(nn.Module):
         lmu_m: torch.Tensor,
     ) -> torch.Tensor:
         x = self.encoder(obs)
-        h, _ = self.lmu_cell(x, lmu_h, lmu_m)
-        return self.critic(h).squeeze(-1)
+        h, m = self.lmu_cell(x, lmu_h, lmu_m)
+        return self.critic(self._critic_input(h, m)).squeeze(-1)
 
     def initial_state(
         self, n_envs: int, device: torch.device
