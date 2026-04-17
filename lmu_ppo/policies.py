@@ -150,12 +150,10 @@ class LMUActorCriticPolicy(nn.Module):
         # Re-initialise C_proj larger so the W_m pathway isn't dead from the
         # start. Previously ±1/√d ≈ ±0.177 shrank to ~0.04 during training.
         # Orthogonal init preserves gradient magnitude through the readout.
-        nn.init.orthogonal_(
-            self.lmu_cell.C_proj.unsqueeze(0)   # orthogonal needs 2D
-        )
-        self.lmu_cell.C_proj = nn.Parameter(
-            self.lmu_cell.C_proj.squeeze(0)
-        )
+        with torch.no_grad():
+            tmp = torch.empty(1, self.lmu_cell.memory_size)
+            nn.init.orthogonal_(tmp)
+            self.lmu_cell.C_proj.data.copy_(tmp.squeeze(0))
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
 

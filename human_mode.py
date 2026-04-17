@@ -14,6 +14,7 @@ Run:
 """
 
 import argparse
+import random
 import gymnasium as gym
 import minigrid  # noqa
 from minigrid.manual_control import ManualControl
@@ -29,8 +30,8 @@ ENV_IDS = {
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env",  default="MemoryS11", choices=list(ENV_IDS))
-    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--env",  default="MemoryS13", choices=list(ENV_IDS))
+    parser.add_argument("--seed", type=int, default=random.randint(0, 10000))
     parser.add_argument("--tile_size", type=int, default=40)
     args = parser.parse_args()
 

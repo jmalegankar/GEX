@@ -393,7 +393,7 @@ class LMUPPO(PPO):
                 )
                 grad_norms.append(grad_norm.item())
 
-            self._n_updates += 1
+                self._n_updates += 1
             if not continue_training:
                 break
 
