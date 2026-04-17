@@ -46,7 +46,7 @@ ARCH = {
     "MemoryS7":  dict(hidden_size=64,  memory_size=32),
     "MemoryS9":  dict(hidden_size=128, memory_size=48),
     "MemoryS11": dict(hidden_size=128, memory_size=64),
-    "MemoryS13": dict(hidden_size=128, memory_size=64),
+    "MemoryS13": dict(hidden_size=128, memory_size=96),
 }
 
 # chunk_len for TBPTT.
@@ -139,13 +139,13 @@ def main():
         memory_size=arch["memory_size"],
         theta=theta,
         chunk_len=chunk_len,
-        gamma=0.995,
+        gamma=0.999,
         gae_lambda=0.98,
         n_steps=args.n_steps,
         n_chunks_per_batch=args.n_chunks_per_batch,
         n_epochs=args.n_epochs,
         lr=args.lr,
-        ent_coef=0.01,
+        ent_coef=0.008,
         vf_coef=1.0,
         max_grad_norm=0.5,
         clip_range=0.2,

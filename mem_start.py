@@ -59,6 +59,6 @@ class MemoryStartWrapper(gym.Wrapper):
 
         # Corridor entrance = first walkable cell to the right of the hint room
         # The hint room occupies x=1; corridor starts at x=2.
-        start_x = 1
+        start_x = 2
         env.agent_pos = np.array([start_x, agent_row])
-        env.agent_dir = 0  # facing right → toward hint room first
+        env.agent_dir = 2  # facing right → toward hint room first
