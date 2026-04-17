@@ -127,8 +127,10 @@ class LMUCell(nn.Module):
         # Cₚᵣₒⱼ ∈ ℝ^d — contracts d-dim memory → scalar per channel
         # Equivalent to the C output matrix in SSM notation: y = C m
         # y[b, c] = Σ_i Cₚᵣₒⱼ[i] * m_new[b, i, c]
-        self.C_proj = nn.Parameter(torch.empty(memory_size))
+        # self.C_proj = nn.Parameter(torch.empty(memory_size))
 
+        self.W_query = nn.Linear(hidden_size, memory_size, bias=False)
+        nn.init.orthogonal_(self.W_query.weight, gain=0.01)
         # ── Hidden state kernels ─────────────────────────────────────────
         # Wₓ: C → n  (input → hidden)
         # Wₕ: n → n  (hidden recurrence, no bias to avoid double-counting)
@@ -145,10 +147,10 @@ class LMUCell(nn.Module):
         # Eₕ: Xavier normal (per Voelker 2019 §3)
         nn.init.xavier_normal_(self.E_h.weight)
         # e_m already zeros from __init__; do not reinit here
-        # Cₚᵣₒⱼ: uniform ± 1/√d  (small to not dominate at init)
-        nn.init.uniform_(self.C_proj,
-                         -1.0 / self.memory_size ** 0.5,
-                          1.0 / self.memory_size ** 0.5)
+        # # Cₚᵣₒⱼ: uniform ± 1/√d  (small to not dominate at init)
+        # nn.init.uniform_(self.C_proj,
+        #                  -1.0 / self.memory_size ** 0.5,
+        #                   1.0 / self.memory_size ** 0.5)
         # Hidden kernels: Xavier normal (per paper §3)
         for layer in (self.W_x, self.W_h, self.W_m):
             nn.init.xavier_normal_(layer.weight)
@@ -189,7 +191,10 @@ class LMUCell(nn.Module):
         # ── Step 3: memory readout → y ∈ (B, C) ─────────────────────────
         # y[b,c] = Σ_i Cₚᵣₒⱼ[i] · m_new[b,i,c]
         # (SSM C-matrix: maps d-dim Legendre state → scalar per channel)
-        y = torch.einsum('d,bdc->bc', self.C_proj, m_new)     # (B, C)
+        # y = torch.einsum('d,bdc->bc', self.C_proj, m_new)     # (B, C)
+        C_t = self.W_query(h_prev)                        # (B, d)
+        C_t = torch.nn.functional.normalize(C_t, dim=-1)  # unit norm — bounds gradient
+        y   = torch.einsum('bd,bdc->bc', C_t, m_new)      # (B, C)
 
         # ── Step 4: nonlinear hidden update ──────────────────────────────
         # h' = tanh(Wₓ x + Wₕ h + Wₘ y)
