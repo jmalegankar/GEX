@@ -61,12 +61,10 @@ class LMUCell(nn.Module):
         # Get (A, B) matrices for the LMU memory update, shared across channels.
         A, B = get_AB(memory_size, theta)
         self.register_buffer('A', torch.from_numpy(A))  # (memory_size, memory_size)
-        self.register_buffer('B', torch.from_numpy(B))  # (memory_size, 1)
+        self.register_buffer('B', torch.from_numpy(B).view(-1))  # (memory_size)
 
         self.input_timestep_extractor = nn.Sequential(
-            nn.Linear(hidden_size, 2*hidden_size),
-            nn.ReLU(),
-            nn.Linear(2*hidden_size, hidden_size),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Conv1d(num_channels, 1, kernel_size=hidden_size),
             nn.Sigmoid(),
@@ -74,9 +72,7 @@ class LMUCell(nn.Module):
         )
 
         self.multi_timestep_extractor = nn.Sequential(
-            nn.Linear(hidden_size, 2*hidden_size),
-            nn.ReLU(),
-            nn.Linear(2*hidden_size, hidden_size),
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Conv1d(num_channels, self.hidden_size, kernel_size=hidden_size),
             nn.Sigmoid(),
@@ -84,14 +80,38 @@ class LMUCell(nn.Module):
         )
 
         self.ut_processor = nn.Sequential(
-            nn.Linear(num_channels + input_size, 2*num_channels),
+            nn.Linear(2*num_channels, 2*num_channels),
             nn.ReLU(),
             nn.Linear(2*num_channels, num_channels)
         )
 
-        self.W_x = nn.Linear(input_size, hidden_size)
+        self.W_x = nn.Linear(input_size, num_channels)
         self.W_h = nn.Linear(hidden_size, hidden_size)
-        self.W_m = nn.Linear(num_channels, num_channels)
+        self.W_m = nn.Linear(hidden_size, hidden_size)
+
+        self.e_m = nn.Parameter(torch.zeros(memory_size))
+        self.e_h = nn.Parameter(torch.zeros(hidden_size))
+        self.e_x = nn.Linear(input_size, num_channels)
+
+        self._reset_parameters()
+    
+    def _reset_parameters(self):
+        # Initialize weights using Xavier initialization
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv1d):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        
+        nn.init.uniform_(self.e_h, -0.1, 0.1)
+        nn.init.uniform_(self.e_m, -0.1, 0.1)
+        nn.init.uniform_(self.e_x.weight, -0.1, 0.1)
+        if self.e_x.bias is not None:
+            nn.init.zeros_(self.e_x.bias)
     
     @torch.jit.export
     def recon_data(
@@ -117,7 +137,7 @@ class LMUCell(nn.Module):
         batch, num_timesteps = x.shape
         Parr = []
         P = torch.zeros(batch, num_timesteps, device=memory.device, dtype=memory.dtype)
-        P[:, 0] = 1.0
+        P[:, :] = 1.0
         Parr.append(P)
         if self.memory_size > 1:
             Parr.append(x)
@@ -153,11 +173,12 @@ class LMUCell(nn.Module):
 
         recon = self.recon_data(m, init_timesteps).view(-1, self.num_channels) # (batch_size, num_channels)
 
+        u_t = torch.einsum('i,bic->bc', self.e_m, m) + torch.einsum('i,bic->bc', self.e_h, h) + self.e_x(x) # (batch_size, num_channels)
         u_t = self.ut_processor(
-            torch.cat([recon, x], dim=-1) # (batch_size, num_channels + input_size)
+            torch.cat([recon, u_t], dim=-1) # (batch_size, 2*num_channels)
         ) # (batch_size, num_channels)
 
-        m_new = torch.einsum('ij,bjc->bic', self.A, m) + torch.einsum('ij,bj->bij', self.B, u_t) # (batch_size, memory_size, num_channels)
+        m_new = torch.einsum('ij,bjc->bic', self.A, m) + torch.einsum('d,bc->bdc', self.B, u_t) # (batch_size, memory_size, num_channels)
 
         multi_timesteps = self.multi_timestep_extractor(
             h.transpose(1, 2)  # (batch_size, num_channels, hidden_size)
@@ -165,8 +186,8 @@ class LMUCell(nn.Module):
 
         recon = self.recon_data(m_new, multi_timesteps) # (batch_size, hidden_size, num_channels)
 
-        h_new = self.W_m(recon) # (batch_size, hidden_size, num_channels)
-        h_new += self.W_x(x).unsqueeze(2) # (batch_size, hidden_size, num_channels)
+        h_new = self.W_m(recon.transpose(1, 2)).transpose(1, 2) # (batch_size, hidden_size, num_channels)
+        h_new += self.W_x(x).unsqueeze(1) # (batch_size, hidden_size, num_channels)
         h_new += self.W_h(h.transpose(1, 2)).transpose(1, 2) # (batch_size, hidden_size, num_channels)
         h_new = torch.tanh(h_new) # (batch_size, hidden_size, num_channels)
 
@@ -177,9 +198,9 @@ if __name__ == "__main__":
     # Test the LMUCell with dummy data
     batch_size = 4
     input_size = 10
-    hidden_size = 20
-    memory_size = 5
-    num_channels = 3
+    hidden_size = 32
+    memory_size = 16
+    num_channels = 10
     theta = 100.0
 
     lmu_cell = LMUCell(input_size, hidden_size, memory_size, num_channels, theta)
@@ -214,19 +235,16 @@ if __name__ == "__main__":
             return output, h_new, m_new
 
     predict_model = PredictNextSinWave(lmu_cell)
-    optim = torch.optim.Adam(predict_model.parameters(), lr=1e-3)
+    optim = torch.optim.Adam(predict_model.parameters(), lr=3e-4)
     num_epochs = 1000
-    num_timesteps = 50
+    num_timesteps = 100
+    torch.manual_seed(0)
     for epoch in range(num_epochs):
         # Generate random multi-sin wave data
         t = torch.linspace(0, 10, num_timesteps)
-        freqs = torch.rand(input_size) * 2 + 0.5  # Random frequencies between 0.5 and 2.5
+        freqs = torch.rand(input_size) * 4 + 0.5  # Random frequencies between 0.5 and 4.5 Hz
         phases = torch.rand(input_size) * 2 * np.pi  # Random phases between 0 and 2pi
         data = torch.stack([torch.sin(freqs[i] * t + phases[i]) for i in range(input_size)], dim=1) # (num_timesteps, num_channels)
-
-        # Use the first num_timesteps-1 steps as input and the last step as target
-        x = data[:-1]  # (num_timesteps-1, num_channels)
-        target = data[1:]  # (num_timesteps-1, num_channels)
 
         # Initialize hidden and memory states
         h = torch.zeros(1, hidden_size, num_channels)
@@ -234,14 +252,24 @@ if __name__ == "__main__":
 
         # Train on each time step
         total_loss = 0.0
-        for t in range(num_timesteps - 1):
+        for t in range(num_timesteps//2):
             optim.zero_grad()
-            output, h, m = predict_model(x[t].unsqueeze(0), h, m)
-            h, m = h.detach(), m.detach()  # Detach to prevent backprop through time
-            loss = nn.MSELoss()(output.squeeze(0), target[t])
+            output, h, m = predict_model(data[t].unsqueeze(0), h, m)
+            loss = nn.MSELoss()(output.squeeze(0), data[t+1])  # Predict next time step
             loss.backward()
             optim.step()
             total_loss += loss.item()
+            h, m = h.detach(), m.detach()  # Detach to prevent backprop through time
+            output = output.detach()  # Detach to prevent backprop through time
+        for t in range(num_timesteps//2, num_timesteps - 1):
+            optim.zero_grad()
+            output, h, m = predict_model(output, h, m)
+            loss = nn.MSELoss()(output.squeeze(0), data[t+1])  # Predict next time step
+            loss.backward()
+            optim.step()
+            h, m = h.detach(), m.detach()  # Detach to prevent backprop through time
+            output = output.detach()  # Detach to prevent backprop through time
+            total_loss += loss.item()
 
-        if epoch % 100 == 0:
+        if epoch % 10 == 0:
             print(f"Epoch {epoch}, Loss: {total_loss / (num_timesteps - 1)}")
