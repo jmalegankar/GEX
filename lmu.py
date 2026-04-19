@@ -37,6 +37,9 @@ import torch.nn as nn
 from scipy.signal import cont2discrete
 from typing import Tuple
 
+from torch.nn.utils import spectral_norm
+
+
 
 def get_AB(d: int, theta: float) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -115,7 +118,8 @@ class LMUCell(nn.Module):
 
         # Eₕ ∈ ℝ^{n×C} — hidden state → per-channel scalar
         # u_from_h[b, c] = Σ_i Eₕ[c, i] * h[b, i]  (Linear(n→C, no bias))
-        self.E_h = nn.Linear(hidden_size, input_size, bias=False)
+        self.E_h = spectral_norm(nn.Linear(hidden_size, input_size, bias=False))
+
 
         # eₘ ∈ ℝ^d — memory readout for encoding, shared across channels
         # u_from_m[b, c] = Σ_i eₘ[i] * m[b, i, c]
@@ -136,7 +140,7 @@ class LMUCell(nn.Module):
         # Wₕ: n → n  (hidden recurrence, no bias to avoid double-counting)
         # Wₘ: C → n  (memory readout y → hidden)
         self.W_x = nn.Linear(input_size,  hidden_size, bias=True)
-        self.W_h = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W_h = spectral_norm(nn.Linear(hidden_size, hidden_size, bias=False))
         self.W_m = nn.Linear(input_size,  hidden_size, bias=False)
 
         self._reset_parameters()

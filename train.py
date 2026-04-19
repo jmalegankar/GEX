@@ -151,8 +151,10 @@ def main():
         clip_range=0.2,
         tensorboard_log=args.tb_log,
         verbose=1,
+        target_kl=0.05,
         seed=args.seed,
         device=args.device,
+
     )
 
     # Total chunks available per rollout = (n_steps // chunk_len) * n_envs
