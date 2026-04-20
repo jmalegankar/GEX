@@ -187,7 +187,7 @@ class LMUPPO(PPO):
 
             with th.no_grad():
                 obs_t = obs_as_tensor(self._last_obs, self.device)
-                actions, values, log_probs, h_new, m_new, logits_t = self.policy.forward(
+                actions, values, log_probs, h_new, m_new, logits_t, r_intr = self.policy.forward(
                     obs_t, self._lmu_h, self._lmu_m
                 )
 
@@ -200,6 +200,7 @@ class LMUPPO(PPO):
                 return False
 
             self._update_info_buffer(infos, dones)
+            self.logger.record("debug/r_intr_mean", r_intr.mean().item())
             n_steps += 1
 
             rollout_buffer.add(
@@ -274,7 +275,7 @@ class LMUPPO(PPO):
             m[dones] = 0.0
 
         with th.no_grad():
-            actions, _, _, h_new, m_new, logits_t = self.policy.forward(obs_tensor, h, m)
+            actions, _, _, h_new, m_new, logits_t, _ = self.policy.forward(obs_tensor, h, m)
 
         actions = actions.cpu().numpy()
 
@@ -320,7 +321,7 @@ class LMUPPO(PPO):
 
                 # Re-run K LMU steps with full gradient.
                 # Returns are flattened: (n_chunks * K,)
-                values, log_prob, entropy = self.policy.evaluate_actions(
+                values, log_prob, entropy, r_intrs = self.policy.evaluate_actions(
                     obs_seq=batch.observations,
                     lmu_h=batch.lmu_h,
                     lmu_m=batch.lmu_m,
@@ -378,6 +379,7 @@ class LMUPPO(PPO):
                 # ── Gradient step ─────────────────────────────────────────
                 self.policy.optimizer.zero_grad()
                 loss.backward()
+                self.policy.lmu_cell.W_pre.ortho_update(lr=1e-3)
                 # Clip gradient norm — important with TBPTT since gradients
                 # accumulate over K steps and can be larger than single-step PPO
                 grad_norm = th.nn.utils.clip_grad_norm_(
@@ -385,6 +387,7 @@ class LMUPPO(PPO):
                 )
                 self.policy.optimizer.step()
 
+                self.logger.record("debug/r_intrs_mean", r_intrs.mean().item())
                 pg_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())

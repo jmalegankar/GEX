@@ -1,45 +1,153 @@
 """
-Multichannel Legendre Memory Unit (LMU) — PyTorch implementation.
+Multichannel Legendre Memory Unit (LMU) — Gated Write variant.
 
-Core idea (S4-style):
-    Run C independent scalar LMUs in parallel, one per input feature,
-    sharing the same frozen (Ā, B̄) matrices.
+What changed from baseline and why:
+──────────────────────────────────
+1. OrthoLayer (new class)
+     W_pre ∈ O(C): orthogonal linear layer for the innovation projection.
+     Maintained via Cayley-map Riemannian updates (ortho_update).
+     MUST be excluded from the main Adam optimizer — see integration note below.
+     Fallback: reorthogonalize() does a hard SVD reset if drift exceeds 1e-3.
 
-    Old (scalar bottleneck):
-        u : (B, 1)     — all C features funnel through one number
-        m : (B, d)     — d Legendre coeffs for the whole vector
+2. _compute_u (new method on LMUCell)
+     Replaces the plain linear sum  u = u_x + u_h + u_m  with a gated structure:
+       pred  = u_h + u_m
+       gate  = tanh(u_x)           ← zeroes when u_x = 0        (Condition 1)
+       innov = tanh(u_x - pred)    ← zeroes when u_x = pred     (Condition 2)
+       u     = W_pre(gate⊙innov) + pred
+     Both conditions collapse to u = pred — novelty-gated writes.
 
-    New (multichannel):
-        u : (B, C)     — one scalar per feature channel
-        m : (B, d, C)  — d Legendre coeffs × C independent channels
+3. e_x normalised in forward via F.normalize(e_x, dim=0)
+     Pins ‖e_x‖₂ = 1.  minimize-r_intr gradient can only rotate e_x,
+     not shrink it toward zero.  Per-channel scalar semantics preserved.
 
-Equations per channel c  (Voelker 2019, Eq. 4 + 6 + 7):
-    u_c  = eₓ[c]·x_c  +  Eₕ[:,c]·h  +  eₘ·m[:,c]    scalar encoding
-    m_c' = Ā m_c + B̄ u_c                               linear memory update
-    y    = Cₚᵣₒⱼ·m'                                    per-channel readout
-    h'   = tanh(Wₓ(x) + Wₕ(h) + Wₘ(y))               shared nonlinear hidden
+4. forward now returns (h_new, m_new, r_intr)   [was: (h_new, m_new)]
+     r_intr = ‖gate ⊙ innov‖₂ ∈ [0, √C]  (W_pre isometry; drops from magnitude).
+     Step 1 validation: β = 0, r_intr is LOGGED ONLY, not added to rewards.
+     Step 2: add β * r_intr to extrinsic reward once Step 1 passes gate checks.
 
-Vectorised shapes:
-    u    = x⊙eₓ  +  hEₕ  +  einsum('d,bdc→bc', eₘ, m)   (B, C)
-    m'   = einsum('ij,bjc→bic', Ā, m)  +  B̄·u.unsqueeze(1)  (B, d, C)
-    y    = einsum('d,bdc→bc', Cₚᵣₒⱼ, m')                    (B, C)
-    h'   = tanh(Wₓ(x) + Wₕ(h) + Wₘ(y))                     (B, n)
+Old lines are commented with  # [OLD]  and kept for diff/reversion.
+New lines are inline or immediately follow the old comment.
 
-Broadcasting proof for memory update:
-    B̄         : (d, 1)  → padded by PyTorch to (1, d, 1)
-    u.unsqueeze(1) : (B, 1, C)
-    product        : (B, d, C)  element [b,i,c] = B̄[i] · u[b,c]  ✓
+Optimizer integration (copy to lmu_ppo.py _setup_model):
+─────────────────────────────────────────────────────────
+    ortho_params = set(model.lmu_cell.W_pre.parameters())
+    main_params  = [p for p in model.parameters() if p not in ortho_params]
+    optimizer    = torch.optim.Adam(main_params, lr=3e-4, eps=1e-5)
+
+Training loop (copy to lmu_ppo.py train):
+──────────────────────────────────────────
+    optimizer.zero_grad()
+    loss.backward()
+    model.lmu_cell.W_pre.ortho_update(lr=1e-3)  # Riemannian step, zeros grad
+    optimizer.step()                             # Adam never sees W_pre grad
+
+    if step % 100 == 0:
+        err = model.lmu_cell.W_pre.orthogonality_error()
+        if err > 1e-3:
+            model.lmu_cell.W_pre.reorthogonalize()   # hard SVD reset
+            print(f"W_pre ortho reset at step {step}, was {err:.6f}")
+        logger.record("debug/W_pre_ortho_error", err)
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
-from scipy.signal import cont2discrete
+import torch.nn.functional as F                  # [NEW] needed for normalize
+from scipy.signal import cont2discrete           # unchanged — do NOT alias
 from typing import Tuple
 
 from torch.nn.utils import spectral_norm
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# OrthoLayer  [NEW CLASS]
+# ─────────────────────────────────────────────────────────────────────────────
+
+class OrthoLayer(nn.Module):
+    """
+    Orthogonal linear layer (no bias) maintained via Cayley-map Riemannian updates.
+
+    No bias is not optional — it is required for the u_null proof.
+    With no bias: W_pre(0) = 0 exactly, so u_null = pred exactly.
+    If you add a bias, u_null = bias + pred ≠ pred and the intrinsic reward
+    measure breaks.
+
+    CRITICAL — exclude from main Adam optimizer:
+        Adam maintains running moment estimates m_t, v_t.  ortho_update zeros
+        the grad, but Adam still applies a nonzero Δ from accumulated momentum —
+        corrupting orthogonality every step.  See optimizer integration note
+        in module docstring above.
+
+    Cayley retraction guarantee:
+        A     = G Wᵀ - W Gᵀ            (skew-symmetric Riemannian gradient)
+        W_new = (I + lr·A)⁻¹(I - lr·A) W_old
+        W_newᵀ W_new = I  always ✓
+
+    Isometry property (why W_pre drops from r_intr):
+        ‖W_pre(v)‖₂ = ‖v‖₂  for all v
+        So r_intr = ‖W_pre(gate⊙innov)‖₂ = ‖gate⊙innov‖₂.
+        W_pre only rotates the innovation into a critic-useful basis;
+        it does not affect reward magnitude.
+    """
+
+    def __init__(self, size: int):
+        super().__init__()
+        # Identity init: valid starting point on O(C).
+        # At init, W_pre(v) = v, so the gated write is just innov + pred.
+        # Learning rotates away from identity as the critic finds a better basis.
+        self.weights = nn.Parameter(torch.eye(size))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x @ self.weights   # (B, C) @ (C, C) → (B, C)
+
+    def ortho_update(self, lr: float) -> None:
+        """
+        Riemannian gradient step on O(C) via Cayley retraction.
+        Call AFTER loss.backward(), BEFORE optimizer.step().
+        Zeros the gradient so Adam never touches this parameter.
+        """
+        with torch.no_grad():
+            if self.weights.grad is None:
+                return
+            G = self.weights.grad       # (C, C) Euclidean gradient
+            W = self.weights
+
+            # Riemannian gradient: project G onto tangent space of O(C) at W.
+            # A = G Wᵀ - W Gᵀ  is skew-symmetric (Aᵀ = −A).
+            A = G @ W.t() - W @ G.t()  # (C, C)
+
+            I = torch.eye(W.size(0), device=W.device, dtype=W.dtype)
+
+            # Cayley retraction.
+            # torch.linalg.solve(X, B) = X⁻¹B — numerically stabler than .inv()
+            W_new = torch.linalg.solve(I + lr * A, (I - lr * A) @ W)
+            self.weights.copy_(W_new)
+            self.weights.grad.zero_()   # Adam must not see this gradient
+
+    @torch.no_grad()
+    def reorthogonalize(self) -> None:
+        """
+        Hard SVD reset.  Use as a fallback when orthogonality_error() > 1e-3.
+        The Cayley map can accumulate floating-point drift over many steps;
+        this resets exactly to the nearest orthogonal matrix.
+        """
+        U, _, Vh = torch.linalg.svd(self.weights, full_matrices=False)
+        self.weights.copy_(U @ Vh)
+
+    @torch.no_grad()
+    def orthogonality_error(self) -> float:
+        """
+        Diagnostic: ‖WᵀW − I‖_F.  Should stay < 1e-3.
+        If it exceeds 1e-3, call reorthogonalize() and reduce the Cayley lr.
+        """
+        I = torch.eye(self.weights.size(0), device=self.weights.device)
+        return (self.weights.t() @ self.weights - I).norm().item()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LMU maths helper (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 
 def get_AB(d: int, theta: float) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -47,47 +155,38 @@ def get_AB(d: int, theta: float) -> Tuple[np.ndarray, np.ndarray]:
 
     A_ij = (2i+1) * { -1           if i < j
                     { (-1)^{i-j+1}  if i ≥ j
-
     B_i  = (2i+1) * (-1)^i
 
-    ZOH via scipy.signal.cont2discrete gives exact Ā, B̄ for dt=1.
     Returns float32 arrays of shape (d, d) and (d, 1).
     """
     Q = np.arange(d, dtype=float)
-    R = (2 * Q + 1)[:, None]          # (d, 1)
-    j, i = np.meshgrid(Q, Q)          # i=row, j=col  (both (d,d))
+    R = (2 * Q + 1)[:, None]
+    j, i = np.meshgrid(Q, Q)
 
     A = R * np.where(i < j, -1.0, (-1.0) ** (i - j + 1))
     A /= theta
-    B = R * ((-1.0) ** Q)[:, None]    # (d, 1)
+    B = R * ((-1.0) ** Q)[:, None]
     B /= theta
 
-    # ZOH: Ā = expm(A·dt),  B̄ = Ā (A⁻¹ B - A⁻¹ B e^{-Adt})  (computed by scipy)
     C_dummy = np.zeros((1, d))
     D_dummy = np.zeros((1,))
     Ad, Bd, _, _, _ = cont2discrete((A, B, C_dummy, D_dummy), dt=1.0, method='zoh')
     return Ad.astype(np.float32), Bd.astype(np.float32)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LMUCell
+# ─────────────────────────────────────────────────────────────────────────────
+
 class LMUCell(nn.Module):
     """
-    One step of the multichannel LMU.
+    One step of the multichannel LMU — gated write variant.
 
-    Args:
-        input_size  (C): encoder output dim — one independent channel per feature
-        hidden_size (n): nonlinear hidden state units
-        memory_size (d): Legendre polynomial degree (more = finer temporal resolution)
-        theta          : memory window length in time-steps
-                         Set to ~max episode length.  Error ∝ θω/d.
+    State shapes:      h : (B, n)     m : (B, d, C)
+    Returns:           h_new, m_new, r_intr
+                       r_intr : (B,)  — Step 1: log only (β=0, not added to rewards)
 
-    State shapes:
-        h : (B, n)      shared nonlinear hidden state
-        m : (B, d, C)   d Legendre coefficients × C independent channels
-
-    Hyperparameter guidance:
-        theta  — MemoryS7: ~100,  MemoryS13: ~200  (cover full episode)
-        d      — 32–64 (32 is a reasonable start; increase if memory is shallow)
-        n      — 64–128 (controls nonlinear capacity, independent of d)
+    See module docstring for optimizer and training loop integration.
     """
 
     def __init__(
@@ -98,47 +197,39 @@ class LMUCell(nn.Module):
         theta:       float,
     ):
         super().__init__()
-        self.input_size  = input_size   # C
-        self.hidden_size = hidden_size  # n
-        self.memory_size = memory_size  # d
+        self.input_size  = input_size
+        self.hidden_size = hidden_size
+        self.memory_size = memory_size
 
-        # ── Fixed memory matrices (frozen, not trained) ───────────────────
-        # Ā: (d, d)   B̄: (d, 1)
-        # These encode the Legendre projection; training them destroys the
-        # theoretical guarantees (Voelker 2019 §3).
+        # ── Fixed memory matrices (frozen) ────────────────────────────────
         Ad, Bd = get_AB(memory_size, theta)
         self.register_buffer('A', torch.from_numpy(Ad))   # (d, d)
         self.register_buffer('B', torch.from_numpy(Bd))   # (d, 1)
 
-        # ── Encoding: (x, h, m) → u per channel ──────────────────────────
-
-        # eₓ ∈ ℝ^C — one scalar weight per input channel
-        # u_from_x[b, c] = eₓ[c] * x[b, c]
+        # ── Encoding parameters ───────────────────────────────────────────
         self.e_x = nn.Parameter(torch.empty(input_size))
+        # [NEW] e_x is still (C,) but is normalised to unit sphere in forward
+        #       via F.normalize(self.e_x, dim=0).
+        #       This prevents the minimize-r_intr gradient from collapsing e_x→0
+        #       (it can only rotate the per-channel weighting, not shrink it).
+        #       Per-channel scalar semantics are preserved — some channels can
+        #       still dominate others; the constraint is ‖e_x‖₂ = 1, not e_x = const.
 
-        # Eₕ ∈ ℝ^{n×C} — hidden state → per-channel scalar
-        # u_from_h[b, c] = Σ_i Eₕ[c, i] * h[b, i]  (Linear(n→C, no bias))
         self.E_h = spectral_norm(nn.Linear(hidden_size, input_size, bias=False))
-
-
-        # eₘ ∈ ℝ^d — memory readout for encoding, shared across channels
-        # u_from_m[b, c] = Σ_i eₘ[i] * m[b, i, c]
-        # MUST be initialised to 0 (prevents unstable memory feedback at init,
-        # per Voelker 2019 §3: "memory's feedback encoders initialised to eₘ=0")
         self.e_m = nn.Parameter(torch.zeros(memory_size))
 
-        # ── Memory readout for hidden update ─────────────────────────────
-        # Cₚᵣₒⱼ ∈ ℝ^d — contracts d-dim memory → scalar per channel
-        # Equivalent to the C output matrix in SSM notation: y = C m
-        # y[b, c] = Σ_i Cₚᵣₒⱼ[i] * m_new[b, i, c]
-        # self.C_proj = nn.Parameter(torch.empty(memory_size))
+        # ── Gated write  [NEW] ────────────────────────────────────────────
+        # W_pre ∈ O(C): projects innovation into a critic-useful basis.
+        # No bias — required for u_null = pred proof (W_pre(0) = 0 exactly).
+        # MUST be excluded from main Adam optimizer (see module docstring).
+        self.W_pre = OrthoLayer(input_size)
 
+        # ── Memory readout (unchanged) ────────────────────────────────────
+        # [OLD] self.C_proj = nn.Parameter(torch.empty(memory_size))
         self.W_query = nn.Linear(hidden_size, memory_size, bias=False)
         nn.init.orthogonal_(self.W_query.weight, gain=0.01)
-        # ── Hidden state kernels ─────────────────────────────────────────
-        # Wₓ: C → n  (input → hidden)
-        # Wₕ: n → n  (hidden recurrence, no bias to avoid double-counting)
-        # Wₘ: C → n  (memory readout y → hidden)
+
+        # ── Hidden state kernels (unchanged) ─────────────────────────────
         self.W_x = nn.Linear(input_size,  hidden_size, bias=True)
         self.W_h = spectral_norm(nn.Linear(hidden_size, hidden_size, bias=False))
         self.W_m = nn.Linear(input_size,  hidden_size, bias=False)
@@ -146,82 +237,124 @@ class LMUCell(nn.Module):
         self._reset_parameters()
 
     def _reset_parameters(self):
-        # eₓ: LeCun uniform (fan_in=1 per element → U[-1, 1])
         nn.init.uniform_(self.e_x, -1.0, 1.0)
-        # Eₕ: Xavier normal (per Voelker 2019 §3)
         nn.init.xavier_normal_(self.E_h.weight)
-        # e_m already zeros from __init__; do not reinit here
-        # # Cₚᵣₒⱼ: uniform ± 1/√d  (small to not dominate at init)
-        # nn.init.uniform_(self.C_proj,
-        #                  -1.0 / self.memory_size ** 0.5,
-        #                   1.0 / self.memory_size ** 0.5)
-        # Hidden kernels: Xavier normal (per paper §3)
+        # e_m stays zero (Voelker 2019 §3)
+        # W_pre stays identity (OrthoLayer.__init__)
         for layer in (self.W_x, self.W_h, self.W_m):
             nn.init.xavier_normal_(layer.weight)
         nn.init.zeros_(self.W_x.bias)
+
+    # ── Gated write  [NEW METHOD] ─────────────────────────────────────────────
+
+    def _compute_u(
+        self,
+        u_x: torch.Tensor,   # (B, C)
+        u_h: torch.Tensor,   # (B, C)
+        u_m: torch.Tensor,   # (B, C)
+    ) -> torch.Tensor:
+        """
+        Novelty-gated write input. Replaces the baseline:
+          [OLD]  u = u_x + u_h + u_m
+
+        pred  = u_h + u_m              memory's joint prediction of u_x
+        gate  = tanh(u_x)              zeroes at u_x = 0        (Condition 1)
+        innov = tanh(u_x − pred)       zeroes at u_x = pred     (Condition 2)
+        u     = W_pre(gate⊙innov) + pred
+
+        Verification:
+          u_x = 0    → gate = 0 → u = W_pre(0) + pred = pred  ✓
+          u_x = pred → innov = 0 → u = W_pre(0) + pred = pred  ✓
+          novel      → gate≠0, innov≠0 → u = pred + W_pre(innovation)  ✓
+
+        Note: W_pre(0) = 0 exactly because OrthoLayer has no bias.
+        This is not an approximation — it is a hard requirement.
+        """
+        pred  = u_h + u_m
+        gate  = torch.tanh(u_x)
+        innov = torch.tanh(u_x - pred)
+        return self.W_pre(gate * innov) + pred
+
+    # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(
         self,
         x:      torch.Tensor,   # (B, C)
         h_prev: torch.Tensor,   # (B, n)
         m_prev: torch.Tensor,   # (B, d, C)
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Returns:
-            h_new : (B, n)
-            m_new : (B, d, C)
+        Returns: h_new (B, n), m_new (B, d, C), r_intr (B,)
+
+        r_intr = ‖u_actual − u_null‖₂
+               = ‖W_pre(gate ⊙ innov)‖₂
+               = ‖gate ⊙ innov‖₂        (W_pre is an isometry: ‖Wv‖₂ = ‖v‖₂)
+               ∈ [0, √C]               (both tanh factors bounded in (−1, 1)^C)
+
+        Step 1 (current): β = 0 — r_intr logged, not added to rewards.
+        Step 2: r_combined = r_ext + β * r_intr, β starting at 0.001.
+                Also add minimize-r_intr auxiliary loss with weight η.
         """
 
-        # ── Step 1: compute u ∈ (B, C) ───────────────────────────────────
-        # Each channel c gets an independent scalar:
-        #   u_c = eₓ[c]·x_c  +  Eₕ[:,c]·h  +  eₘ·m[:,c]
+        # ── Step 1: per-channel u ─────────────────────────────────────────
 
-        u_x = x * self.e_x                                    # (B, C) element-wise
-        u_h = self.E_h(h_prev)                                # (B, C) via Linear(n→C)
-        u_m = torch.einsum('d,bdc->bc', self.e_m, m_prev)    # (B, C) dot over d-dim
-        u   = u_x + u_h + u_m                                 # (B, C)
+        # [OLD] u_x = x * self.e_x
+        e_x_n = F.normalize(self.e_x, dim=0)               # (C,)  ‖e_x_n‖₂ = 1
+        u_x   = x * e_x_n                                   # (B, C)
 
-        # ── Step 2: Legendre memory update ───────────────────────────────
-        # m'[b,i,c] = Σ_j Ā[i,j] m[b,j,c]  +  B̄[i] · u[b,c]
-        #
-        # einsum('ij,bjc->bic'): matrix-multiply Ā over the d dimension,
-        #   independently for every batch element b and channel c.
-        # B̄: (d, 1), u.unsqueeze(1): (B, 1, C)
-        # PyTorch pads B̄ to (1, d, 1) → broadcast to (B, d, C)  ✓
+        u_h = self.E_h(h_prev)                              # (B, C)
+        u_m = torch.einsum('d,bdc->bc', self.e_m, m_prev)  # (B, C)
+
+        # [OLD] u = u_x + u_h + u_m
+        u_actual = self._compute_u(u_x, u_h, u_m)          # (B, C)
+
+        # ── Intrinsic reward  [NEW] ───────────────────────────────────────
+        # u_null: what _compute_u returns when u_x = 0.
+        # Provably equals pred (gate_null = tanh(0) = 0 → W_pre(0) = 0).
+        # Kept in the live graph (no stop_grad) so that gradients flow through
+        # u_h and u_m, training E_h and e_m to predict u_x (world model signal).
+        # At β=0 (Step 1), no gradient flows through r_intr anyway — the graph
+        # connection is inert until r_intr appears in the loss at Step 2.
+        u_null = self._compute_u(torch.zeros_like(u_x), u_h, u_m)  # (B, C) = pred
+        r_intr = (u_actual - u_null).norm(dim=-1)                   # (B,)
+
+        # ── Step 2: Legendre memory update ────────────────────────────────
         Am    = torch.einsum('ij,bjc->bic', self.A, m_prev)   # (B, d, C)
-        Bu    = self.B * u.unsqueeze(1)                        # (B, d, C)
+        # [OLD] Bu = self.B * u.unsqueeze(1)
+        Bu    = self.B * u_actual.unsqueeze(1)                 # (B, d, C)
         m_new = Am + Bu                                        # (B, d, C)
 
-        # ── Step 3: memory readout → y ∈ (B, C) ─────────────────────────
-        # y[b,c] = Σ_i Cₚᵣₒⱼ[i] · m_new[b,i,c]
-        # (SSM C-matrix: maps d-dim Legendre state → scalar per channel)
-        # y = torch.einsum('d,bdc->bc', self.C_proj, m_new)     # (B, C)
-        C_t = self.W_query(h_prev)                        # (B, d)
-        C_t = torch.nn.functional.normalize(C_t, dim=-1)  # unit norm — bounds gradient
-        y   = torch.einsum('bd,bdc->bc', C_t, m_new)      # (B, C)
+        # ── Step 3: dynamic read head (unchanged) ─────────────────────────
+        C_t = F.normalize(self.W_query(h_prev), dim=-1)       # (B, d)
+        y   = torch.einsum('bd,bdc->bc', C_t, m_new)          # (B, C)
 
-        # ── Step 4: nonlinear hidden update ──────────────────────────────
-        # h' = tanh(Wₓ x + Wₕ h + Wₘ y)
+        # ── Step 4: hidden update (unchanged) ────────────────────────────
         h_new = torch.tanh(
             self.W_x(x) + self.W_h(h_prev) + self.W_m(y)
         )                                                      # (B, n)
 
-        return h_new, m_new
+        # [OLD] return h_new, m_new
+        return h_new, m_new, r_intr
 
     def initial_state(
         self, n: int, device: torch.device
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Zero initial state.  n = batch_size or n_envs."""
+        """Zero initial state. n = batch_size or n_envs."""
         h = torch.zeros(n, self.hidden_size, device=device)
         m = torch.zeros(n, self.memory_size, self.input_size, device=device)
         return h, m
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LMU — sequence wrapper (not used by lmu_ppo.py, updated for completeness)
+# ─────────────────────────────────────────────────────────────────────────────
+
 class LMU(nn.Module):
     """
     Sequence wrapper around LMUCell.
     Input  : x  (B, T, C)
-    Output : out (B, T, n),  final_state (h, m)
+    # [OLD] Output : out (B, T, n),  final_state (h, m)
+    Output : out (B, T, n),  r_intrs (B, T),  final_state (h, m)
     """
     def __init__(self, input_size, hidden_size, memory_size, theta):
         super().__init__()
@@ -231,42 +364,14 @@ class LMU(nn.Module):
         self,
         x:     torch.Tensor,
         state: Tuple[torch.Tensor, torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, T, _ = x.shape
         h, m = state if state is not None else self.cell.initial_state(B, x.device)
-        outs = []
+        outs, r_intrs = [], []
         for t in range(T):
-            h, m = self.cell(x[:, t], h, m)
+            # [OLD] h, m = self.cell(x[:, t], h, m)
+            h, m, r = self.cell(x[:, t], h, m)
             outs.append(h)
-        return torch.stack(outs, dim=1), (h, m)
-
-
-# if __name__ == '__main__':
-#     torch.manual_seed(0)
-#     B, C, n, d = 4, 64, 128, 32
-#     theta = 100.0  # MemoryS7; use 200 for MemoryS13
-
-#     cell = LMUCell(C, n, d, theta)
-
-#     # Sanity: spectral radius of Ā must be < 1 for stability
-#     rho = torch.linalg.eigvals(cell.A).abs().max().item()
-#     assert rho < 1.0, f"Unstable Ā: spectral radius {rho:.4f}"
-#     print(f"Ā spectral radius: {rho:.6f}  ✓ stable")
-
-#     # A, B must be non-trainable
-#     assert not cell.A.requires_grad and not cell.B.requires_grad
-
-#     h, m = cell.initial_state(B, torch.device('cpu'))
-#     x = torch.randn(B, C)
-#     h_new, m_new = cell(x, h, m)
-#     assert h_new.shape == (B, n),    f"h shape: {h_new.shape}"
-#     assert m_new.shape == (B, d, C), f"m shape: {m_new.shape}"
-#     print(f"h: {tuple(h_new.shape)}  m: {tuple(m_new.shape)}  ✓")
-
-#     # Sequence wrapper
-#     model = LMU(C, n, d, theta)
-#     seq = torch.randn(B, 50, C)
-#     out, (h_f, m_f) = model(seq)
-#     assert out.shape == (B, 50, n)
-#     print(f"LMU sequence output: {tuple(out.shape)}  ✓")
-#     print("All checks passed.")
+            r_intrs.append(r)
+        # [OLD] return torch.stack(outs, dim=1), (h, m)
+        return torch.stack(outs, dim=1), torch.stack(r_intrs, dim=1), (h, m)

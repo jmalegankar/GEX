@@ -1,35 +1,38 @@
 """
-LMU Actor-Critic Policy — TBPTT version.
+LMU Actor-Critic Policy — Gated Write variant.
 
-The only method that changes meaningfully is evaluate_actions.
-Previously it ran 1 LMU step per sample.  Now it unrolls K steps,
-with gradient flowing back through the entire chunk.
+Changes from baseline:
+──────────────────────
+1. LMUCell.forward now returns (h, m, r_intr).
+   All three call sites updated:
+     forward()          → returns r_intr as 7th value (Option A)
+     evaluate_actions() → accumulates r_intrs per step, returns as 4th value
+     predict_values()   → discards r_intr with _
 
-Episode boundary handling:
-    episode_starts[b, k] == 1 means obs[b, k] is the first obs of a new episode.
-    Before processing step k, we zero h and m for any env where this is True.
-    This is equivalent to h = h * (1 - reset), m = m * (1 - reset).
-    Gradient does NOT flow through a reset (the multiplication kills it), so
-    episodes are independent in the backward pass — correct TBPTT behaviour.
+2. Optimizer excludes W_pre from Adam (see __init__).
+   W_pre uses its own Riemannian update (ortho_update) in the training loop.
+
+3. evaluate_actions returns r_intrs at β=0 (Step 1) for diagnostic logging.
+   The values are not zero — the computation runs every step — but they are
+   NOT in the loss until Step 2.  This is intentional: Step 1 validation
+   requires observing r_intr trends to confirm the gated write is behaving
+   before any gradient from it is introduced.
+
+Old lines are commented with  # [OLD]  and kept for diff/reversion.
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributions import Categorical
 from gymnasium import spaces
 from typing import Dict, Tuple
 
 from lmu import LMUCell
-# from lmu_new import LMUCell
 
 
 class MinigridEncoder(nn.Module):
-    """
-    Encoder for MiniGrid Dict obs (unchanged from previous version).
-    image: (B, 3, H, W) categorical channels after VecTransposeImage
-    direction: (B,) Discrete(4)
-    Output: (B, out_dim)
-    """
+    """Unchanged from baseline."""
 
     N_OBJECTS    = 11
     N_COLORS     = 6
@@ -83,11 +86,16 @@ class MinigridEncoder(nn.Module):
 
 class LMUActorCriticPolicy(nn.Module):
     """
-    MinigridEncoder → LMUCell → actor + critic.
+    MinigridEncoder → LMUCell (gated write) → actor + critic.
 
-    State convention (unchanged):
-        h : (B, n)      stored BEFORE processing current obs
-        m : (B, d, C)   stored BEFORE processing current obs
+    Optimizer note:
+        W_pre must be excluded from Adam — it is updated via Riemannian steps
+        in the training loop (lmu_ppo.py train()).  The split is done here in
+        __init__ so the optimizer is constructed correctly from the start.
+
+        self.optimizer covers all params EXCEPT lmu_cell.W_pre.
+        lmu_ppo.train() must call self.policy.lmu_cell.W_pre.ortho_update(lr)
+        after every loss.backward() and before optimizer.step().
     """
 
     def __init__(
@@ -111,33 +119,12 @@ class LMUActorCriticPolicy(nn.Module):
         self.encoder  = MinigridEncoder(observation_space, encoder_dim)
         self.lmu_cell = LMUCell(encoder_dim, hidden_size, memory_size, theta)
 
-        # Both actor and critic receive cat([h, m_pooled]) directly.
-        #
-        # Why actor also needs m_pooled:
-        #   The LMU's C_proj readout (m → y → W_m → h) collapses during
-        #   training because C_proj and W_m are coupled — if C_proj is small,
-        #   W_m sees noise and doesn't learn; Adam then shrinks C_proj further.
-        #   In practice h ends up dominated by W_x(x) + W_h(h) (current obs
-        #   + recurrence) with almost no memory signal. The actor acting on h
-        #   alone is effectively memoryless.
-        #
-        #   Giving both heads direct access to m.mean(d) → (B, C) bypasses
-        #   the C_proj bottleneck entirely. C_proj + W_m remain as an auxiliary
-        #   pathway that can still learn, but the primary memory signal is
-        #   direct. The actor can now condition on ball identity from step 1
-        #   even before C_proj has learned anything useful.
-        #
-        # head_in = hidden_size + encoder_dim  (h concat m_pooled)
         head_in = hidden_size + encoder_dim
 
-        # Actor: linear over head_in → n_actions.
-        # Small orthogonal gain (0.01) keeps initial policy near-uniform.
         self.actor = nn.Linear(head_in, n_actions)
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
 
-        # Critic: two-layer MLP — nonlinearity lets it threshold on memory
-        # content ("did we see the ball?") not just linearly combine features.
         self.critic = nn.Sequential(
             nn.Linear(head_in, head_in // 2),
             nn.Tanh(),
@@ -148,103 +135,111 @@ class LMUActorCriticPolicy(nn.Module):
         nn.init.orthogonal_(self.critic[2].weight, gain=1.0)
         nn.init.zeros_(self.critic[2].bias)
 
-        # Re-initialise C_proj larger so the W_m pathway isn't dead from the
-        # start. Previously ±1/√d ≈ ±0.177 shrank to ~0.04 during training.
-        # Orthogonal init preserves gradient magnitude through the readout.
-        # with torch.no_grad():
-        #     tmp = torch.empty(1, self.lmu_cell.memory_size)
-        #     nn.init.orthogonal_(tmp)
-        #     self.lmu_cell.C_proj.data.copy_(tmp.squeeze(0))
+        # [NEW] Exclude W_pre from Adam.
+        # W_pre has its own Riemannian update (OrthoLayer.ortho_update).
+        # If W_pre were included, Adam would apply stale momentum updates
+        # after ortho_update zeros the grad, corrupting orthogonality.
+        ortho_params  = set(self.lmu_cell.W_pre.parameters())
+        main_params   = [p for p in self.parameters() if p not in ortho_params]
+        # [OLD] self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
+        self.optimizer = torch.optim.Adam(main_params, lr=lr, eps=1e-5)
 
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
-
-    # ── helpers ───────────────────────────────────────────────────────────────
+    # ── helpers (unchanged) ───────────────────────────────────────────────────
 
     def _critic_input(self, h: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        """
-        Concatenate h and mean-pooled m for the critic.
-
-        h : (B, n)
-        m : (B, d, C)
-        → (B, n + C)
-        """
-        m_pooled = m.mean(dim=1)          # (B, d, C) → (B, C), pool over Legendre dim
+        m_pooled = m.mean(dim=1)   # (B, d, C) → (B, C)
         return torch.cat([h, m_pooled], dim=-1)
 
-    # ── rollout (single step, no grad needed) ────────────────────────────────
+    # ── rollout (single step) ─────────────────────────────────────────────────
 
     def forward(
         self,
         obs:    Dict[str, torch.Tensor],
-        h_prev: torch.Tensor,   # (B, n)
-        m_prev: torch.Tensor,   # (B, d, C)
+        h_prev: torch.Tensor,
+        m_prev: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor]:
+               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        # [OLD] Returns: action, value, log_prob, h, m, logits        (6 values)
+        Returns:         action, value, log_prob, h, m, logits, r_intr (7 values)
+
+        r_intr : (B,) — Step 1: caller logs this, does NOT add to rewards.
+        """
         x = self.encoder(obs)
-        h, m     = self.lmu_cell(x, h_prev, m_prev)
-        logits   = self.actor(self._critic_input(h, m))   # actor now sees memory too
+
+        # [OLD] h, m    = self.lmu_cell(x, h_prev, m_prev)
+        h, m, r_intr = self.lmu_cell(x, h_prev, m_prev)
+
+        logits   = self.actor(self._critic_input(h, m))
         dist     = Categorical(logits=logits)
         action   = dist.sample()
         log_prob = dist.log_prob(action)
         value    = self.critic(self._critic_input(h, m)).squeeze(-1)
-        return action, value, log_prob, h, m, logits
 
-    # ── PPO update (K-step unroll, full gradient) ─────────────────────────────
+        # [OLD] return action, value, log_prob, h, m, logits
+        return action, value, log_prob, h, m, logits, r_intr
+
+    # ── PPO update (K-step unroll) ────────────────────────────────────────────
 
     def evaluate_actions(
         self,
-        obs_seq:        Dict[str, torch.Tensor],  # each (B, K, ...)
-        lmu_h:          torch.Tensor,             # (B, n)       chunk-start state
-        lmu_m:          torch.Tensor,             # (B, d, C)    chunk-start state
-        episode_starts: torch.Tensor,             # (B, K)  float32
-        actions_seq:    torch.Tensor,             # (B, K)  long
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        obs_seq:        Dict[str, torch.Tensor],
+        lmu_h:          torch.Tensor,
+        lmu_m:          torch.Tensor,
+        episode_starts: torch.Tensor,
+        actions_seq:    torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Unrolls K LMU steps with full gradient.
 
-        Episode boundary handling:
-            Before step k, zero h and m wherever episode_starts[:, k] == 1.
-            Multiplication by (1 - reset) is differentiable but kills gradient
-            at the boundary — correct: no grad flows between episodes.
+        # [OLD] Returns (flattened over B*K): values, log_probs, entropy
+        Returns (flattened over B*K):          values, log_probs, entropy, r_intrs
 
-            reset_h : (B, 1)     broadcasts over hidden dim
-            reset_m : (B, 1, 1)  broadcasts over (d, C)
+        r_intrs : (B*K,)
+          Step 1 (β=0): returned for logging only.  NOT in the PPO loss.
+          Step 2: lmu_ppo.train() adds η * r_intrs.mean() to the loss.
 
-        Returns (flattened over B*K):
-            values   : (B*K,)
-            log_probs: (B*K,)
-            entropy  : (B*K,)
+        NOTE on r_intrs vs collect_rollouts r_intr:
+          These are recomputed with gradient during the PPO update pass.
+          The values will differ slightly from the no-grad rollout values
+          because the policy weights have been updated between rollout and
+          update. This is the same situation as log_probs vs old_log_prob —
+          expected and correct.  Do not use evaluate_actions r_intrs for the
+          reward shaping signal; use the rollout values for that.
         """
         B, K = episode_starts.shape
         h, m = lmu_h, lmu_m
 
-        all_values, all_log_probs, all_entropy = [], [], []
+        all_values, all_log_probs, all_entropy, all_r_intrs = [], [], [], []
 
         for k in range(K):
-            # Zero state at episode boundaries (no grad through reset)
-            reset    = episode_starts[:, k:k+1]              # (B, 1)
-            h = h * (1.0 - reset)                            # (B, n)
-            m = m * (1.0 - reset.unsqueeze(-1))              # (B, d, C)
+            reset = episode_starts[:, k:k+1]          # (B, 1)
+            h = h * (1.0 - reset)                     # (B, n)
+            m = m * (1.0 - reset.unsqueeze(-1))       # (B, d, C)
 
             obs_k = {key: obs_seq[key][:, k] for key in obs_seq}
-            x     = self.encoder(obs_k)                      # (B, C)
-            h, m  = self.lmu_cell(x, h, m)                  # (B,n), (B,d,C)
+            x     = self.encoder(obs_k)               # (B, C)
 
-            head    = self._critic_input(h, m)             # (B, n+C) — shared input
-            logits  = self.actor(head)
-            dist    = Categorical(logits=logits)
+            # [OLD] h, m  = self.lmu_cell(x, h, m)
+            h, m, r_intr = self.lmu_cell(x, h, m)    # (B,n), (B,d,C), (B,)
+
+            head   = self._critic_input(h, m)
+            logits = self.actor(head)
+            dist   = Categorical(logits=logits)
             all_log_probs.append(dist.log_prob(actions_seq[:, k]))
             all_entropy.append(dist.entropy())
             all_values.append(self.critic(head).squeeze(-1))
+            all_r_intrs.append(r_intr)                # [NEW]
 
-        # (B, K) → (B*K,)
         values    = torch.stack(all_values,    dim=1).reshape(B * K)
         log_probs = torch.stack(all_log_probs, dim=1).reshape(B * K)
         entropy   = torch.stack(all_entropy,   dim=1).reshape(B * K)
+        r_intrs   = torch.stack(all_r_intrs,   dim=1).reshape(B * K)  # [NEW]
 
-        return values, log_probs, entropy
+        # [OLD] return values, log_probs, entropy
+        return values, log_probs, entropy, r_intrs
 
-    # ── GAE bootstrap (single step, no grad needed) ──────────────────────────
+    # ── GAE bootstrap ─────────────────────────────────────────────────────────
 
     def predict_values(
         self,
@@ -253,8 +248,11 @@ class LMUActorCriticPolicy(nn.Module):
         lmu_m: torch.Tensor,
     ) -> torch.Tensor:
         x = self.encoder(obs)
-        h, m = self.lmu_cell(x, lmu_h, lmu_m)
+        # [OLD] h, m = self.lmu_cell(x, lmu_h, lmu_m)
+        h, m, _ = self.lmu_cell(x, lmu_h, lmu_m)   # r_intr not needed here
         return self.critic(self._critic_input(h, m)).squeeze(-1)
+
+    # ── state helpers (unchanged) ─────────────────────────────────────────────
 
     def initial_state(
         self, n_envs: int, device: torch.device
