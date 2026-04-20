@@ -85,6 +85,7 @@ class LMUPPO(PPO):
         theta:              float = 50.0,
         chunk_len:          int = 16,
         n_chunks_per_batch: int = 16,
+        beta:               float = 0.001,
         tensorboard_log:    Optional[str] = None,
         verbose:            int = 1,
         seed:               Optional[int] = None,
@@ -97,6 +98,7 @@ class LMUPPO(PPO):
         self.theta              = theta
         self.chunk_len          = chunk_len
         self.n_chunks_per_batch = n_chunks_per_batch
+        self.beta               = beta
 
         super().__init__(
             policy="MultiInputPolicy",
@@ -192,6 +194,7 @@ class LMUPPO(PPO):
         # would overwrite the same key each step; only the last value would
         # survive to the flush.  Collect here, log the mean after the loop.
         r_intr_buf = []
+        beta = self.beta
 
         n_steps = 0
         while n_steps < n_rollout_steps:
@@ -217,10 +220,13 @@ class LMUPPO(PPO):
 
             n_steps += 1
 
+            r_intr_masked = r_intr.cpu().numpy() * (1.0 - self._last_episode_starts)
+            rewards_combined = rewards + beta * r_intr_masked
+
             rollout_buffer.add(
                 self._last_obs,
                 actions_np.reshape(-1, 1),
-                rewards,
+                rewards_combined,          # [OLD] rewards
                 self._last_episode_starts,
                 values,
                 log_probs,
@@ -267,6 +273,9 @@ class LMUPPO(PPO):
         # Monotone growth → u_actual too large. Monotone shrink → write collapsing.
         m_norm = self._lmu_m.norm(dim=(1, 2)).mean().item()
         self.logger.record("debug/m_norm", m_norm)
+        self.logger.record("intrinsic/beta",    beta)
+        self.logger.record("intrinsic/r_intr_contribution",
+                           beta * r_intr_all.mean().item())
 
         callback.on_rollout_end()
         return True

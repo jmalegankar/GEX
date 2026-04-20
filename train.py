@@ -100,6 +100,8 @@ def main():
                              "Total batch size = n_chunks_per_batch * chunk_len.")
     parser.add_argument("--full_bptt",   action="store_true",
                         help="Use full-episode BPTT (chunk_len = max episode length)")
+    parser.add_argument("--beta",        type=float, default=0.001,
+                        help="Intrinsic reward weight (0 = disabled)")
     args = parser.parse_args()
 
     env_id = ENV_IDS[args.env]
@@ -154,7 +156,7 @@ def main():
         target_kl=0.05,
         seed=args.seed,
         device=args.device,
-
+        beta=args.beta,
     )
 
     # Total chunks available per rollout = (n_steps // chunk_len) * n_envs
