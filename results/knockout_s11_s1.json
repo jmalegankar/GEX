@@ -1,0 +1,48 @@
+{
+  "never": {
+    "knockout_at": "never",
+    "n_episodes": 200,
+    "n_knockout_applied": 0,
+    "success_rate": 1.0,
+    "success_rate_when_knocked_out": null,
+    "success_rate_when_not_knocked_out": 1.0,
+    "per_knockout_step_success": {}
+  },
+  "junction": {
+    "knockout_at": "junction",
+    "n_episodes": 200,
+    "n_knockout_applied": 200,
+    "success_rate": 0.46,
+    "success_rate_when_knocked_out": 0.46,
+    "success_rate_when_not_knocked_out": null,
+    "per_knockout_step_success": {
+      "3": {
+        "n": 200,
+        "success_rate": 0.46
+      }
+    }
+  },
+  "midcorridor": {
+    "knockout_at": "midcorridor",
+    "n_episodes": 200,
+    "n_knockout_applied": 200,
+    "success_rate": 0.51,
+    "success_rate_when_knocked_out": 0.51,
+    "success_rate_when_not_knocked_out": null,
+    "per_knockout_step_success": {
+      "5": {
+        "n": 200,
+        "success_rate": 0.51
+      }
+    }
+  },
+  "always": {
+    "knockout_at": "always",
+    "n_episodes": 200,
+    "n_knockout_applied": 0,
+    "success_rate": 0.47,
+    "success_rate_when_knocked_out": null,
+    "success_rate_when_not_knocked_out": 0.47,
+    "per_knockout_step_success": {}
+  }
+}

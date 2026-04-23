@@ -1,32 +1,32 @@
 """
-LMU-PPO: PPO with an LMU recurrent policy.
+LMU-PPO: PPO with an LMU recurrent policy + E3B episodic bonus.
 
-Changes from baseline:
-──────────────────────
-1. collect_rollouts: unpacks 10-value policy.forward (adds gate, innov, u_x).
-   gate/innov/u_x captured as local variables BEFORE callback.on_step().
-   This is the fix for the EvalCallback mid-rollout shape clobber:
-     - policy.forward() returns gate/innov/u_x as named local tensors
-     - callback.on_step() may call model.predict() → policy.forward() on the
-       eval env (n_envs=1), which returns shape [1, C] tensors
-     - because we captured gate/innov/u_x into locals before the callback,
-       the training-batch tensors [n_envs, C] are already safe in prod/u_x_step
-     - the old _last_* attribute pattern assigned self.policy.lmu_cell._last_prod
-       AFTER forward() but BEFORE the callback, then READ _last_prod AFTER the
-       callback — by which point predict() had overwritten it with [1, C].
-       That's the exact shape mismatch at entry 112 (eval_freq=625 with n_envs=16
-       means first eval fires 625 - 512 = 113 steps into rollout 2 → index 112).
+Phase 2 additions on top of the Phase 0 patched version:
+─────────────────────────────────────────────────────────
+1. EllipticalEpisodicBonus (from episodic_bonus.py) wired into
+   collect_rollouts. The bonus b_t = y_t^T M_{t-1}^{-1} y_t is computed
+   from the LMU's W_query readout y at each step, normalized by a running
+   std, scaled by beta_ep, and added to the reward alongside r_intr.
 
-2. train: unpacks 4-value evaluate_actions (adds r_intrs).
-   r_intrs logged per update. W_pre.ortho_update called after every
-   loss.backward(). Periodic orthogonality check every 100 updates.
+2. y computation: recomputed from (h_prev, m_new) inside the rollout loop
+   using the same formula as LMUCell.forward's read head. This avoids
+   touching the cell's return signature.
 
-3. predict: unpacks 10-value policy.forward, discards all diagnostics.
+3. HintCorridorDiscriminationTracker logs ratio_b = E[b|hint] / E[b|corridor]
+   per rollout. If this drops below ~2 for several rollouts, add the
+   inverse dynamics auxiliary loss (plan.md Phase 2.5).
 
-Old lines marked  # [OLD]  and kept for diff/reversion.
+4. beta_ep = 0.0 disables the episodic bonus entirely — this is the flag
+   for the no-wrapper baseline run without E3B.
+
+New constructor args vs Phase 0:
+    beta_ep    : float, episodic bonus weight (default 0.03, 0.0 = disabled)
+    lambda_reg : float, E3B regularization lambda (default 1.0)
+
+All Phase 0 changes are preserved intact.
 """
 
-from typing import Any, Optional, Tuple, Type, Union
+from typing import Optional, Union
 
 import numpy as np
 import torch as th
@@ -34,30 +34,36 @@ import torch.nn.functional as F
 from gymnasium import spaces
 
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.type_aliases import GymEnv, Schedule
 from stable_baselines3.common.utils import (
     explained_variance,
     get_schedule_fn,
     obs_as_tensor,
 )
-from stable_baselines3.common.vec_env import VecEnv
 
 from .buffer import LMURolloutBuffer
+from .episodic_bonus import (
+    EllipticalEpisodicBonus,
+    HintCorridorDiscriminationTracker,
+    RunningStd,
+)
 from .policies import LMUActorCriticPolicy
-from torch.distributions import Categorical, kl_divergence
-import os
 
 
 class LMUPPO(PPO):
     """
-    PPO with LMU recurrent policy (gated write variant).
+    PPO with LMU recurrent policy and E3B episodic bonus.
 
-    Key differences from standard PPO:
-      - LMU state (h, m) tracked per env during rollout
-      - State reset to zero on episode boundaries
-      - State stored in buffer; re-run with gradient during update
-      - W_pre maintained on O(C) via Riemannian updates (ortho_update)
+    Total reward at step t:
+        r_t = r_ext_t
+              + beta     * r_intr_t  * (1 - episode_start_t)   [lifelong]
+              + beta_ep  * b_t_norm  * (1 - episode_start_t)   [episodic]
+
+    r_intr_t = ||gate ⊙ innov||₂   from LMUCell (gated write prediction error)
+    b_t_norm = b_t / running_std(b) where b_t = y_t^T M_{t-1}^{-1} y_t
+
+    Set beta_ep=0.0 to run the lifelong-only baseline (reproduces Phase 0).
+    Set beta=0.0 to run E3B-only (not recommended; lifelong signal is cheap).
     """
 
     policy: LMUActorCriticPolicy
@@ -65,41 +71,45 @@ class LMUPPO(PPO):
 
     def __init__(
         self,
-        env:                GymEnv,
+        env: GymEnv,
         policy=None,
-        lr:                 Union[float, Schedule] = 3e-4,
-        n_steps:            int = 2048,
-        batch_size:         int = 256,
-        n_epochs:           int = 10,
-        gamma:              float = 0.999,
-        gae_lambda:         float = 0.95,
-        clip_range:         Union[float, Schedule] = 0.2,
-        clip_range_vf:      Optional[float] = None,
+        lr: Union[float, Schedule] = 3e-4,
+        n_steps: int = 2048,
+        batch_size: int = 256,
+        n_epochs: int = 10,
+        gamma: float = 0.999,
+        gae_lambda: float = 0.95,
+        clip_range: Union[float, Schedule] = 0.2,
+        clip_range_vf: Optional[float] = None,
         normalize_advantage: bool = True,
-        ent_coef:           float = 0.01,
-        vf_coef:            float = 0.5,
-        max_grad_norm:      float = 0.5,
-        target_kl:          Optional[float] = None,
-        encoder_dim:        int = 64,
-        hidden_size:        int = 64,
-        memory_size:        int = 32,
-        theta:              float = 50.0,
-        chunk_len:          int = 16,
+        ent_coef: float = 0.01,
+        vf_coef: float = 0.5,
+        max_grad_norm: float = 0.5,
+        target_kl: Optional[float] = None,
+        encoder_dim: int = 64,
+        hidden_size: int = 64,
+        memory_size: int = 32,
+        theta: float = 50.0,
+        chunk_len: int = 16,
         n_chunks_per_batch: int = 16,
-        beta:               float = 0.001,
-        tensorboard_log:    Optional[str] = None,
-        verbose:            int = 1,
-        seed:               Optional[int] = None,
-        device:             Union[th.device, str] = "auto",
-        _init_setup_model:  bool = True,
+        beta: float = 0.001,
+        beta_ep: float = 0.03,     # [NEW] episodic bonus weight
+        lambda_reg: float = 1.0,   # [NEW] E3B regularization
+        tensorboard_log: Optional[str] = None,
+        verbose: int = 1,
+        seed: Optional[int] = None,
+        device: Union[th.device, str] = "auto",
+        _init_setup_model: bool = True,
     ):
-        self.encoder_dim        = encoder_dim
-        self.hidden_size        = hidden_size
-        self.memory_size        = memory_size
-        self.theta              = theta
-        self.chunk_len          = chunk_len
+        self.encoder_dim = encoder_dim
+        self.hidden_size = hidden_size
+        self.memory_size = memory_size
+        self.theta = theta
+        self.chunk_len = chunk_len
         self.n_chunks_per_batch = n_chunks_per_batch
-        self.beta               = beta
+        self.beta = beta
+        self.beta_ep = beta_ep
+        self.lambda_reg = lambda_reg
 
         super().__init__(
             policy="MultiInputPolicy",
@@ -167,7 +177,7 @@ class LMUPPO(PPO):
         self._lmu_m: Optional[th.Tensor] = None
 
     # ------------------------------------------------------------------
-    # Learn setup
+    # Learn setup — E3B objects created here (n_envs is known)
     # ------------------------------------------------------------------
 
     def _setup_learn(self, total_timesteps, callback=None,
@@ -177,7 +187,25 @@ class LMUPPO(PPO):
             total_timesteps, callback, reset_num_timesteps,
             tb_log_name, progress_bar
         )
-        self._lmu_h, self._lmu_m = self.policy.initial_state(self.n_envs, self.device)
+        self._lmu_h, self._lmu_m = self.policy.initial_state(
+            self.n_envs, self.device
+        )
+
+        # E3B objects — only allocated if beta_ep > 0
+        if self.beta_ep > 0:
+            self._ep_bonus = EllipticalEpisodicBonus(
+                n_envs=self.n_envs,
+                dim=self.encoder_dim,
+                lambda_reg=self.lambda_reg,
+                device=self.device,
+            )
+            self._b_running_std = RunningStd(epsilon=1e-4)
+            self._disc_tracker = HintCorridorDiscriminationTracker()
+        else:
+            self._ep_bonus = None
+            self._b_running_std = None
+            self._disc_tracker = None
+
         return ret
 
     # ------------------------------------------------------------------
@@ -191,36 +219,55 @@ class LMUPPO(PPO):
         rollout_buffer.reset()
         callback.on_rollout_start()
 
+        # Diagnostic buffers — GPU, transferred once at rollout end
         r_intr_buf = []
-        prod_buf   = []   # gate ⊙ innov per step — captured before callback
-        u_x_buf    = []   # channel-weighted obs per step — captured before callback
-        beta = self.beta
+        prod_buf   = []
+        u_x_buf    = []
+        gate_buf   = []
+        innov_buf  = []
+        ep_start_buf = []
+        # E3B bonus buffer (CPU numpy, parallel to r_intr_buf)
+        b_buf = []
+
+        beta    = self.beta
+        beta_ep = self.beta_ep
 
         n_steps = 0
         while n_steps < n_rollout_steps:
 
             with th.no_grad():
                 obs_t = obs_as_tensor(self._last_obs, self.device)
-
-                # [OLD] actions, values, log_probs, h_new, m_new, logits_t, r_intr = \
-                # [OLD]     self.policy.forward(obs_t, self._lmu_h, self._lmu_m)
                 actions, values, log_probs, h_new, m_new, logits_t, r_intr, \
                     gate, innov, u_x = \
                     self.policy.forward(obs_t, self._lmu_h, self._lmu_m)
 
-                # [FIX] Compute prod here, inside the no_grad block, using the
-                # return values of this exact forward call.  This is the only
-                # safe place — callback.on_step() (below) may call predict()
-                # which calls lmu_cell.forward() on the eval env (n_envs=1),
-                # returning [1, C] tensors.  The old approach read
-                #   self.policy.lmu_cell._last_prod   (side-effect attribute)
-                # AFTER the callback, by which point predict() had overwritten
-                # it with shape [1, C].  Stacking [n_envs, C] and [1, C] tensors
-                # raised the RuntimeError at entry 112.
-                # Now gate/innov/u_x are local variables — immutable to any
-                # subsequent forward call.
-                prod     = gate * innov              # (n_envs, C) detached
-                # u_x is already (n_envs, C) detached — no copy needed
+                prod = gate * innov  # (n_envs, C) detached, GPU
+
+                # ── E3B bonus ────────────────────────────────────────────
+                if self._ep_bonus is not None:
+                    # Recompute y using h_prev (before update) and m_new
+                    # (after write). Matches LMUCell.forward's read head.
+                    C_t = F.normalize(
+                        self.policy.lmu_cell.W_query(self._lmu_h), dim=-1
+                    )  # (n_envs, d)
+                    y_t = th.einsum('bd,bdc->bc', C_t, m_new)  # (n_envs, C)
+
+                    b_raw = self._ep_bonus.bonus_and_update(y_t)  # (n_envs,)
+
+                    # Update running std with this batch of bonus values
+                    self._b_running_std.update(b_raw.cpu().numpy())
+                    b_norm = (b_raw.cpu().numpy()
+                              / (self._b_running_std.std + 1e-6))
+
+                    b_buf.append(b_norm)  # (n_envs,) numpy
+
+                    # Track discrimination for monitoring
+                    # self._last_obs['image'] is (n_envs, C, H, W) numpy
+                    self._disc_tracker.record(
+                        self._last_obs['image'], b_raw.cpu().numpy()
+                    )
+
+            ep_start_buf.append(self._last_episode_starts.copy())
 
             actions_np = actions.cpu().numpy()
             new_obs, rewards, dones, infos = env.step(actions_np)
@@ -232,20 +279,27 @@ class LMUPPO(PPO):
 
             self._update_info_buffer(infos, dones)
 
-            # Accumulate — do NOT log inside the loop (overwrites same key each step)
-            r_intr_buf.append(r_intr.cpu())
-            prod_buf.append(prod.cpu())    # [FIX] was: self.policy.lmu_cell._last_prod.cpu()
-            u_x_buf.append(u_x.cpu())     # [FIX] was: self.policy.lmu_cell._last_u_x.cpu()
+            r_intr_buf.append(r_intr)
+            prod_buf.append(prod)
+            u_x_buf.append(u_x)
+            gate_buf.append(gate)
+            innov_buf.append(innov)
 
             n_steps += 1
 
-            r_intr_masked    = r_intr.cpu().numpy() * (1.0 - self._last_episode_starts)
+            # ── Reward combination ────────────────────────────────────
+            mask = (1.0 - self._last_episode_starts)  # (n_envs,)
+            r_intr_masked = r_intr.cpu().numpy() * mask
             rewards_combined = rewards + beta * r_intr_masked
+
+            if self._ep_bonus is not None:
+                b_masked = b_norm * mask
+                rewards_combined = rewards_combined + beta_ep * b_masked
 
             rollout_buffer.add(
                 self._last_obs,
                 actions_np.reshape(-1, 1),
-                rewards_combined,          # [OLD] rewards
+                rewards_combined,
                 self._last_episode_starts,
                 values,
                 log_probs,
@@ -256,25 +310,36 @@ class LMUPPO(PPO):
             self._lmu_h = h_new.clone()
             self._lmu_m = m_new.clone()
 
-            for i, done in enumerate(dones):
-                if done:
-                    self._lmu_h[i].zero_()
-                    self._lmu_m[i].zero_()
+            # Reset LMU state and E3B buffer at episode boundaries
+            done_envs = np.where(dones)[0].tolist()
+            for i in done_envs:
+                self._lmu_h[i].zero_()
+                self._lmu_m[i].zero_()
+            if self._ep_bonus is not None and done_envs:
+                self._ep_bonus.reset(done_envs)
 
-            self._last_obs            = new_obs
+            self._last_obs = new_obs
             self._last_episode_starts = dones
 
         with th.no_grad():
-            obs_t  = obs_as_tensor(new_obs, self.device)
+            obs_t = obs_as_tensor(new_obs, self.device)
             values = self.policy.predict_values(obs_t, self._lmu_h, self._lmu_m)
 
         rollout_buffer.compute_returns_and_advantage(values, dones)
 
-        # Step 1 diagnostics — logged once per rollout.
-        r_intr_all = th.stack(r_intr_buf)          # (n_steps, n_envs)
-        self.logger.record("debug/r_intr_mean",      r_intr_all.mean().item())
-        self.logger.record("debug/r_intr_max",        r_intr_all.max().item())
+        # ────────── Per-rollout diagnostics ──────────────────────────
+        r_intr_all = th.stack(r_intr_buf).cpu()    # (T, n_envs)
+        prod_all   = th.stack(prod_buf).cpu()      # (T, n_envs, C)
+        u_x_all    = th.stack(u_x_buf).cpu()
+        gate_all   = th.stack(gate_buf).cpu()
+        innov_all  = th.stack(innov_buf).cpu()
+        ep_start_all = np.stack(ep_start_buf)      # (T, n_envs) bool
 
+        # ── r_intr ───────────────────────────────────────────────────
+        self.logger.record("debug/r_intr_mean", r_intr_all.mean().item())
+        self.logger.record("debug/r_intr_max",  r_intr_all.max().item())
+
+        # ── W_pre and e_x ────────────────────────────────────────────
         e_x_norm = F.normalize(self.policy.lmu_cell.e_x, dim=0).norm().item()
         self.logger.record("debug/e_x_norm", e_x_norm)
 
@@ -282,32 +347,73 @@ class LMUPPO(PPO):
         self.logger.record("debug/W_pre_ortho_error", ortho_err)
         if ortho_err > 1e-3:
             if self.verbose >= 1:
-                print(f"  [warn] W_pre ortho error = {ortho_err:.2e} — running SVD reset")
+                print(f"  [warn] W_pre ortho error = {ortho_err:.2e} — SVD reset")
             self.policy.lmu_cell.W_pre.reorthogonalize()
 
+        # ── Memory magnitude ─────────────────────────────────────────
         m_norm = self._lmu_m.norm(dim=(1, 2)).mean().item()
         self.logger.record("debug/m_norm", m_norm)
-        self.logger.record("intrinsic/beta",                 beta)
-        self.logger.record("intrinsic/r_intr_contribution",  beta * r_intr_all.mean().item())
+        self.logger.record("intrinsic/beta",    beta)
+        self.logger.record("intrinsic/beta_ep", beta_ep)
+        self.logger.record("intrinsic/r_intr_contribution",
+                           beta * r_intr_all.mean().item())
 
-        # Bug-1 and encoder diagnostics.
-        # prod_all: (n_steps, n_envs, C)  — all captured before any callback call
-        prod_all = th.stack(prod_buf)
-        u_x_all  = th.stack(u_x_buf)
+        # ── Bug 1: cold-start sign bias ──────────────────────────────
+        ep_start_t = th.from_numpy(ep_start_all)          # (T, n_envs) bool
+        prod_cold = prod_all[ep_start_t]
+        prod_warm = prod_all[~ep_start_t]
 
-        # prod_positive_frac ≈ 1.0 early and stays → sign-bias is real (Bug 1)
-        # prod_positive_frac ≈ 0.5 throughout     → bias is not a problem
-        self.logger.record("debug/prod_positive_frac",
+        if prod_cold.numel() > 0:
+            self.logger.record("debug/prod_positive_frac_cold_start",
+                               (prod_cold > 0).float().mean().item())
+            gate_cold  = gate_all[ep_start_t]
+            innov_cold = innov_all[ep_start_t]
+            self.logger.record("debug/gate_positive_frac_cold",
+                               (gate_cold > 0).float().mean().item())
+            self.logger.record("debug/innov_positive_frac_cold",
+                               (innov_cold > 0).float().mean().item())
+        if prod_warm.numel() > 0:
+            self.logger.record("debug/prod_positive_frac_warm",
+                               (prod_warm > 0).float().mean().item())
+        self.logger.record("debug/prod_positive_frac_all",
                            (prod_all > 0).float().mean().item())
+        self.logger.record("debug/gate_abs_mean",  gate_all.abs().mean().item())
+        self.logger.record("debug/innov_abs_mean", innov_all.abs().mean().item())
 
-        # u_x_zero_frac: ReLU encoder saturation suppressing write inputs
-        # if ≥ 0.3, encoder is saturating and killing novelty signal
+        # ── Encoder saturation ────────────────────────────────────────
         self.logger.record("debug/u_x_zero_frac",
                            (u_x_all.abs() < 1e-6).float().mean().item())
 
-        # Per-channel novelty: which encoder channels drive r_intr
-        self.logger.record("debug/gate_innov_per_channel",
-                           prod_all.abs().mean(dim=(0, 1)).tolist())
+        # ── Per-channel novelty concentration ─────────────────────────
+        per_chan = prod_all.abs().mean(dim=(0, 1))  # (C,)
+        self.logger.record("debug/per_channel_mean", per_chan.mean().item())
+        self.logger.record("debug/per_channel_std",  per_chan.std().item())
+        self.logger.record("debug/per_channel_max",  per_chan.max().item())
+        active = (per_chan > 0.1 * per_chan.max()).float().sum().item()
+        self.logger.record("debug/active_channel_count", active)
+
+        # ── E3B diagnostics ───────────────────────────────────────────
+        if self._ep_bonus is not None and b_buf:
+            b_all = np.stack(b_buf)  # (T, n_envs)
+            self.logger.record("episodic/b_mean",    float(b_all.mean()))
+            self.logger.record("episodic/b_max",     float(b_all.max()))
+            self.logger.record("episodic/b_std",     float(b_all.std()))
+            self.logger.record("episodic/b_running_std",
+                               self._b_running_std.std)
+            self.logger.record("episodic/b_contribution",
+                               beta_ep * float(b_all.mean()))
+
+            # Discrimination monitoring — KEY metric for Phase 2 health
+            disc = self._disc_tracker.flush()
+            for k, v in disc.items():
+                self.logger.record(f"episodic/disc_{k}", v)
+
+            # The critical number — log prominently
+            if 'ratio_b' in disc:
+                self.logger.record("episodic/ratio_b", disc['ratio_b'])
+                if disc['ratio_b'] < 2.0 and self.verbose >= 1:
+                    print(f"  [warn] episodic ratio_b = {disc['ratio_b']:.2f} "
+                          f"(below 2.0 — consider adding inverse dynamics aux)")
 
         callback.on_rollout_end()
         return True
@@ -338,19 +444,19 @@ class LMUPPO(PPO):
             h[dones] = 0.0; m[dones] = 0.0
 
         with th.no_grad():
-            # [OLD] actions, _, _, h_new, m_new, logits_t, _ = \
-            # [OLD]     self.policy.forward(obs_tensor, h, m)
-            actions, _, _, h_new, m_new, logits_t, _, _, _, _ = \
+            actions, _, _, h_new, m_new, _, _, _, _, _ = \
                 self.policy.forward(obs_tensor, h, m)
 
         actions = actions.cpu().numpy()
         if isinstance(self.action_space, spaces.Box):
-            actions = np.clip(actions, self.action_space.low, self.action_space.high)
+            actions = np.clip(
+                actions, self.action_space.low, self.action_space.high
+            )
 
         return actions, (h_new, m_new)
 
     # ------------------------------------------------------------------
-    # PPO update
+    # PPO update — unchanged from Phase 0
     # ------------------------------------------------------------------
 
     def train(self) -> None:
@@ -367,12 +473,15 @@ class LMUPPO(PPO):
         pg_losses, value_losses, entropy_losses = [], [], []
         clip_fractions, approx_kl_divs, grad_norms = [], [], []
         r_intrs_log = []
+        wpre_grad_norms = []
+        comp_grad_norms = {
+            "encoder": [], "lmu_cell": [], "actor": [], "critic": []
+        }
 
         continue_training = True
         for epoch in range(self.n_epochs):
             for batch in self.rollout_buffer.get(self.n_chunks_per_batch):
 
-                # [OLD] values, log_prob, entropy = self.policy.evaluate_actions(...)
                 values, log_prob, entropy, r_intrs = self.policy.evaluate_actions(
                     obs_seq=batch.observations,
                     lmu_h=batch.lmu_h,
@@ -383,9 +492,10 @@ class LMUPPO(PPO):
 
                 advantages = batch.advantages
                 if self.normalize_advantage and len(advantages) > 1:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    advantages = (advantages - advantages.mean()) / \
+                                 (advantages.std() + 1e-8)
 
-                ratio       = th.exp(log_prob - batch.old_log_prob)
+                ratio = th.exp(log_prob - batch.old_log_prob)
                 policy_loss = -th.min(
                     advantages * ratio,
                     advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range),
@@ -400,52 +510,55 @@ class LMUPPO(PPO):
                 value_loss   = F.mse_loss(batch.returns, values_pred)
                 entropy_loss = -entropy.mean()
 
-                loss = (
-                    policy_loss
-                    + self.ent_coef * entropy_loss
-                    + self.vf_coef  * value_loss
-                )
+                loss = (policy_loss
+                        + self.ent_coef * entropy_loss
+                        + self.vf_coef * value_loss)
 
                 with th.no_grad():
-                    log_ratio     = log_prob - batch.old_log_prob
-                    approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).item()
+                    log_ratio = log_prob - batch.old_log_prob
+                    approx_kl_div = th.mean(
+                        (th.exp(log_ratio) - 1) - log_ratio
+                    ).item()
                     approx_kl_divs.append(approx_kl_div)
 
-                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                if (self.target_kl is not None
+                        and approx_kl_div > 1.5 * self.target_kl):
                     continue_training = False
                     if self.verbose >= 1:
-                        print(f"  Early stopping epoch {epoch}, KL={approx_kl_div:.3f}")
+                        print(f"  Early stopping epoch {epoch}, "
+                              f"KL={approx_kl_div:.3f}")
                     break
 
                 self.policy.optimizer.zero_grad()
                 loss.backward()
 
-                # Log W_pre grad norm before ortho_update zeros it.
-                # If wpre_gn stays >> 1 consistently, Cayley lr=1e-3 is too large.
                 if self.policy.lmu_cell.W_pre.weights.grad is not None:
-                    wpre_gn = self.policy.lmu_cell.W_pre.weights.grad.norm().item()
-                    self.logger.record("debug/W_pre_grad_norm", wpre_gn)
+                    wpre_grad_norms.append(
+                        self.policy.lmu_cell.W_pre.weights.grad.norm().item()
+                    )
                 self.policy.lmu_cell.W_pre.ortho_update(lr=1e-3)
 
-                # Per-component gradient clipping.
-                # W_pre excluded: ortho_update already zeroed its grad.
-                _comp_norms = []
-                for _comp in [self.policy.encoder, self.policy.lmu_cell,
-                               self.policy.actor, self.policy.critic]:
-                    _comp_norms.append(
-                        th.nn.utils.clip_grad_norm_(
-                            _comp.parameters(), self.max_grad_norm
-                        ).item()
-                    )
-                grad_norm = max(_comp_norms)
+                _per_comp = []
+                for _name, _mod in [
+                    ("encoder",  self.policy.encoder),
+                    ("lmu_cell", self.policy.lmu_cell),
+                    ("actor",    self.policy.actor),
+                    ("critic",   self.policy.critic),
+                ]:
+                    pre_clip = th.nn.utils.clip_grad_norm_(
+                        _mod.parameters(), self.max_grad_norm
+                    ).item()
+                    comp_grad_norms[_name].append(pre_clip)
+                    _per_comp.append(pre_clip)
+
+                grad_norm = max(_per_comp)
                 self.policy.optimizer.step()
 
-                # Periodic hard orthogonality check (every 100 updates)
                 if self._n_updates % 100 == 0:
                     ortho_err = self.policy.lmu_cell.W_pre.orthogonality_error()
                     if ortho_err > 1e-3:
                         if self.verbose >= 1:
-                            print(f"  [warn] W_pre ortho error={ortho_err:.2e} "
+                            print(f"  [warn] W_pre ortho={ortho_err:.2e} "
                                   f"at update {self._n_updates} — SVD reset")
                         self.policy.lmu_cell.W_pre.reorthogonalize()
 
@@ -456,7 +569,7 @@ class LMUPPO(PPO):
                 clip_fractions.append(
                     th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 )
-                grad_norms.append(grad_norm if isinstance(grad_norm, float) else grad_norm.item())
+                grad_norms.append(grad_norm)
                 self._n_updates += 1
 
             if not continue_training:
@@ -474,7 +587,16 @@ class LMUPPO(PPO):
         self.logger.record("train/clip_fraction",      np.mean(clip_fractions))
         self.logger.record("train/grad_norm",          np.mean(grad_norms))
         self.logger.record("train/explained_variance", explained_var)
-        self.logger.record("train/n_updates",          self._n_updates, exclude="tensorboard")
+        self.logger.record("train/n_updates",
+                           self._n_updates, exclude="tensorboard")
         self.logger.record("train/learning_rate",      lr)
         self.logger.record("train/clip_range",         clip_range)
         self.logger.record("debug/r_intrs_train_mean", np.mean(r_intrs_log))
+
+        for name, values_list in comp_grad_norms.items():
+            if values_list:
+                self.logger.record(f"grad/{name}_norm",
+                                   float(np.mean(values_list)))
+        if wpre_grad_norms:
+            self.logger.record("debug/W_pre_grad_norm",
+                               float(np.mean(wpre_grad_norms)))

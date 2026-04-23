@@ -1,547 +1,627 @@
 """
-scripts/diagnose_e3b.py
+Phase 1 diagnostic: does the LMU's W_query readout y discriminate hint-room
+states from corridor states under an elliptical (Mahalanobis) metric?
 
-Phase 1 diagnostic: post-hoc episodic elliptical bonus (E3B) on a converged
-LMU-PPO checkpoint.
+This is the go/no-go gate for the E3B-on-y approach. It runs on a CONVERGED
+S11 checkpoint (no training, no gradient) and computes:
 
-Tests two things:
-  1. Discrimination: does y_t = LMU dynamic readout distinguish hint_room steps
-     from corridor steps? (ratio_b = b_hint / b_corridor, target > 3)
-  2. Aliasing: does y at corridor step ~alias_step retain episode-specific
-     information (which ball was in the hint room)? (cosine < 0.95 = good)
+  ratio_b = E[b_t | hint_room] / E[b_t | corridor]
 
-No training, no bonus in rewards. Pure diagnostic rollout.
+where b_t = y_t^T M_{t-1} y_t is the E3B elliptical bonus, M_{t-1} is the
+running inverse second-moment of y across the current episode, and
+hint_room / corridor are defined by ground truth from the observation.
+
+Ground-truth classifier (DEFAULT):
+  hint_room : observation contains a ball or key (MiniGrid object IDs 5, 6)
+  corridor  : observation contains NO ball and NO key
+  excluded  : step 0 (y=0 by construction, since m=0 at episode start)
+
+R_intr-based classifier (FALLBACK, used only on non-converged checkpoints):
+  hint_room : r_intr > mean + 1.5*std AND step < max_hint_steps
+  corridor  : all other non-step-0 steps
+
+Decision table (from plan.md Phase 1.4):
+    ratio_b > 3    : proceed with y as phi directly
+    1.5 <= r <= 3  : proceed but add inverse-dynamics auxiliary loss on y
+    ratio_b < 1.5  : stop, investigate y collapse
 
 Usage:
-    python scripts/diagnose_e3b.py \\
-        --checkpoint lmu_ppo_MemoryS11_s1 \\
-        --env MemoryS11 \\
-        --n_episodes 50 \\
-        --ridge 0.1 \\
-        --hint_steps 10 \\
-        --alias_step 50 \\
-        --out results/e3b_diag.pkl
-
-Decision table (ratio_b):
-    > 3:    Proceed to Phase 2 with y as φ.
-    1.5–3:  Proceed to Phase 2 but add inverse-dynamics auxiliary loss on y.
-    < 1.5:  STOP. Investigate y collapse (low-rank manifold, theta too short).
-
-NOTE on m_norm ≈ 0 (your current run):
-    If memory writes have collapsed, y ≈ C_t @ 0 ≈ 0 for all steps.
-    In that case ratio_b will be near 1 regardless of hint structure —
-    the diagnostic will correctly route you to the STOP branch and prompt
-    investigation of the write gate / theta / encoder saturation before
-    committing to Phase 2.
+    python scripts/diagnose_e3b.py \
+        --checkpoint path/to/lmu_ppo_MemoryS11_s0.zip \
+        --env MemoryS11 \
+        --n_episodes 50 \
+        --classifier ground_truth \
+        --output results/e3b_diag_s11.json
 """
 
 import argparse
-import pickle
-import sys
-from dataclasses import dataclass, field
+import json
+import os
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import gymnasium as gym
-import minigrid  # noqa: F401
-from gymnasium.wrappers import FilterObservation
-from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
-from stable_baselines3.common.utils import obs_as_tensor
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+import gymnasium as gym
+import minigrid  # noqa: F401  register MiniGrid envs
+from gymnasium.wrappers import FilterObservation
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv, VecTransposeImage
+
 from lmu_ppo.lmu_ppo import LMUPPO
 from mem_start import MemoryStartWrapper
 
 
-# ── MiniGrid constants ────────────────────────────────────────────────────────
-# OBJECT_TO_IDX: empty=1, wall=2, door=4, key=5, ball=6, box=7, goal=8
-BALL_OBJ_IDX = 6
-# COLOR_TO_IDX: red=0, green=1, blue=2, purple=3, yellow=4, grey=5
-COLOR_NAMES  = {0: 'red', 1: 'green', 2: 'blue', 3: 'purple', 4: 'yellow', 5: 'grey'}
+# ──────────────────────────────────────────────────────────────────────────
+# Env construction
+# ──────────────────────────────────────────────────────────────────────────
 
 ENV_IDS = {
+    "MemoryS5":  "MiniGrid-MemoryS5-v0",
     "MemoryS7":  "MiniGrid-MemoryS7-v0",
     "MemoryS9":  "MiniGrid-MemoryS9-v0",
     "MemoryS11": "MiniGrid-MemoryS11-v0",
     "MemoryS13": "MiniGrid-MemoryS13-v0",
 }
 
+# MiniGrid object IDs (from minigrid.core.constants.OBJECT_TO_IDX).
+# The MiniGrid-Memory family uses ball (6) or key (5) as the hint object
+# and the two choices at the junction.
+BALL_IDX = 6
+KEY_IDX  = 5
+HINT_OBJECT_IDS = {BALL_IDX, KEY_IDX}
 
-# ── Sherman-Morrison E3B ──────────────────────────────────────────────────────
 
-def sm_init(d: int, ridge: float) -> np.ndarray:
+def make_env(env_id: str, seed: int, use_wrapper: bool):
+    """Single-env factory. use_wrapper=True matches training conditions."""
+    def _init():
+        env = gym.make(env_id)
+        if use_wrapper:
+            env = MemoryStartWrapper(env)
+        env = FilterObservation(env, filter_keys=["image", "direction"])
+        env = Monitor(env)
+        env.reset(seed=seed)
+        return env
+    return _init
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# E3B elliptical bonus (single-env version for diagnostic)
+# ──────────────────────────────────────────────────────────────────────────
+
+class E3BBuffer:
     """
-    M_0 = (λI)^{-1} = (1/λ) I_d.
-
-    Initial bonus b_0 = φ^T M_0 φ = (1/λ) ‖φ‖².
-    With normalize_phi=True, ‖φ‖ = 1 so b_0 = 1/λ for every episode.
-    This is the correct high-novelty starting state — all features are new.
+    Single-env elliptical bonus buffer.
+    Maintains M = Lambda^{-1} in R^{CxC}, reset to (1/lambda) I at each
+    episode start. Updated via Sherman-Morrison.
     """
-    return np.eye(d, dtype=np.float64) / ridge
+    def __init__(self, dim: int, lambda_reg: float, device: torch.device):
+        self.dim = dim
+        self.lam = lambda_reg
+        self.device = device
+        self.reset()
+
+    def reset(self) -> None:
+        self.M = torch.eye(self.dim, device=self.device) / self.lam
+
+    def bonus_and_update(self, phi: torch.Tensor) -> float:
+        """
+        phi: (C,) float tensor.
+        Returns: scalar bonus computed with M_{t-1} (before update).
+        Side effect: updates self.M to M_t via Sherman-Morrison.
+        """
+        Mphi = self.M @ phi                    # (C,)
+        bonus = float(phi @ Mphi)              # scalar
+        denom = 1.0 + bonus                    # scalar, always >= 1
+        outer = Mphi.unsqueeze(-1) * Mphi.unsqueeze(-2)  # (C, C)
+        self.M = self.M - outer / denom
+        return bonus
 
 
-def sm_step(M: np.ndarray, phi: np.ndarray) -> Tuple[float, np.ndarray]:
+# ──────────────────────────────────────────────────────────────────────────
+# y extraction (readout of the LMU)
+# ──────────────────────────────────────────────────────────────────────────
+
+def compute_y(policy, h_prev: torch.Tensor, m_new: torch.Tensor) -> torch.Tensor:
     """
-    Compute E3B bonus THEN update the inverse covariance.
+    y_t = <C_t, m_t> where C_t = normalize(W_query(h_{t-1})).
 
-    b_t  = φ^T M_{t-1} φ            (novelty; high if φ unseen this episode)
-    M_t  = M_{t-1} - (M_{t-1}φ φ^T M_{t-1}) / (1 + φ^T M_{t-1}φ)   [SM rank-1]
+    At t=0 of an episode, h_prev=0 and m_new is the write from step 0 only.
+    W_query(0) = 0 and F.normalize(0) = 0 numerically, so y_0 = 0.
+    That's why we exclude step 0 from both hint and corridor buckets.
 
-    Returns (bonus: float, M_new: ndarray).
-
-    Numerical note: denom = 1 + b_t ≥ 1 always (M is PSD, φ^T M φ ≥ 0),
-    so no risk of division by zero or sign flip.
+    h_prev: (1, hidden)   — the hidden state BEFORE this step
+    m_new:  (1, d, C)     — the memory state AFTER this step's write
     """
-    phi   = phi.astype(np.float64)
-    Mphi  = M @ phi                          # (d,)
-    bonus = float(phi @ Mphi)               # scalar, ≥ 0
-    M_new = M - np.outer(Mphi, Mphi) / (1.0 + bonus)
-    return bonus, M_new
+    lmu = policy.lmu_cell
+    C_t = F.normalize(lmu.W_query(h_prev), dim=-1)         # (1, d)
+    y = torch.einsum('bd,bdc->bc', C_t, m_new).squeeze(0)  # (C,)
+    return y
 
 
-# ── y extraction ─────────────────────────────────────────────────────────────
-
-@torch.no_grad()
-def extract_y(policy, h_prev: torch.Tensor, m_new: torch.Tensor) -> np.ndarray:
+def observation_has_hint(obs_image: np.ndarray) -> bool:
     """
-    Recompute LMU dynamic readout y from (h_prev, m_new).
+    Ground truth: does the agent's egocentric view contain a hint object?
 
-    Mirrors exactly what LMUCell.forward computes internally:
-        C_t = normalize(W_query(h_prev))         # (B, memory_size)
-        y   = einsum('bd,bdc->bc', C_t, m_new)  # (B, encoder_dim)
-
-    We call it externally using return values we already captured — no
-    side-effect attributes, no race condition with EvalCallback.
-
-    Returns: np.ndarray of shape (encoder_dim,), dtype float64.
+    MiniGrid obs structure (after VecTransposeImage): (C=3, H, W)
+      channel 0: object IDs
+      channel 1: color
+      channel 2: state
     """
-    C_t = F.normalize(policy.lmu_cell.W_query(h_prev), dim=-1)  # (1, d)
-    y   = torch.einsum('bd,bdc->bc', C_t, m_new)                 # (1, C)
-    return y.squeeze(0).cpu().numpy().astype(np.float64)
+    obj_channel = obs_image[0]
+    return bool(np.isin(obj_channel, list(HINT_OBJECT_IDS)).any())
 
 
-# ── hint detection ────────────────────────────────────────────────────────────
-
-def detect_ball_color(obs_image: np.ndarray) -> int:
+def count_hint_objects_visible(obs_image: np.ndarray) -> int:
     """
-    Detect hint ball color from a (3, H, W) image observation.
-
-    Channel 0 = object type, channel 1 = color, channel 2 = state.
-    VecTransposeImage has already moved channels first.
-
-    Returns: color index ∈ [0, 5], or -1 if no ball found.
+    Number of hint-object cells visible. At the hint room, typically 1.
+    At the decision junction, the agent sees BOTH the ball and key — so 2.
+    Separates hint-room (== 1) from decision-junction (>= 2).
     """
-    obj_mask = obs_image[0] == BALL_OBJ_IDX   # (H, W)
-    if not obj_mask.any():
-        return -1
-    colors = obs_image[1][obj_mask]           # colors under ball pixels
-    return int(np.bincount(colors).argmax())
+    obj_channel = obs_image[0]
+    n_balls = int((obj_channel == BALL_IDX).sum())
+    n_keys  = int((obj_channel == KEY_IDX).sum())
+    return n_balls + n_keys
 
 
-# ── data containers ───────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────
+# Main rollout loop
+# ──────────────────────────────────────────────────────────────────────────
 
-@dataclass
-class StepRecord:
-    step:         int
-    r_intr:       float
-    b_t:          float   # E3B bonus (before SM update for this step)
-    y_t:          np.ndarray
-    is_hint_room: bool    # step < hint_steps
-
-
-@dataclass
-class EpisodeData:
-    hint_color:   int            # -1 if not detected
-    steps:        List[StepRecord] = field(default_factory=list)
-    total_reward: float = 0.0
-
-    @property
-    def length(self) -> int:
-        return len(self.steps)
-
-
-# ── main rollout ──────────────────────────────────────────────────────────────
-
-def run_episodes(
-    model:       LMUPPO,
+def rollout_and_record(
+    model: LMUPPO,
     env,
-    n_episodes:  int,
-    hint_steps:  int,
-    ridge:       float,
-    normalize_phi: bool = True,
-) -> List[EpisodeData]:
-    """
-    Roll out the policy for n_episodes with no training and no bonus in rewards.
-
-    normalize_phi: L2-normalise y before the SM update.
-        True  → b_t ∈ [0, 1/λ], directly comparable across episodes.
-        False → b_t also reflects y magnitude; informative if m_norm is near 0
-                (y ≈ 0 → b_t ≈ 0 for all steps → ratio_b ≈ 1 regardless of hint).
-    """
+    n_episodes: int,
+    lambda_reg: float,
+    device: torch.device,
+) -> List[Dict]:
     policy = model.policy
     policy.set_training_mode(False)
-    device = model.device
-    d      = model.encoder_dim   # y dimension
 
-    episodes:   List[EpisodeData] = []
-    obs         = env.reset()
-    h, m        = policy.initial_state(1, device)
-    M           = sm_init(d, ridge)
-    step_in_ep  = 0
-    ep          = EpisodeData(hint_color=detect_ball_color(obs['image'][0]))
+    obs0 = env.reset()
+    C = policy.lmu_cell.input_size  # readout dimension (= encoder_dim)
 
-    while len(episodes) < n_episodes:
-        obs_t  = obs_as_tensor(obs, device)
-        h_prev = h.clone()   # capture BEFORE forward — needed for y computation
+    e3b = E3BBuffer(dim=C, lambda_reg=lambda_reg, device=device)
+    episodes: List[Dict] = []
 
-        with torch.no_grad():
-            actions, values, log_probs, h, m, logits, r_intr, gate, innov, u_x = \
-                policy.forward(obs_t, h, m)
-            # Extract y immediately, before any callback or env step can
-            # trigger another policy.forward call with a different batch size.
-            y_t = extract_y(policy, h_prev, m)   # (d,) — m is now m_new
+    for ep_idx in range(n_episodes):
+        if ep_idx > 0:
+            obs0 = env.reset()
 
-        phi = y_t / (np.linalg.norm(y_t) + 1e-8) if normalize_phi else y_t
-        b_t, M = sm_step(M, phi)
+        h, m = policy.initial_state(n_envs=1, device=device)
+        e3b.reset()
 
-        ep.steps.append(StepRecord(
-            step         = step_in_ep,
-            r_intr       = float(r_intr[0].item()),
-            b_t          = b_t,
-            y_t          = y_t.copy(),
-            is_hint_room = step_in_ep < hint_steps,
-        ))
+        per_ep = defaultdict(list)
+        last_obs = obs0
+        last_episode_start = np.array([True])
 
-        obs, rewards, dones, infos = env.step(actions.cpu().numpy())
-        ep.total_reward += float(rewards[0])
-        step_in_ep += 1
+        for t in range(1000):
+            with torch.no_grad():
+                obs_t = {k: torch.as_tensor(v, device=device)
+                         for k, v in last_obs.items()}
 
-        if dones[0]:
-            episodes.append(ep)
-            n = len(episodes)
-            if n % 10 == 0 or n == n_episodes:
-                succ = ep.total_reward > 0
-                color_name = COLOR_NAMES.get(ep.hint_color, '?')
-                print(f"  ep {n:3d}/{n_episodes}  len={ep.length:4d}  "
-                      f"ret={ep.total_reward:.2f}  "
-                      f"hint={color_name}  "
-                      f"{'✓' if succ else '✗'}")
+                # policy.forward returns 10 values; discard gate/innov/u_x
+                action, _, _, h_new, m_new, _, r_intr, _, _, _ = policy.forward(
+                    obs_t, h, m
+                )
 
-            if len(episodes) < n_episodes:
-                h, m        = policy.initial_state(1, device)
-                M           = sm_init(d, ridge)
-                step_in_ep  = 0
-                ep          = EpisodeData(hint_color=detect_ball_color(obs['image'][0]))
+                y_t = compute_y(policy, h, m_new)  # (C,)
+                b_t = e3b.bonus_and_update(y_t)
+
+                r_masked = 0.0 if last_episode_start[0] else float(r_intr.item())
+                b_masked = 0.0 if last_episode_start[0] else float(b_t)
+
+            action_np = action.cpu().numpy()
+            new_obs, reward, done, info = env.step(action_np)
+
+            obs_img = last_obs['image'][0].copy()  # (C, H, W)
+
+            per_ep['step'].append(t)
+            per_ep['r_intr'].append(r_masked)
+            per_ep['b'].append(b_masked)
+            per_ep['y'].append(y_t.cpu().numpy().tolist())
+            per_ep['obs_image'].append(obs_img)
+            per_ep['hint_visible'].append(observation_has_hint(obs_img))
+            per_ep['n_hint_objects'].append(count_hint_objects_visible(obs_img))
+            per_ep['done'].append(bool(done[0]))
+            per_ep['ext_reward'].append(float(reward[0]))
+
+            h = h_new
+            m = m_new
+            last_obs = new_obs
+            last_episode_start = done
+
+            if done[0]:
+                break
+
+        episodes.append(dict(per_ep))
+        if (ep_idx + 1) % 10 == 0:
+            n_hint_steps = sum(per_ep['hint_visible'])
+            print(f"  rolled out {ep_idx + 1}/{n_episodes} episodes "
+                  f"(last len={len(per_ep['step'])}, "
+                  f"hint_visible_steps={n_hint_steps}, "
+                  f"ext_sum={sum(per_ep['ext_reward']):.2f})")
 
     return episodes
 
 
-# ── discrimination metrics ────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────
+# Classifiers
+# ──────────────────────────────────────────────────────────────────────────
 
-def compute_discrimination(episodes: List[EpisodeData]) -> Dict:
+def classify_ground_truth(
+    episodes: List[Dict],
+    exclude_ambiguous: bool = True,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
     """
-    Classify each step as hint_room (step < hint_steps) or corridor, then
-    compute the ratio_b and ratio_r primary metrics.
-
-    b_start: first 3 steps — should be the HIGHEST (most novel, episode just started)
-    b_late:  last 20% of episode — should approach 0 (all y seen before)
+    hint_room  : exactly 1 hint object visible
+    corridor   : 0 hint objects visible
+    excluded   : step 0, OR 2+ hint objects visible (decision junction)
     """
-    b_hint, b_corr   = [], []
-    r_hint, r_corr   = [], []
-    b_start, b_late  = [], []
-    y_norms          = []   # track if y is near-zero (m_norm collapse indicator)
-
+    hint_masks, corridor_masks = [], []
     for ep in episodes:
-        T          = ep.length
-        late_start = max(1, int(0.8 * T))
+        n = len(ep['step'])
+        if n == 0:
+            hint_masks.append(np.array([], dtype=bool))
+            corridor_masks.append(np.array([], dtype=bool))
+            continue
 
-        for s in ep.steps:
-            y_norms.append(float(np.linalg.norm(s.y_t)))
+        n_objects = np.asarray(ep['n_hint_objects'])
+        hint_vis  = np.asarray(ep['hint_visible'])
 
-            if s.is_hint_room:
-                b_hint.append(s.b_t);  r_hint.append(s.r_intr)
-            else:
-                b_corr.append(s.b_t);  r_corr.append(s.r_intr)
+        hint = hint_vis & (n_objects == 1)
+        corridor = ~hint_vis
 
-            if s.step < 3:
-                b_start.append(s.b_t)
-            if s.step >= late_start:
-                b_late.append(s.b_t)
+        if n > 0:
+            hint[0] = False
+            corridor[0] = False
 
-    def _stats(xs):
-        return (float(np.mean(xs)), float(np.std(xs))) if xs else (float('nan'), float('nan'))
+        hint_masks.append(hint)
+        corridor_masks.append(corridor)
 
-    bh_mu, bh_sd = _stats(b_hint)
-    bc_mu, bc_sd = _stats(b_corr)
-    ratio_b = bh_mu / bc_mu if bc_mu > 0 else float('inf')
-    ratio_r = (np.mean(r_hint) / np.mean(r_corr)) if r_corr and np.mean(r_corr) > 0 else float('inf')
+    return hint_masks, corridor_masks
+
+
+def classify_r_intr_proxy(
+    episodes: List[Dict],
+    z_threshold: float = 1.5,
+    max_steps_for_hint: int = 10,
+) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """Legacy r_intr-based classifier. Fails on converged checkpoints."""
+    hint_masks, corridor_masks = [], []
+    for ep in episodes:
+        n = len(ep['step'])
+        if n == 0:
+            hint_masks.append(np.array([], dtype=bool))
+            corridor_masks.append(np.array([], dtype=bool))
+            continue
+
+        r = np.asarray(ep['r_intr'])
+        mu, sigma = r.mean(), r.std() + 1e-8
+        novelty_mask = r > (mu + z_threshold * sigma)
+        step_mask = np.asarray(ep['step']) < max_steps_for_hint
+        hint = novelty_mask & step_mask
+
+        corridor = ~hint
+        if n > 0:
+            hint[0] = False
+            corridor[0] = False
+
+        hint_masks.append(hint)
+        corridor_masks.append(corridor)
+
+    return hint_masks, corridor_masks
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Discrimination analysis
+# ──────────────────────────────────────────────────────────────────────────
+
+def compute_discrimination_metrics(
+    episodes: List[Dict],
+    hint_masks: List[np.ndarray],
+    corridor_masks: List[np.ndarray],
+) -> Dict:
+    b_hint_all, b_corridor_all = [], []
+    r_hint_all, r_corridor_all = [], []
+
+    for ep, h_mask, c_mask in zip(episodes, hint_masks, corridor_masks):
+        if len(h_mask) == 0:
+            continue
+        if h_mask.sum() == 0 and c_mask.sum() == 0:
+            continue
+        b = np.asarray(ep['b'])
+        r = np.asarray(ep['r_intr'])
+
+        if h_mask.sum() > 0:
+            b_hint_all.append(b[h_mask])
+            r_hint_all.append(r[h_mask])
+        if c_mask.sum() > 0:
+            b_corridor_all.append(b[c_mask])
+            r_corridor_all.append(r[c_mask])
+
+    if not b_hint_all:
+        return {
+            'status': 'no_hint_detected',
+            'note': 'Classifier found no hint-room steps.',
+        }
+    if not b_corridor_all:
+        return {
+            'status': 'no_corridor_detected',
+            'note': 'Classifier found no corridor steps. With wrapper, '
+                    'episodes may be too short for a pure-corridor phase.',
+        }
+
+    b_hint = np.concatenate(b_hint_all)
+    b_corridor = np.concatenate(b_corridor_all)
+    r_hint = np.concatenate(r_hint_all)
+    r_corridor = np.concatenate(r_corridor_all)
+
+    eps = 1e-8
+    ratio_b = b_hint.mean() / (b_corridor.mean() + eps)
+    ratio_r = r_hint.mean() / (r_corridor.mean() + eps)
+
+    if ratio_b > 3.0:
+        decision = 'PROCEED_with_y_as_phi'
+    elif ratio_b > 1.5:
+        decision = 'PROCEED_with_inverse_dynamics_aux'
+    else:
+        decision = 'STOP_investigate_y_collapse'
 
     return {
-        'b_hint_mean':      bh_mu,   'b_hint_std':      bh_sd,
-        'b_corridor_mean':  bc_mu,   'b_corridor_std':  bc_sd,
-        'b_start_mean':     _stats(b_start)[0],
-        'b_late_mean':      _stats(b_late)[0],
-        'r_hint_mean':      float(np.mean(r_hint))  if r_hint  else float('nan'),
-        'r_corridor_mean':  float(np.mean(r_corr))  if r_corr  else float('nan'),
-        'ratio_b':          ratio_b,
-        'ratio_r':          float(ratio_r),
-        'y_norm_mean':      float(np.mean(y_norms)),   # near 0 → memory collapsed
-        'y_norm_std':       float(np.std(y_norms)),
-        'n_hint_steps':     len(b_hint),
-        'n_corridor_steps': len(b_corr),
+        'status': 'ok',
+        'n_hint_steps': int(b_hint.size),
+        'n_corridor_steps': int(b_corridor.size),
+        'b_hint_mean': float(b_hint.mean()),
+        'b_hint_std': float(b_hint.std()),
+        'b_corridor_mean': float(b_corridor.mean()),
+        'b_corridor_std': float(b_corridor.std()),
+        'ratio_b': float(ratio_b),
+        'r_intr_hint_mean': float(r_hint.mean()),
+        'r_intr_corridor_mean': float(r_corridor.mean()),
+        'ratio_r': float(ratio_r),
+        'decision': decision,
     }
 
 
-# ── aliasing check ────────────────────────────────────────────────────────────
-
-def compute_aliasing(episodes: List[EpisodeData], alias_step: int) -> Dict:
-    """
-    1.5: Aliasing check at corridor step alias_step.
-
-    For episodes long enough to reach alias_step:
-      - Extract y at that step
-      - Compute pairwise cosine similarity
-      - Compute Mahalanobis distance using pool covariance
-      - If hint colors known: compare within-color vs cross-color cosine
-
-    Interpretation:
-      mean_cosine > 0.95  → all y's look the same regardless of hint →
-                             hint info has decayed (theta too short, or m_norm ≈ 0)
-      mean_cosine < 0.95  → y retains episode-specific structure → good
-      color_discrim > 0   → within-hint-color y's are MORE similar than
-                             cross-color y's → memory encodes the hint → great
-    """
-    Y_list, colors = [], []
+def compute_episode_profile(episodes: List[Dict]) -> Dict:
+    b_start, b_mid, b_end = [], [], []
+    b_start_skip0, b_mid_skip0, b_end_skip0 = [], [], []
 
     for ep in episodes:
-        if ep.length > alias_step:
-            Y_list.append(ep.steps[alias_step].y_t)
-            colors.append(ep.hint_color)
+        b = np.asarray(ep['b'])
+        T = len(b)
+        if T < 3:
+            continue
+        t1, t2 = T // 3, 2 * T // 3
+        b_start.append(b[:t1].mean())
+        b_mid.append(b[t1:t2].mean())
+        b_end.append(b[t2:].mean())
 
-    N = len(Y_list)
-    if N < 2:
-        return {'error': f'Only {N} episode(s) reached step {alias_step}. '
-                         f'Try a smaller --alias_step.'}
+        if T > 3 and t1 >= 2:
+            b_start_skip0.append(b[1:t1].mean())
+            b_mid_skip0.append(b[t1:t2].mean())
+            b_end_skip0.append(b[t2:].mean())
 
-    Y = np.stack(Y_list, axis=0)   # (N, d)
-
-    # ── cosine similarity ─────────────────────────────────────────────────────
-    Y_n  = Y / (np.linalg.norm(Y, axis=1, keepdims=True) + 1e-8)
-    C_mat = Y_n @ Y_n.T           # (N, N)
-    mask  = ~np.eye(N, dtype=bool)
-    mean_cos = float(C_mat[mask].mean())
-    max_cos  = float(C_mat[mask].max())
-
-    # ── Mahalanobis ───────────────────────────────────────────────────────────
-    # Use pinv for robustness when d > N (likely here: d=64, N≤50)
-    cov     = np.cov(Y.T) + 1e-6 * np.eye(Y.shape[1])
-    cov_inv = np.linalg.pinv(cov)
-    # Sample up to 10×10 pairs to keep computation cheap
-    idx   = np.arange(min(N, 10))
-    dists = []
-    for i in idx:
-        for j in idx:
-            if i >= j:
-                continue
-            d_vec = Y[i] - Y[j]
-            dists.append(float(np.sqrt(max(0, d_vec @ cov_inv @ d_vec))))
-    mean_mahal = float(np.mean(dists)) if dists else float('nan')
-
-    result = {
-        'alias_step':               alias_step,
-        'n_episodes':               N,
-        'mean_cosine':              mean_cos,
-        'max_cosine':               max_cos,
-        'mean_mahalanobis':         mean_mahal,
-        'y_mean_norm_at_step':      float(np.linalg.norm(Y, axis=1).mean()),
+    return {
+        'b_start_third_mean': float(np.mean(b_start)) if b_start else 0.0,
+        'b_middle_third_mean': float(np.mean(b_mid)) if b_mid else 0.0,
+        'b_end_third_mean': float(np.mean(b_end)) if b_end else 0.0,
+        'b_start_third_mean_skip0':
+            float(np.mean(b_start_skip0)) if b_start_skip0 else 0.0,
+        'b_middle_third_mean_skip0':
+            float(np.mean(b_mid_skip0)) if b_mid_skip0 else 0.0,
+        'b_end_third_mean_skip0':
+            float(np.mean(b_end_skip0)) if b_end_skip0 else 0.0,
     }
 
-    # ── per-color breakdown ───────────────────────────────────────────────────
-    known   = [(i, c) for i, c in enumerate(colors) if c >= 0]
-    if len(known) >= 4 and len(set(c for _, c in known)) >= 2:
-        within, cross = [], []
-        for a, (i, ci) in enumerate(known):
-            for b_, (j, cj) in enumerate(known):
-                if b_ <= a:
-                    continue
-                (within if ci == cj else cross).append(C_mat[i, j])
-        result['within_color_cosine']  = float(np.mean(within)) if within else float('nan')
-        result['cross_color_cosine']   = float(np.mean(cross))  if cross  else float('nan')
-        # Positive = within-color y's are closer = hint is encoded in y
-        result['color_discrimination'] = (
-            result['within_color_cosine'] - result['cross_color_cosine']
-        )
 
-    return result
-
-
-# ── report ────────────────────────────────────────────────────────────────────
-
-def print_report(disc: Dict, alias: Dict, n_episodes: int,
-                 mean_ep_len: float, mean_ret: float):
-    W = 62
-    print("\n" + "="*W)
-    print("  PHASE 1 — E3B DIAGNOSTIC REPORT")
-    print("="*W)
-    print(f"  Episodes: {n_episodes}  |  mean_len: {mean_ep_len:.1f}  |  "
-          f"mean_ret: {mean_ret:.3f}")
-    print()
-
-    print("[Discrimination]")
-    print(f"  b_hint_mean     = {disc['b_hint_mean']:8.4f}  ± {disc['b_hint_std']:.4f}  "
-          f"(n={disc['n_hint_steps']})")
-    print(f"  b_corridor_mean = {disc['b_corridor_mean']:8.4f}  ± {disc['b_corridor_std']:.4f}  "
-          f"(n={disc['n_corridor_steps']})")
-    print(f"  b_start_mean    = {disc['b_start_mean']:8.4f}  (first 3 steps; should be highest)")
-    print(f"  b_late_mean     = {disc['b_late_mean']:8.4f}  (last 20%; should be near 0)")
-    print()
-    print(f"  ratio_b = {disc['ratio_b']:.3f}   ← PRIMARY METRIC (target > 3)")
-    print(f"  ratio_r = {disc['ratio_r']:.3f}   ← r_intr ratio (comparison)")
-    print(f"  y_norm_mean = {disc['y_norm_mean']:.4f} ± {disc['y_norm_std']:.4f}"
-          f"  ← near 0 means memory has collapsed (m_norm issue)")
-    print()
-
-    ratio = disc['ratio_b']
-    print("[Decision]")
-    if ratio > 3.0:
-        print("  ✓  ratio_b > 3")
-        print("     → Proceed to Phase 2 with y as φ (no auxiliary loss needed).")
-    elif ratio >= 1.5:
-        print("  ⚠  1.5 ≤ ratio_b ≤ 3")
-        print("     → Proceed to Phase 2 with inverse-dynamics auxiliary loss on y.")
-        print("       This strengthens the episodic structure before E3B scaling.")
-    else:
-        print("  ✗  ratio_b < 1.5")
-        print("     → STOP. y is not discriminative. Investigate:")
-        if disc['y_norm_mean'] < 0.01:
-            print("       • y_norm ≈ 0: memory has collapsed (m_norm issue from TB).")
-            print("         Fix encoder saturation (u_x_zero_frac=0.72) first.")
-            print("         Replace proj ReLU with ELU or add pre-LMU LayerNorm.")
+def compute_hint_visibility_stats(episodes: List[Dict]) -> Dict:
+    hint_step_ranges = []
+    n_hint_steps_per_ep = []
+    for ep in episodes:
+        hv = np.asarray(ep['hint_visible'])
+        if hv.any():
+            idx = np.where(hv)[0]
+            hint_step_ranges.append((int(idx.min()), int(idx.max())))
+            n_hint_steps_per_ep.append(int(hv.sum()))
         else:
-            print("       • y has nonzero norm but no episodic structure.")
-            print("         Consider: theta too short, W_query not learning, or")
-            print("         e_m=0 init preventing meaningful reads from memory.")
-    print()
+            n_hint_steps_per_ep.append(0)
 
-    print("[Aliasing check]")
-    if 'error' in alias:
-        print(f"  ERROR: {alias['error']}")
-    else:
-        print(f"  step={alias['alias_step']}  n_episodes={alias['n_episodes']}")
-        print(f"  y_norm at step   = {alias['y_mean_norm_at_step']:.4f}")
-        print(f"  mean_cosine      = {alias['mean_cosine']:.4f}  "
-              f"({'✗ HIGH — hint decayed' if alias['mean_cosine'] > 0.95 else '✓ OK'})")
-        print(f"  max_cosine       = {alias['max_cosine']:.4f}")
-        print(f"  mean_mahalanobis = {alias['mean_mahalanobis']:.4f}")
-        if 'color_discrimination' in alias:
-            cd = alias['color_discrimination']
-            print(f"  within_color_cos = {alias['within_color_cosine']:.4f}")
-            print(f"  cross_color_cos  = {alias['cross_color_cosine']:.4f}")
-            print(f"  color_discrim    = {cd:.4f}  "
-                  f"({'✓ hint retained in y' if cd > 0 else '✗ hint NOT retained in y'})")
-        if alias['mean_cosine'] > 0.95:
-            print()
-            print("  High cosine at corridor step → hint information has decayed.")
-            print("  Likely causes: theta too short for episode length, or m_norm ≈ 0")
-            print("  (write gate inactive → y is always the same low-rank output).")
-    print("="*W + "\n")
+    if not hint_step_ranges:
+        return {'status': 'hint_never_visible'}
+
+    first_steps = [r[0] for r in hint_step_ranges]
+    last_steps  = [r[1] for r in hint_step_ranges]
+    return {
+        'n_episodes_with_hint': len(hint_step_ranges),
+        'hint_first_step_mean': float(np.mean(first_steps)),
+        'hint_last_step_mean':  float(np.mean(last_steps)),
+        'hint_steps_per_episode_mean': float(np.mean(n_hint_steps_per_ep)),
+    }
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+def compute_aliasing_check(episodes: List[Dict], step_idx: int = 30) -> Dict:
+    ys_at_step = []
+    for ep in episodes:
+        y_arr = np.asarray(ep['y'])
+        if y_arr.shape[0] > step_idx:
+            ys_at_step.append(y_arr[step_idx])
+    if len(ys_at_step) < 2:
+        return {'status': 'insufficient_episode_length',
+                'n_samples': len(ys_at_step),
+                'note': f'Need > 2 episodes reaching step {step_idx}.'}
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description='Phase 1: post-hoc E3B diagnostic on a converged LMU-PPO checkpoint.'
-    )
-    p.add_argument('--checkpoint', required=True,
-                   help='Path to saved LMUPPO model (without .zip)')
-    p.add_argument('--env',        default='MemoryS11', choices=list(ENV_IDS))
-    p.add_argument('--n_episodes', type=int,   default=50)
-    p.add_argument('--ridge',      type=float, default=0.1,
-                   help='Ridge λ for E3B inverse init (M_0 = (1/λ)·I)')
-    p.add_argument('--hint_steps', type=int,   default=10,
-                   help='Steps 0..hint_steps-1 classified as hint_room')
-    p.add_argument('--alias_step', type=int,   default=50,
-                   help='Corridor step used for aliasing check')
-    p.add_argument('--no_normalize_phi', action='store_true',
-                   help='Skip L2-normalising y before SM update '
-                        '(useful to diagnose y magnitude collapse)')
-    p.add_argument('--seed',   type=int, default=42)
-    p.add_argument('--device', default='cpu',
-                   help='Inference device (cpu recommended; diagnostics are offline)')
-    p.add_argument('--out', default='results/e3b_diag.pkl',
-                   help='Output path for full results dict (pickle)')
-    return p.parse_args()
+    Y = np.stack(ys_at_step, axis=0)
+    norms = np.linalg.norm(Y, axis=1, keepdims=True) + 1e-8
+    Yn = Y / norms
+    cos_matrix = Yn @ Yn.T
+    mask = ~np.eye(len(Y), dtype=bool)
+    cos_pairs = cos_matrix[mask]
+
+    return {
+        'step_idx': step_idx,
+        'n_samples': int(len(Y)),
+        'cos_mean': float(cos_pairs.mean()),
+        'cos_median': float(np.median(cos_pairs)),
+        'cos_p95': float(np.quantile(cos_pairs, 0.95)),
+        'cos_min': float(cos_pairs.min()),
+        'warning': 'y may be collapsed' if cos_pairs.mean() > 0.95 else 'ok',
+    }
 
 
-def make_env(env_id: str, seed: int):
-    def _init():
-        env = gym.make(env_id)
-        env = MemoryStartWrapper(env)
-        env = FilterObservation(env, filter_keys=['image', 'direction'])
-        env.reset(seed=seed)
-        return env
-    return VecTransposeImage(DummyVecEnv([_init]))
-
+# ──────────────────────────────────────────────────────────────────────────
+# CLI
+# ──────────────────────────────────────────────────────────────────────────
 
 def main():
-    args = parse_args()
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", required=True, type=str,
+                        help="Path to saved LMUPPO .zip checkpoint")
+    parser.add_argument("--env", default="MemoryS11", choices=list(ENV_IDS))
+    parser.add_argument("--n_episodes", type=int, default=50)
+    parser.add_argument("--lambda_reg", type=float, default=1.0)
+    parser.add_argument("--seed", type=int, default=9999)
+    parser.add_argument("--use_wrapper", action='store_true',
+                        help="Include MemoryStartWrapper (matches training).")
+    parser.add_argument("--classifier", default="ground_truth",
+                        choices=["ground_truth", "r_intr"],
+                        help="ground_truth uses ball/key visibility. "
+                             "r_intr is the legacy proxy.")
+    parser.add_argument("--success_only", action='store_true',
+                        help="Restrict analysis to episodes where the agent "
+                             "succeeded (ext_reward > 0.5). Strips failure-mode "
+                             "artifacts when running wrapper-trained policy "
+                             "without wrapper.")
+    parser.add_argument("--device", default="auto")
+    parser.add_argument("--output", default=None)
+    parser.add_argument("--z_threshold", type=float, default=1.5)
+    parser.add_argument("--max_hint_steps", type=int, default=10)
+    parser.add_argument("--aliasing_step_idx", type=int, default=30)
+    args = parser.parse_args()
 
-    print(f"Env:        {ENV_IDS[args.env]}")
-    print(f"Checkpoint: {args.checkpoint}")
-    env = make_env(ENV_IDS[args.env], args.seed)
-
-    model = LMUPPO.load(args.checkpoint, env=env, device=args.device)
-    model.policy.set_training_mode(False)
-
-    print(f"y_dim={model.encoder_dim}  "
-          f"ridge={args.ridge}  "
-          f"hint_steps={args.hint_steps}  "
-          f"alias_step={args.alias_step}  "
-          f"normalize_phi={not args.no_normalize_phi}")
-    print(f"E3B matrix: ({model.encoder_dim}×{model.encoder_dim}) per episode\n")
-
-    episodes = run_episodes(
-        model, env,
-        n_episodes    = args.n_episodes,
-        hint_steps    = args.hint_steps,
-        ridge         = args.ridge,
-        normalize_phi = not args.no_normalize_phi,
+    device = torch.device(
+        "cuda" if args.device == "auto" and torch.cuda.is_available()
+        else ("cpu" if args.device == "auto" else args.device)
     )
 
-    disc  = compute_discrimination(episodes)
-    alias = compute_aliasing(episodes, args.alias_step)
+    env = VecTransposeImage(DummyVecEnv([
+        make_env(ENV_IDS[args.env], args.seed, use_wrapper=args.use_wrapper)
+    ]))
 
-    ep_lens = [ep.length for ep in episodes]
-    ep_rets = [ep.total_reward for ep in episodes]
-    print_report(disc, alias, len(episodes),
-                 mean_ep_len=float(np.mean(ep_lens)),
-                 mean_ret=float(np.mean(ep_rets)))
+    print(f"Loading checkpoint: {args.checkpoint}")
+    model = LMUPPO.load(args.checkpoint, env=env, device=device)
+    print(f"  encoder_dim={model.policy.lmu_cell.input_size}  "
+          f"memory_size={model.policy.lmu_cell.memory_size}  "
+          f"hidden_size={model.policy.lmu_cell.hidden_size}")
 
-    results = {
-        'args':          vars(args),
-        'disc':          disc,
-        'alias':         alias,
-        'ep_lengths':    np.array(ep_lens),
-        'ep_returns':    np.array(ep_rets),
-        'hint_colors':   np.array([ep.hint_color for ep in episodes]),
-        # Raw per-step data for further analysis if needed
-        'all_b':   np.array([s.b_t    for ep in episodes for s in ep.steps]),
-        'all_rintr': np.array([s.r_intr for ep in episodes for s in ep.steps]),
-        'all_step':  np.array([s.step   for ep in episodes for s in ep.steps]),
-        'all_is_hint': np.array([s.is_hint_room for ep in episodes for s in ep.steps]),
+    ortho_err = model.policy.lmu_cell.W_pre.orthogonality_error()
+    print(f"  W_pre ortho_err = {ortho_err:.2e} "
+          f"{'(ok)' if ortho_err < 1e-3 else '(WARNING: drifted)'}")
+
+    print(f"\nRolling out {args.n_episodes} episodes "
+          f"(wrapper={args.use_wrapper}, classifier={args.classifier})...")
+    episodes = rollout_and_record(
+        model, env,
+        n_episodes=args.n_episodes,
+        lambda_reg=args.lambda_reg,
+        device=device,
+    )
+
+    episodes = [e for e in episodes if len(e.get('step', [])) > 0]
+    print(f"\nCollected {len(episodes)} non-empty episodes.")
+    lens = [len(e['step']) for e in episodes]
+    rewards = [sum(e['ext_reward']) for e in episodes]
+    print(f"  Episode lengths: mean={np.mean(lens):.1f} min={min(lens)} max={max(lens)}")
+    print(f"  Extrinsic return: mean={np.mean(rewards):.3f} "
+          f"success_rate={np.mean([r > 0.5 for r in rewards]):.2%}")
+
+    if args.success_only:
+        before = len(episodes)
+        episodes = [e for e in episodes if sum(e['ext_reward']) > 0.5]
+        print(f"\n[--success_only] Filtered: {before} → {len(episodes)} episodes")
+        if len(episodes) == 0:
+            print("  No successful episodes — cannot continue analysis.")
+            return
+        lens_succ = [len(e['step']) for e in episodes]
+        print(f"  Successful episode lengths: "
+              f"mean={np.mean(lens_succ):.1f} min={min(lens_succ)} max={max(lens_succ)}")
+
+    vis_stats = compute_hint_visibility_stats(episodes)
+    print("\n── Hint visibility (ground truth from observation) ───────")
+    for k, v in vis_stats.items():
+        print(f"  {k}: {v}")
+
+    print(f"\nClassifying with '{args.classifier}'...")
+    if args.classifier == "ground_truth":
+        hint_masks, corridor_masks = classify_ground_truth(episodes)
+    else:
+        hint_masks, corridor_masks = classify_r_intr_proxy(
+            episodes,
+            z_threshold=args.z_threshold,
+            max_steps_for_hint=args.max_hint_steps,
+        )
+
+    metrics = compute_discrimination_metrics(episodes, hint_masks, corridor_masks)
+    print("\n── E3B discrimination (go/no-go) ─────────────────────────")
+    for k, v in metrics.items():
+        print(f"  {k}: {v}")
+
+    profile = compute_episode_profile(episodes)
+    print("\n── Episode profile (bonus by episode third) ──────────────")
+    for k, v in profile.items():
+        print(f"  {k}: {v:.4f}")
+
+    aliasing = compute_aliasing_check(episodes, step_idx=args.aliasing_step_idx)
+    print("\n── Aliasing check (late-episode y collapse) ──────────────")
+    for k, v in aliasing.items():
+        print(f"  {k}: {v}")
+
+    result = {
+        'checkpoint': args.checkpoint,
+        'env': args.env,
+        'n_episodes': len(episodes),
+        'lambda_reg': args.lambda_reg,
+        'classifier': args.classifier,
+        'use_wrapper': args.use_wrapper,
+        'success_only': args.success_only,
+        'W_pre_ortho_err': ortho_err,
+        'episode_lengths': {
+            'mean': float(np.mean(lens)),
+            'min': int(min(lens)),
+            'max': int(max(lens)),
+        },
+        'success_rate': float(np.mean([r > 0.5 for r in rewards])),
+        'hint_visibility': vis_stats,
+        'discrimination': metrics,
+        'profile': profile,
+        'aliasing': aliasing,
     }
 
-    with open(args.out, 'wb') as f:
-        pickle.dump(results, f)
-    print(f"Results saved → {args.out}")
+    if args.output:
+        Path(os.path.dirname(args.output) or '.').mkdir(parents=True, exist_ok=True)
+        with open(args.output, 'w') as f:
+            json.dump(result, f, indent=2)
+        print(f"\nWrote: {args.output}")
+
+    if metrics.get('status') == 'ok':
+        print("\n" + "=" * 60)
+        print(f"DECISION: {metrics['decision']}")
+        print(f"  ratio_b = {metrics['ratio_b']:.3f}  "
+              f"(b_hint={metrics['b_hint_mean']:.3f}, "
+              f"b_corridor={metrics['b_corridor_mean']:.3f})")
+        print(f"  ratio_r = {metrics['ratio_r']:.3f}  (r_intr comparison)")
+        print(f"  n_hint={metrics['n_hint_steps']}  "
+              f"n_corridor={metrics['n_corridor_steps']}")
+        print("=" * 60)
 
     env.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
+
+
