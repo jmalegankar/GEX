@@ -1,12 +1,19 @@
 """
-LMU-PPO baseline on MiniGrid-Memory envs.
+LMU-PPO baseline on MiniGrid-Memory envs — Phase 2 (E3B episodic bonus).
 
 Run:
-    # Chunked TBPTT (default):
-    python train.py --env MemoryS7  --seed 0
-    python train.py --env MemoryS13 --seed 0
+    # Phase 1 baseline (no E3B, no wrapper):
+    python train.py --env MemoryS11 --seed 0 --beta_ep 0
 
-    # Full episode BPTT on S7:
+    # Phase 2 sweep — vary beta_ep and lambda_reg:
+    python train.py --env MemoryS11 --seed 0 --beta_ep 0.01  --lambda_reg 1.0
+    python train.py --env MemoryS11 --seed 0 --beta_ep 0.03  --lambda_reg 1.0
+    python train.py --env MemoryS11 --seed 0 --beta_ep 0.1   --lambda_reg 1.0
+    python train.py --env MemoryS11 --seed 0 --beta_ep 0.3   --lambda_reg 1.0
+    python train.py --env MemoryS11 --seed 0 --beta_ep 0.1   --lambda_reg 0.1
+    python train.py --env MemoryS11 --seed 0 --beta_ep 0.1   --lambda_reg 10.0
+
+    # Full BPTT on S7:
     python train.py --env MemoryS7 --seed 0 --full_bptt
 """
 
@@ -30,9 +37,6 @@ ENV_IDS = {
     "MemoryS13": "MiniGrid-MemoryS13-v0",
 }
 
-# theta = memory window horizon (steps).
-# Should cover the full episode so the ball seen at step 1 is
-# still reconstructable at episode end.
 THETA = {
     "MemoryS5":   64,
     "MemoryS7":  100,
@@ -49,33 +53,28 @@ ARCH = {
     "MemoryS13": dict(hidden_size=128, memory_size=96),
 }
 
-# chunk_len for TBPTT.
-# For S7 full BPTT we use max_episode_len (~50 steps) so every episode
-# gets a full gradient unroll.  For harder envs we use a shorter chunk
-# to keep memory and compute reasonable.
 CHUNK_LEN_DEFAULT = {
     "MemoryS5":  16,
     "MemoryS7":  16,
     "MemoryS9":  32,
-    "MemoryS11": 32,
-    "MemoryS13": 1,
+    "MemoryS11": 16,   # [CHANGED from 1] chunk_len=1 = degenerate TBPTT
+    "MemoryS13": 16,   # [CHANGED from 1]
 }
 
-# MiniGrid Memory max_steps ≈ 5*(size-2) for size=grid_size
-# S7→size=7: 5*5=25... actually it's set per-env; 50 is a safe upper bound for S7.
 FULL_BPTT_CHUNK = {
     "MemoryS5":  32,
-    "MemoryS7":  64,   # full episode (episode len ≤ 50, round up to next divisor)
+    "MemoryS7":  64,
     "MemoryS9":  64,
     "MemoryS11": 64,
     "MemoryS13": 64,
 }
 
 
-def make_env(env_id: str, seed: int, rank: int = 0):
+def make_env(env_id: str, seed: int, rank: int = 0, use_wrapper: bool = True):
     def _init():
         env = gym.make(env_id)
-        env = MemoryStartWrapper(env)
+        if use_wrapper:
+            env = MemoryStartWrapper(env)
         env = FilterObservation(env, filter_keys=["image", "direction"])
         env = Monitor(env)
         env.reset(seed=seed + rank)
@@ -88,20 +87,32 @@ def main():
     parser.add_argument("--env",         default="MemoryS11", choices=list(ENV_IDS))
     parser.add_argument("--seed",        type=int,   default=0)
     parser.add_argument("--n_envs",      type=int,   default=16)
-    parser.add_argument("--total_steps", type=int,   default=2_000_000)
+    parser.add_argument("--total_steps", type=int,   default=5_000_000)
     parser.add_argument("--n_steps",     type=int,   default=512)
     parser.add_argument("--batch_size",  type=int,   default=256)
     parser.add_argument("--n_epochs",    type=int,   default=4)
     parser.add_argument("--lr",          type=float, default=3e-4)
-    parser.add_argument("--tb_log",      default="runs/lmu_ppo_new")
+    parser.add_argument("--tb_log",      default="runs/lmu_ppo_e3b")
     parser.add_argument("--device",      default="auto")
-    parser.add_argument("--n_chunks_per_batch", type=int, default=16,
-                        help="Number of K-step chunks per PPO update batch (for TBPTT). "
-                             "Total batch size = n_chunks_per_batch * chunk_len.")
-    parser.add_argument("--full_bptt",   action="store_true",
-                        help="Use full-episode BPTT (chunk_len = max episode length)")
-    parser.add_argument("--beta",        type=float, default=0.001,
-                        help="Intrinsic reward weight (0 = disabled)")
+    parser.add_argument("--n_chunks_per_batch", type=int, default=16)
+    parser.add_argument("--full_bptt",   action="store_true")
+
+    # Intrinsic reward weights
+    # [OLD] --beta renamed to --beta_life for clarity.
+    parser.add_argument("--beta_life",   type=float, default=0.001,
+                        help="Gated-write intrinsic reward weight (step-level)")
+    parser.add_argument("--beta_ep",     type=float, default=0.0,
+                        help="E3B episodic bonus weight (0 = disabled)")
+    parser.add_argument("--lambda_reg",  type=float, default=1.0,
+                        help="E3B ridge: M_0 = (1/λ)·I. Smaller λ → "
+                             "higher initial bonus, faster decay within episode.")
+
+    # Phase 2 sweep: disable MemoryStartWrapper to use raw env difficulty.
+    # The wrapper places agent near the goal, shortening episodes to ~11 steps.
+    # Without it, episode lengths are ~100-200 steps and E3B has more room to help.
+    parser.add_argument("--no_wrapper",  action="store_true",
+                        help="Disable MemoryStartWrapper (harder; recommended for Phase 2 sweep)")
+
     args = parser.parse_args()
 
     env_id = ENV_IDS[args.env]
@@ -113,18 +124,19 @@ def main():
         else CHUNK_LEN_DEFAULT[args.env]
     )
 
-    # n_steps must be divisible by chunk_len
     if args.n_steps % chunk_len != 0:
         old = args.n_steps
         args.n_steps = (args.n_steps // chunk_len) * chunk_len
         print(f"  [warn] n_steps adjusted {old} → {args.n_steps} "
               f"to be divisible by chunk_len={chunk_len}")
 
+    use_wrapper = not args.no_wrapper
+
     train_env = VecTransposeImage(SubprocVecEnv([
-        make_env(env_id, args.seed, i) for i in range(args.n_envs)
+        make_env(env_id, args.seed, i, use_wrapper) for i in range(args.n_envs)
     ]))
     eval_env = VecTransposeImage(DummyVecEnv([
-        make_env(env_id, args.seed + 1000)
+        make_env(env_id, args.seed + 1000, use_wrapper=use_wrapper)
     ]))
 
     eval_cb = EvalCallback(
@@ -156,13 +168,18 @@ def main():
         target_kl=0.05,
         seed=args.seed,
         device=args.device,
-        beta=args.beta,
+        beta_life=args.beta_life,
+        beta_ep=args.beta_ep,
+        lambda_reg=args.lambda_reg,
     )
 
-    # Total chunks available per rollout = (n_steps // chunk_len) * n_envs
-    total_chunks = (args.n_steps // chunk_len) * args.n_envs
-    bptt_mode = f"full_bptt (K={chunk_len})" if args.full_bptt else f"tbptt (K={chunk_len})"
-    total_params = sum(p.numel() for p in model.policy.parameters())
+    total_chunks  = (args.n_steps // chunk_len) * args.n_envs
+    bptt_mode     = f"full_bptt (K={chunk_len})" if args.full_bptt else f"tbptt (K={chunk_len})"
+    total_params  = sum(p.numel() for p in model.policy.parameters())
+    e3b_status    = (f"β_ep={args.beta_ep} λ={args.lambda_reg}"
+                     if args.beta_ep > 0 else "disabled")
+    wrapper_status = "no wrapper" if args.no_wrapper else "MemoryStartWrapper"
+
     print(f"\nLMU-PPO  ·  {env_id}  ·  seed={args.seed}  ·  {bptt_mode}")
     print(f"  encoder=64  hidden={arch['hidden_size']}"
           f"  memory={arch['memory_size']}  theta={theta}")
@@ -170,16 +187,28 @@ def main():
           f"  total_steps={args.total_steps:,}")
     print(f"  total_chunks={total_chunks}  n_chunks_per_batch={args.n_chunks_per_batch}"
           f"  → {args.n_chunks_per_batch * chunk_len} transitions/update")
+    print(f"  β_life={args.beta_life}  E3B={e3b_status}")
+    print(f"  env={wrapper_status}")
     print(f"  policy params: {total_params:,}\n")
+
+    # Build a descriptive run name for TensorBoard.
+    # e.g. "lmu_MemoryS11_tbptt_ep0.03_lam1.0_s0"
+    ep_tag  = f"_ep{args.beta_ep}" if args.beta_ep > 0 else ""
+    lam_tag = f"_lam{args.lambda_reg}" if args.beta_ep > 0 else ""
+    tb_name = (
+        f"lmu_{args.env}_"
+        f"{'full_bptt' if args.full_bptt else 'tbptt'}"
+        f"{ep_tag}{lam_tag}_s{args.seed}"
+    )
 
     model.learn(
         total_timesteps=args.total_steps,
         callback=eval_cb,
-        tb_log_name=f"lmu_{args.env}_{'full_bptt' if args.full_bptt else 'tbptt'}_s{args.seed}",
+        tb_log_name=tb_name,
         progress_bar=True,
     )
 
-    save_path = f"lmu_ppo_{args.env}_s{args.seed}"
+    save_path = f"lmu_ppo_{args.env}_ep{args.beta_ep}_s{args.seed}"
     model.save(save_path)
     print(f"\nSaved → {save_path}")
     train_env.close()
