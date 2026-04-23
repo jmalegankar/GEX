@@ -58,7 +58,7 @@ CHUNK_LEN_DEFAULT = {
     "MemoryS7":  16,
     "MemoryS9":  32,
     "MemoryS11": 32,
-    "MemoryS13": 32,
+    "MemoryS13": 1,
 }
 
 # MiniGrid Memory max_steps ≈ 5*(size-2) for size=grid_size
@@ -93,7 +93,7 @@ def main():
     parser.add_argument("--batch_size",  type=int,   default=256)
     parser.add_argument("--n_epochs",    type=int,   default=4)
     parser.add_argument("--lr",          type=float, default=3e-4)
-    parser.add_argument("--tb_log",      default="runs/lmu_ppo")
+    parser.add_argument("--tb_log",      default="runs/lmu_ppo_new")
     parser.add_argument("--device",      default="auto")
     parser.add_argument("--n_chunks_per_batch", type=int, default=16,
                         help="Number of K-step chunks per PPO update batch (for TBPTT). "

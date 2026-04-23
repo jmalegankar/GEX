@@ -3,20 +3,20 @@ LMU Actor-Critic Policy — Gated Write variant.
 
 Changes from baseline:
 ──────────────────────
-1. LMUCell.forward now returns (h, m, r_intr).
+1. LMUCell.forward now returns (h, m, r_intr, gate, innov, u_x).
    All three call sites updated:
-     forward()          → returns r_intr as 7th value (Option A)
-     evaluate_actions() → accumulates r_intrs per step, returns as 4th value
-     predict_values()   → discards r_intr with _
+     forward()          → unpacks 6, returns r_intr/gate/innov/u_x as extra values
+     evaluate_actions() → unpacks 6, discards gate/innov/u_x with _
+     predict_values()   → unpacks 6, discards r_intr/gate/innov/u_x with _
 
 2. Optimizer excludes W_pre from Adam (see __init__).
    W_pre uses its own Riemannian update (ortho_update) in the training loop.
 
 3. evaluate_actions returns r_intrs at β=0 (Step 1) for diagnostic logging.
-   The values are not zero — the computation runs every step — but they are
-   NOT in the loss until Step 2.  This is intentional: Step 1 validation
-   requires observing r_intr trends to confirm the gated write is behaving
-   before any gradient from it is introduced.
+
+4. The _last_* attribute pattern (self.lmu_cell._last_prod etc.) has been
+   removed from LMUCell.  Callers must use the return values.  This fixes
+   the EvalCallback mid-rollout clobber bug (eval n_envs=1 vs train n_envs=16).
 
 Old lines are commented with  # [OLD]  and kept for diff/reversion.
 """
@@ -92,10 +92,6 @@ class LMUActorCriticPolicy(nn.Module):
         W_pre must be excluded from Adam — it is updated via Riemannian steps
         in the training loop (lmu_ppo.py train()).  The split is done here in
         __init__ so the optimizer is constructed correctly from the start.
-
-        self.optimizer covers all params EXCEPT lmu_cell.W_pre.
-        lmu_ppo.train() must call self.policy.lmu_cell.W_pre.ortho_update(lr)
-        after every loss.backward() and before optimizer.step().
     """
 
     def __init__(
@@ -136,18 +132,15 @@ class LMUActorCriticPolicy(nn.Module):
         nn.init.zeros_(self.critic[2].bias)
 
         # [NEW] Exclude W_pre from Adam.
-        # W_pre has its own Riemannian update (OrthoLayer.ortho_update).
-        # If W_pre were included, Adam would apply stale momentum updates
-        # after ortho_update zeros the grad, corrupting orthogonality.
         ortho_params  = set(self.lmu_cell.W_pre.parameters())
         main_params   = [p for p in self.parameters() if p not in ortho_params]
         # [OLD] self.optimizer = torch.optim.Adam(self.parameters(), lr=lr, eps=1e-5)
         self.optimizer = torch.optim.Adam(main_params, lr=lr, eps=1e-5)
 
-    # ── helpers (unchanged) ───────────────────────────────────────────────────
+    # ── helpers ───────────────────────────────────────────────────────────────
 
     def _critic_input(self, h: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        m_pooled = m.mean(dim=1)   # (B, d, C) → (B, C)
+        m_pooled = F.layer_norm(m.mean(dim=1), [self.encoder_dim])   # (B, d, C) → (B, C)
         return torch.cat([h, m_pooled], dim=-1)
 
     # ── rollout (single step) ─────────────────────────────────────────────────
@@ -158,17 +151,25 @@ class LMUActorCriticPolicy(nn.Module):
         h_prev: torch.Tensor,
         m_prev: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        # [OLD] Returns: action, value, log_prob, h, m, logits        (6 values)
-        Returns:         action, value, log_prob, h, m, logits, r_intr (7 values)
+        # [OLD] Returns: action, value, log_prob, h, m, logits, r_intr   (7 values)
+        Returns:         action, value, log_prob, h, m, logits, r_intr,
+                         gate, innov, u_x                                 (10 values)
 
-        r_intr : (B,) — Step 1: caller logs this, does NOT add to rewards.
+        r_intr : (B,) — in compute graph (needed for Step 2 loss)
+        gate   : (B, C) — detached diagnostic
+        innov  : (B, C) — detached diagnostic
+        u_x    : (B, C) — detached diagnostic
+
+        Callers that don't need diagnostics unpack with trailing _:
+            actions, values, log_probs, h, m, logits, r_intr, _, _, _ = policy.forward(...)
         """
         x = self.encoder(obs)
 
-        # [OLD] h, m    = self.lmu_cell(x, h_prev, m_prev)
-        h, m, r_intr = self.lmu_cell(x, h_prev, m_prev)
+        # [OLD] h, m, r_intr = self.lmu_cell(x, h_prev, m_prev)
+        h, m, r_intr, gate, innov, u_x = self.lmu_cell(x, h_prev, m_prev)
 
         logits   = self.actor(self._critic_input(h, m))
         dist     = Categorical(logits=logits)
@@ -176,8 +177,8 @@ class LMUActorCriticPolicy(nn.Module):
         log_prob = dist.log_prob(action)
         value    = self.critic(self._critic_input(h, m)).squeeze(-1)
 
-        # [OLD] return action, value, log_prob, h, m, logits
-        return action, value, log_prob, h, m, logits, r_intr
+        # [OLD] return action, value, log_prob, h, m, logits, r_intr
+        return action, value, log_prob, h, m, logits, r_intr, gate, innov, u_x
 
     # ── PPO update (K-step unroll) ────────────────────────────────────────────
 
@@ -199,13 +200,10 @@ class LMUActorCriticPolicy(nn.Module):
           Step 1 (β=0): returned for logging only.  NOT in the PPO loss.
           Step 2: lmu_ppo.train() adds η * r_intrs.mean() to the loss.
 
-        NOTE on r_intrs vs collect_rollouts r_intr:
-          These are recomputed with gradient during the PPO update pass.
-          The values will differ slightly from the no-grad rollout values
-          because the policy weights have been updated between rollout and
-          update. This is the same situation as log_probs vs old_log_prob —
-          expected and correct.  Do not use evaluate_actions r_intrs for the
-          reward shaping signal; use the rollout values for that.
+        gate/innov/u_x from lmu_cell are discarded here — they are only needed
+        during collect_rollouts for diagnostics.  During evaluate_actions the
+        policy weights have changed since the rollout, so diagnostic values
+        would differ from rollout diagnostics anyway.
         """
         B, K = episode_starts.shape
         h, m = lmu_h, lmu_m
@@ -220,8 +218,8 @@ class LMUActorCriticPolicy(nn.Module):
             obs_k = {key: obs_seq[key][:, k] for key in obs_seq}
             x     = self.encoder(obs_k)               # (B, C)
 
-            # [OLD] h, m  = self.lmu_cell(x, h, m)
-            h, m, r_intr = self.lmu_cell(x, h, m)    # (B,n), (B,d,C), (B,)
+            # [OLD] h, m, r_intr = self.lmu_cell(x, h, m)
+            h, m, r_intr, _, _, _ = self.lmu_cell(x, h, m)   # gate/innov/u_x unused
 
             head   = self._critic_input(h, m)
             logits = self.actor(head)
@@ -229,12 +227,12 @@ class LMUActorCriticPolicy(nn.Module):
             all_log_probs.append(dist.log_prob(actions_seq[:, k]))
             all_entropy.append(dist.entropy())
             all_values.append(self.critic(head).squeeze(-1))
-            all_r_intrs.append(r_intr)                # [NEW]
+            all_r_intrs.append(r_intr)
 
         values    = torch.stack(all_values,    dim=1).reshape(B * K)
         log_probs = torch.stack(all_log_probs, dim=1).reshape(B * K)
         entropy   = torch.stack(all_entropy,   dim=1).reshape(B * K)
-        r_intrs   = torch.stack(all_r_intrs,   dim=1).reshape(B * K)  # [NEW]
+        r_intrs   = torch.stack(all_r_intrs,   dim=1).reshape(B * K)
 
         # [OLD] return values, log_probs, entropy
         return values, log_probs, entropy, r_intrs
@@ -248,11 +246,11 @@ class LMUActorCriticPolicy(nn.Module):
         lmu_m: torch.Tensor,
     ) -> torch.Tensor:
         x = self.encoder(obs)
-        # [OLD] h, m = self.lmu_cell(x, lmu_h, lmu_m)
-        h, m, _ = self.lmu_cell(x, lmu_h, lmu_m)   # r_intr not needed here
+        # [OLD] h, m, _ = self.lmu_cell(x, lmu_h, lmu_m)
+        h, m, _, _, _, _ = self.lmu_cell(x, lmu_h, lmu_m)   # all diagnostics unused
         return self.critic(self._critic_input(h, m)).squeeze(-1)
 
-    # ── state helpers (unchanged) ─────────────────────────────────────────────
+    # ── state helpers ─────────────────────────────────────────────────────────
 
     def initial_state(
         self, n_envs: int, device: torch.device

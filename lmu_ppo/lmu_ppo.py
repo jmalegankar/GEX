@@ -3,24 +3,25 @@ LMU-PPO: PPO with an LMU recurrent policy.
 
 Changes from baseline:
 ──────────────────────
-1. collect_rollouts: unpacks 7-value policy.forward (adds r_intr).
-   r_intr accumulated over rollout and logged as mean/max — NOT added to
-   rewards (β=0, Step 1 validation only).
+1. collect_rollouts: unpacks 10-value policy.forward (adds gate, innov, u_x).
+   gate/innov/u_x captured as local variables BEFORE callback.on_step().
+   This is the fix for the EvalCallback mid-rollout shape clobber:
+     - policy.forward() returns gate/innov/u_x as named local tensors
+     - callback.on_step() may call model.predict() → policy.forward() on the
+       eval env (n_envs=1), which returns shape [1, C] tensors
+     - because we captured gate/innov/u_x into locals before the callback,
+       the training-batch tensors [n_envs, C] are already safe in prod/u_x_step
+     - the old _last_* attribute pattern assigned self.policy.lmu_cell._last_prod
+       AFTER forward() but BEFORE the callback, then READ _last_prod AFTER the
+       callback — by which point predict() had overwritten it with [1, C].
+       That's the exact shape mismatch at entry 112 (eval_freq=625 with n_envs=16
+       means first eval fires 625 - 512 = 113 steps into rollout 2 → index 112).
 
 2. train: unpacks 4-value evaluate_actions (adds r_intrs).
    r_intrs logged per update. W_pre.ortho_update called after every
-   loss.backward(). Periodic orthogonality check every 100 updates with
-   hard SVD reset fallback.
+   loss.backward(). Periodic orthogonality check every 100 updates.
 
-3. predict: unpacks 7-value policy.forward, discards r_intr with _.
-
-Step 1 diagnostics logged in collect_rollouts (all computable without
-API changes to lmu_cell.forward):
-  debug/r_intr_mean      — novelty signal, should decrease in corridor
-  debug/r_intr_max       — upper bound check (must stay ≤ √C)
-  debug/e_x_norm         — must = 1.0 always (F.normalize guard)
-  debug/W_pre_ortho_error — must stay < 1e-3 (Cayley lr check)
-  debug/m_norm           — memory magnitude; crash if growing/shrinking
+3. predict: unpacks 10-value policy.forward, discards all diagnostics.
 
 Old lines marked  # [OLD]  and kept for diff/reversion.
 """
@@ -190,10 +191,9 @@ class LMUPPO(PPO):
         rollout_buffer.reset()
         callback.on_rollout_start()
 
-        # [NEW] Accumulate r_intr over the rollout — logging inside the loop
-        # would overwrite the same key each step; only the last value would
-        # survive to the flush.  Collect here, log the mean after the loop.
         r_intr_buf = []
+        prod_buf   = []   # gate ⊙ innov per step — captured before callback
+        u_x_buf    = []   # channel-weighted obs per step — captured before callback
         beta = self.beta
 
         n_steps = 0
@@ -201,9 +201,26 @@ class LMUPPO(PPO):
 
             with th.no_grad():
                 obs_t = obs_as_tensor(self._last_obs, self.device)
-                # [OLD] actions, values, log_probs, h_new, m_new, logits_t = self.policy.forward(...)
-                actions, values, log_probs, h_new, m_new, logits_t, r_intr = \
+
+                # [OLD] actions, values, log_probs, h_new, m_new, logits_t, r_intr = \
+                # [OLD]     self.policy.forward(obs_t, self._lmu_h, self._lmu_m)
+                actions, values, log_probs, h_new, m_new, logits_t, r_intr, \
+                    gate, innov, u_x = \
                     self.policy.forward(obs_t, self._lmu_h, self._lmu_m)
+
+                # [FIX] Compute prod here, inside the no_grad block, using the
+                # return values of this exact forward call.  This is the only
+                # safe place — callback.on_step() (below) may call predict()
+                # which calls lmu_cell.forward() on the eval env (n_envs=1),
+                # returning [1, C] tensors.  The old approach read
+                #   self.policy.lmu_cell._last_prod   (side-effect attribute)
+                # AFTER the callback, by which point predict() had overwritten
+                # it with shape [1, C].  Stacking [n_envs, C] and [1, C] tensors
+                # raised the RuntimeError at entry 112.
+                # Now gate/innov/u_x are local variables — immutable to any
+                # subsequent forward call.
+                prod     = gate * innov              # (n_envs, C) detached
+                # u_x is already (n_envs, C) detached — no copy needed
 
             actions_np = actions.cpu().numpy()
             new_obs, rewards, dones, infos = env.step(actions_np)
@@ -215,12 +232,14 @@ class LMUPPO(PPO):
 
             self._update_info_buffer(infos, dones)
 
-            # [NEW] Accumulate — do NOT log inside the loop
+            # Accumulate — do NOT log inside the loop (overwrites same key each step)
             r_intr_buf.append(r_intr.cpu())
+            prod_buf.append(prod.cpu())    # [FIX] was: self.policy.lmu_cell._last_prod.cpu()
+            u_x_buf.append(u_x.cpu())     # [FIX] was: self.policy.lmu_cell._last_u_x.cpu()
 
             n_steps += 1
 
-            r_intr_masked = r_intr.cpu().numpy() * (1.0 - self._last_episode_starts)
+            r_intr_masked    = r_intr.cpu().numpy() * (1.0 - self._last_episode_starts)
             rewards_combined = rewards + beta * r_intr_masked
 
             rollout_buffer.add(
@@ -251,17 +270,14 @@ class LMUPPO(PPO):
 
         rollout_buffer.compute_returns_and_advantage(values, dones)
 
-        # [NEW] Step 1 diagnostics — logged once per rollout, not per step.
-        # These are the minimum required to validate the gated write (Section 12).
+        # Step 1 diagnostics — logged once per rollout.
         r_intr_all = th.stack(r_intr_buf)          # (n_steps, n_envs)
         self.logger.record("debug/r_intr_mean",      r_intr_all.mean().item())
         self.logger.record("debug/r_intr_max",        r_intr_all.max().item())
 
-        # e_x_norm must = 1.0 always — any drift means F.normalize is broken
         e_x_norm = F.normalize(self.policy.lmu_cell.e_x, dim=0).norm().item()
         self.logger.record("debug/e_x_norm", e_x_norm)
 
-        # W_pre orthogonality — must stay < 1e-3; fire warning if it drifts
         ortho_err = self.policy.lmu_cell.W_pre.orthogonality_error()
         self.logger.record("debug/W_pre_ortho_error", ortho_err)
         if ortho_err > 1e-3:
@@ -269,13 +285,29 @@ class LMUPPO(PPO):
                 print(f"  [warn] W_pre ortho error = {ortho_err:.2e} — running SVD reset")
             self.policy.lmu_cell.W_pre.reorthogonalize()
 
-        # m_norm — memory magnitude; should be stable throughout training.
-        # Monotone growth → u_actual too large. Monotone shrink → write collapsing.
         m_norm = self._lmu_m.norm(dim=(1, 2)).mean().item()
         self.logger.record("debug/m_norm", m_norm)
-        self.logger.record("intrinsic/beta",    beta)
-        self.logger.record("intrinsic/r_intr_contribution",
-                           beta * r_intr_all.mean().item())
+        self.logger.record("intrinsic/beta",                 beta)
+        self.logger.record("intrinsic/r_intr_contribution",  beta * r_intr_all.mean().item())
+
+        # Bug-1 and encoder diagnostics.
+        # prod_all: (n_steps, n_envs, C)  — all captured before any callback call
+        prod_all = th.stack(prod_buf)
+        u_x_all  = th.stack(u_x_buf)
+
+        # prod_positive_frac ≈ 1.0 early and stays → sign-bias is real (Bug 1)
+        # prod_positive_frac ≈ 0.5 throughout     → bias is not a problem
+        self.logger.record("debug/prod_positive_frac",
+                           (prod_all > 0).float().mean().item())
+
+        # u_x_zero_frac: ReLU encoder saturation suppressing write inputs
+        # if ≥ 0.3, encoder is saturating and killing novelty signal
+        self.logger.record("debug/u_x_zero_frac",
+                           (u_x_all.abs() < 1e-6).float().mean().item())
+
+        # Per-channel novelty: which encoder channels drive r_intr
+        self.logger.record("debug/gate_innov_per_channel",
+                           prod_all.abs().mean(dim=(0, 1)).tolist())
 
         callback.on_rollout_end()
         return True
@@ -306,8 +338,9 @@ class LMUPPO(PPO):
             h[dones] = 0.0; m[dones] = 0.0
 
         with th.no_grad():
-            # [OLD] actions, _, _, h_new, m_new, logits_t = self.policy.forward(...)
-            actions, _, _, h_new, m_new, logits_t, _ = \
+            # [OLD] actions, _, _, h_new, m_new, logits_t, _ = \
+            # [OLD]     self.policy.forward(obs_tensor, h, m)
+            actions, _, _, h_new, m_new, logits_t, _, _, _, _ = \
                 self.policy.forward(obs_tensor, h, m)
 
         actions = actions.cpu().numpy()
@@ -333,7 +366,7 @@ class LMUPPO(PPO):
 
         pg_losses, value_losses, entropy_losses = [], [], []
         clip_fractions, approx_kl_divs, grad_norms = [], [], []
-        r_intrs_log = []   # [NEW] accumulate across batches
+        r_intrs_log = []
 
         continue_training = True
         for epoch in range(self.n_epochs):
@@ -387,18 +420,27 @@ class LMUPPO(PPO):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
 
-                # [NEW] Riemannian update for W_pre — after backward, before
-                # clip_grad_norm_.  Zeros W_pre.grad so Adam never sees it.
-                # NOTE: clip_grad_norm_ will therefore see 0 for W_pre's
-                # contribution, slightly underestimating the true grad norm.
+                # Log W_pre grad norm before ortho_update zeros it.
+                # If wpre_gn stays >> 1 consistently, Cayley lr=1e-3 is too large.
+                if self.policy.lmu_cell.W_pre.weights.grad is not None:
+                    wpre_gn = self.policy.lmu_cell.W_pre.weights.grad.norm().item()
+                    self.logger.record("debug/W_pre_grad_norm", wpre_gn)
                 self.policy.lmu_cell.W_pre.ortho_update(lr=1e-3)
 
-                grad_norm = th.nn.utils.clip_grad_norm_(
-                    self.policy.parameters(), self.max_grad_norm
-                )
+                # Per-component gradient clipping.
+                # W_pre excluded: ortho_update already zeroed its grad.
+                _comp_norms = []
+                for _comp in [self.policy.encoder, self.policy.lmu_cell,
+                               self.policy.actor, self.policy.critic]:
+                    _comp_norms.append(
+                        th.nn.utils.clip_grad_norm_(
+                            _comp.parameters(), self.max_grad_norm
+                        ).item()
+                    )
+                grad_norm = max(_comp_norms)
                 self.policy.optimizer.step()
 
-                # [NEW] Periodic hard orthogonality check (every 100 updates)
+                # Periodic hard orthogonality check (every 100 updates)
                 if self._n_updates % 100 == 0:
                     ortho_err = self.policy.lmu_cell.W_pre.orthogonality_error()
                     if ortho_err > 1e-3:
@@ -407,14 +449,14 @@ class LMUPPO(PPO):
                                   f"at update {self._n_updates} — SVD reset")
                         self.policy.lmu_cell.W_pre.reorthogonalize()
 
-                r_intrs_log.append(r_intrs.mean().item())   # [NEW]
+                r_intrs_log.append(r_intrs.mean().item())
                 pg_losses.append(policy_loss.item())
                 value_losses.append(value_loss.item())
                 entropy_losses.append(entropy_loss.item())
                 clip_fractions.append(
                     th.mean((th.abs(ratio - 1) > clip_range).float()).item()
                 )
-                grad_norms.append(grad_norm.item())
+                grad_norms.append(grad_norm if isinstance(grad_norm, float) else grad_norm.item())
                 self._n_updates += 1
 
             if not continue_training:
@@ -435,4 +477,4 @@ class LMUPPO(PPO):
         self.logger.record("train/n_updates",          self._n_updates, exclude="tensorboard")
         self.logger.record("train/learning_rate",      lr)
         self.logger.record("train/clip_range",         clip_range)
-        self.logger.record("debug/r_intrs_train_mean", np.mean(r_intrs_log))   # [NEW]
+        self.logger.record("debug/r_intrs_train_mean", np.mean(r_intrs_log))
