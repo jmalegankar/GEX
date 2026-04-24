@@ -61,7 +61,7 @@ from torch.nn.utils import spectral_norm
 
 # OrthoLayer and GateType are identical to lmu_t — import directly,
 # no duplication.
-from lmu_ppo.lmu_t import OrthoLayer, GateType
+from lmu_t import OrthoLayer, GateType
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -26,9 +26,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 from gymnasium import spaces
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 from lmu_t import LMUCell
+from lmu_s import LegSCell
 
 
 class MinigridEncoder(nn.Module):
@@ -103,6 +104,9 @@ class LMUActorCriticPolicy(nn.Module):
         hidden_size:       int = 64,
         memory_size:       int = 32,
         theta:             float = 100.0,
+        measure:           str = 'LegT',
+        gate_type:         str = 'softsign_sum',
+        residual_scale:    float = 0.05,
     ):
         super().__init__()
         assert isinstance(action_space, spaces.Discrete)
@@ -110,10 +114,22 @@ class LMUActorCriticPolicy(nn.Module):
         self.hidden_size = hidden_size
         self.memory_size = memory_size
         self.encoder_dim = encoder_dim
+        self.measure     = measure
         n_actions = action_space.n
 
-        self.encoder  = MinigridEncoder(observation_space, encoder_dim)
-        self.lmu_cell = LMUCell(encoder_dim, hidden_size, memory_size, theta)
+        self.encoder = MinigridEncoder(observation_space, encoder_dim)
+        if measure == 'LegS':
+            self.lmu_cell = LegSCell(
+                encoder_dim, hidden_size, memory_size,
+                gate_type=gate_type,
+                residual_scale=residual_scale,
+            )
+        else:
+            self.lmu_cell = LMUCell(
+                encoder_dim, hidden_size, memory_size, theta,
+                gate_type=gate_type,
+                residual_scale=residual_scale,
+            )
 
         head_in = hidden_size + encoder_dim
 
@@ -150,6 +166,7 @@ class LMUActorCriticPolicy(nn.Module):
         obs:    Dict[str, torch.Tensor],
         h_prev: torch.Tensor,
         m_prev: torch.Tensor,
+        t:      Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -169,7 +186,12 @@ class LMUActorCriticPolicy(nn.Module):
         x = self.encoder(obs)
 
         # [OLD] h, m, r_intr = self.lmu_cell(x, h_prev, m_prev)
-        h, m, r_intr, gate, innov, u_x = self.lmu_cell(x, h_prev, m_prev)
+        if self.measure == 'LegS':
+            h, m, r_intr, gate, innov, u_x = self.lmu_cell(
+                x, h_prev, m_prev, t.float()
+            )
+        else:
+            h, m, r_intr, gate, innov, u_x = self.lmu_cell(x, h_prev, m_prev)
 
         logits   = self.actor(self._critic_input(h, m))
         dist     = Categorical(logits=logits)
@@ -189,6 +211,7 @@ class LMUActorCriticPolicy(nn.Module):
         lmu_m:          torch.Tensor,
         episode_starts: torch.Tensor,
         actions_seq:    torch.Tensor,
+        lmu_t:          Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Unrolls K LMU steps with full gradient.
@@ -219,7 +242,11 @@ class LMUActorCriticPolicy(nn.Module):
             x     = self.encoder(obs_k)               # (B, C)
 
             # [OLD] h, m, r_intr = self.lmu_cell(x, h, m)
-            h, m, r_intr, _, _, _ = self.lmu_cell(x, h, m)   # gate/innov/u_x unused
+            if self.measure == 'LegS':
+                t_k = lmu_t[:, k].float()             # (B,)
+                h, m, r_intr, _, _, _ = self.lmu_cell(x, h, m, t_k)
+            else:
+                h, m, r_intr, _, _, _ = self.lmu_cell(x, h, m)   # gate/innov/u_x unused
 
             head   = self._critic_input(h, m)
             logits = self.actor(head)
@@ -244,10 +271,14 @@ class LMUActorCriticPolicy(nn.Module):
         obs:   Dict[str, torch.Tensor],
         lmu_h: torch.Tensor,
         lmu_m: torch.Tensor,
+        t:     Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         x = self.encoder(obs)
         # [OLD] h, m, _ = self.lmu_cell(x, lmu_h, lmu_m)
-        h, m, _, _, _, _ = self.lmu_cell(x, lmu_h, lmu_m)   # all diagnostics unused
+        if self.measure == 'LegS':
+            h, m, _, _, _, _ = self.lmu_cell(x, lmu_h, lmu_m, t.float())
+        else:
+            h, m, _, _, _, _ = self.lmu_cell(x, lmu_h, lmu_m)   # all diagnostics unused
         return self.critic(self._critic_input(h, m)).squeeze(-1)
 
     # ── state helpers ─────────────────────────────────────────────────────────

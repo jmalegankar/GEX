@@ -95,6 +95,9 @@ class LMUPPO(PPO):
         beta: float = 0.001,
         beta_ep: float = 0.03,     # [NEW] episodic bonus weight
         lambda_reg: float = 1.0,   # [NEW] E3B regularization
+        measure: str = 'LegT',     # [NEW] 'LegT' | 'LegS'
+        gate_type: str = 'softsign_sum',   # [NEW] 'softsign_sum' | 'tanh_product' | 'none'
+        residual_scale: float = 0.05,      # [NEW] anti-collapse residual
         tensorboard_log: Optional[str] = None,
         verbose: int = 1,
         seed: Optional[int] = None,
@@ -110,6 +113,9 @@ class LMUPPO(PPO):
         self.beta = beta
         self.beta_ep = beta_ep
         self.lambda_reg = lambda_reg
+        self.measure = measure
+        self.gate_type = gate_type
+        self.residual_scale = residual_scale
 
         super().__init__(
             policy="MultiInputPolicy",
@@ -153,6 +159,9 @@ class LMUPPO(PPO):
             hidden_size=self.hidden_size,
             memory_size=self.memory_size,
             theta=self.theta,
+            measure=self.measure,
+            gate_type=self.gate_type,
+            residual_scale=self.residual_scale,
         ).to(self.device)
 
         self.rollout_buffer = LMURolloutBuffer(
@@ -190,6 +199,16 @@ class LMUPPO(PPO):
         self._lmu_h, self._lmu_m = self.policy.initial_state(
             self.n_envs, self.device
         )
+
+        # LegS per-env step counter (1-indexed). None for LegT.
+        if self.measure == 'LegS':
+            self._lmu_t = th.ones(self.n_envs, dtype=th.int32, device=self.device)
+        else:
+            self._lmu_t = None
+
+        if self.verbose >= 1:
+            print(f"  measure={self.measure}  gate_type={self.gate_type}  "
+                  f"residual_scale={self.residual_scale}")
 
         # E3B objects — only allocated if beta_ep > 0
         if self.beta_ep > 0:
@@ -239,7 +258,9 @@ class LMUPPO(PPO):
                 obs_t = obs_as_tensor(self._last_obs, self.device)
                 actions, values, log_probs, h_new, m_new, logits_t, r_intr, \
                     gate, innov, u_x = \
-                    self.policy.forward(obs_t, self._lmu_h, self._lmu_m)
+                    self.policy.forward(
+                        obs_t, self._lmu_h, self._lmu_m, t=self._lmu_t
+                    )
 
                 prod = gate * innov  # (n_envs, C) detached, GPU
 
@@ -305,16 +326,23 @@ class LMUPPO(PPO):
                 log_probs,
                 self._lmu_h,
                 self._lmu_m,
+                lmu_t=self._lmu_t,
             )
 
             self._lmu_h = h_new.clone()
             self._lmu_m = m_new.clone()
+
+            # Advance LegS step counter for all envs before episode-boundary reset.
+            if self._lmu_t is not None:
+                self._lmu_t = self._lmu_t + 1
 
             # Reset LMU state and E3B buffer at episode boundaries
             done_envs = np.where(dones)[0].tolist()
             for i in done_envs:
                 self._lmu_h[i].zero_()
                 self._lmu_m[i].zero_()
+                if self._lmu_t is not None:
+                    self._lmu_t[i] = 1   # first step of next episode
             if self._ep_bonus is not None and done_envs:
                 self._ep_bonus.reset(done_envs)
 
@@ -323,7 +351,9 @@ class LMUPPO(PPO):
 
         with th.no_grad():
             obs_t = obs_as_tensor(new_obs, self.device)
-            values = self.policy.predict_values(obs_t, self._lmu_h, self._lmu_m)
+            values = self.policy.predict_values(
+                obs_t, self._lmu_h, self._lmu_m, t=self._lmu_t
+            )
 
         rollout_buffer.compute_returns_and_advantage(values, dones)
 
@@ -433,19 +463,29 @@ class LMUPPO(PPO):
         else:
             n = observation.shape[0]
 
+        is_legs = self.measure == 'LegS'
+
         if state is None:
             h, m = self.policy.initial_state(n, self.device)
+            t = th.ones(n, dtype=th.int32, device=self.device) if is_legs else None
         else:
-            h, m = state
+            if is_legs and len(state) == 3:
+                h, m, t = state
+            else:
+                h, m = state[0], state[1]
+                t = th.ones(n, dtype=th.int32, device=self.device) if is_legs else None
 
         if episode_start is not None:
             dones = th.as_tensor(episode_start, dtype=th.bool, device=self.device)
             h = h.clone(); m = m.clone()
             h[dones] = 0.0; m[dones] = 0.0
+            if t is not None:
+                t = t.clone()
+                t[dones] = 1
 
         with th.no_grad():
             actions, _, _, h_new, m_new, _, _, _, _, _ = \
-                self.policy.forward(obs_tensor, h, m)
+                self.policy.forward(obs_tensor, h, m, t=t)
 
         actions = actions.cpu().numpy()
         if isinstance(self.action_space, spaces.Box):
@@ -453,6 +493,8 @@ class LMUPPO(PPO):
                 actions, self.action_space.low, self.action_space.high
             )
 
+        if t is not None:
+            return actions, (h_new, m_new, t + 1)
         return actions, (h_new, m_new)
 
     # ------------------------------------------------------------------
@@ -488,6 +530,7 @@ class LMUPPO(PPO):
                     lmu_m=batch.lmu_m,
                     episode_starts=batch.episode_starts,
                     actions_seq=batch.actions,
+                    lmu_t=batch.lmu_t if self.measure == 'LegS' else None,
                 )
 
                 advantages = batch.advantages

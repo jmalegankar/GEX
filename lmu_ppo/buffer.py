@@ -35,6 +35,7 @@ class LMURolloutBufferSamples(NamedTuple):
     lmu_h:         th.Tensor             # (B, hidden_size)              — chunk-start state
     lmu_m:         th.Tensor             # (B, memory_size, encoder_dim) — chunk-start state
     episode_starts: th.Tensor            # (B, K)  float32  1=new episode
+    lmu_t:         th.Tensor             # (B, K)  int32  per-step episode counter (LegS)
 
 
 class LMURolloutBuffer(DictRolloutBuffer):
@@ -50,6 +51,7 @@ class LMURolloutBuffer(DictRolloutBuffer):
 
     lmu_h: np.ndarray   # (T, n_envs, hidden_size)
     lmu_m: np.ndarray   # (T, n_envs, memory_size, encoder_dim)
+    lmu_t: np.ndarray   # (T, n_envs)  int32  per-step episode counter (LegS)
 
     def __init__(
         self,
@@ -88,6 +90,11 @@ class LMURolloutBuffer(DictRolloutBuffer):
             (self.buffer_size, self.n_envs, self.memory_size, self.encoder_dim),
             dtype=np.float32,
         )
+        # LegS step counter: 1-indexed (1 = first step of episode).
+        # Ignored by LegT path.
+        self.lmu_t = np.ones(
+            (self.buffer_size, self.n_envs), dtype=np.int32,
+        )
         super().reset()
 
     def add(
@@ -100,9 +107,12 @@ class LMURolloutBuffer(DictRolloutBuffer):
         log_prob:      th.Tensor,
         lmu_h:         th.Tensor,   # (n_envs, hidden_size)
         lmu_m:         th.Tensor,   # (n_envs, memory_size, encoder_dim)
+        lmu_t:         Optional[th.Tensor] = None,   # (n_envs,) int32 (LegS)
     ) -> None:
         self.lmu_h[self.pos] = lmu_h.cpu().numpy()
         self.lmu_m[self.pos] = lmu_m.cpu().numpy()
+        if lmu_t is not None:
+            self.lmu_t[self.pos] = lmu_t.cpu().numpy().astype(np.int32)
         super().add(obs, action, reward, episode_start, value, log_prob)
 
     def get(
@@ -168,6 +178,9 @@ class LMURolloutBuffer(DictRolloutBuffer):
         lmu_h = self.to_torch(self.lmu_h[t_starts, envs])       # (B, n)
         lmu_m = self.to_torch(self.lmu_m[t_starts, envs])       # (B, d, C)
 
+        # ── per-step LegS step counter  (B, K)  int32 ────────────────────
+        lmu_t = self.to_torch(self.lmu_t[t_idx, envs[:, None]])  # (B, K)
+
         # ── episode_starts  (B, K)  float32 ──────────────────────────────
         # episode_starts[b, k] = 1 if obs[b, k] begins a new episode → zero h,m
         ep_starts = self.to_torch(
@@ -191,4 +204,5 @@ class LMURolloutBuffer(DictRolloutBuffer):
             lmu_h=lmu_h,
             lmu_m=lmu_m,
             episode_starts=ep_starts,                    # (B, K)
+            lmu_t=lmu_t,                                 # (B, K)  int32
         )
