@@ -67,7 +67,7 @@ class MinigridEncoder(nn.Module):
         cnn_out = 64 * (H - 3) * (W - 3)
         self.proj = nn.Sequential(
             nn.Linear(cnn_out + dir_emb_dim, out_dim),
-            nn.ReLU(),
+            nn.ELU(),
         )
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
