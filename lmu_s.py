@@ -13,14 +13,15 @@ weight, rescaling at each step. The continuous ODE is:
 
     d/dt c(t) = -1/t · A · c(t) + 1/t · B · u(t)
 
-where A is the upper-triangular LegS matrix (no θ hyperparameter). The key
+where A is the lower-triangular LegS matrix (no θ hyperparameter). The key
 property: dilating time by α maps t→αt and leaves the trajectory of c
 invariant. This means LegS is timescale-robust — it works for episodes of any
 length without θ to tune.
 
 Discrete-time forward Euler recurrence (Gu et al. eq 4):
 
-    m_t = (1 - A/t) m_{t-1} + B/t · u_t
+    m_t = (I - A/t) m_{t-1} + B/t · u_t
+        = m_{t-1} + (1/t)(B · u_t - A · m_{t-1})
 
 where t is the current step counter within the episode (1-indexed, reset to 1
 at episode boundary). m_0 = 0 by convention.
@@ -31,48 +32,36 @@ The A matrix for LegS (Gu et al. 2020 Theorem 2):
            { n+1                  if n == k
            { 0                    if n < k
 
-B_n = sqrt(2n+1)
+B_n = sqrt(2n+1). A is lower triangular.
 
-This is upper triangular, meaning higher-order coefficients (n=d-1) depend on
-all lower-order ones, but not vice versa. The structure is the transpose of
-LegT's lower-triangular A.
+Gate types (same as lmu_t.py — identical interface):
+─────────────────────────────────────────────────────
+  'softsign_sum'   (default, recommended)
+  'tanh_product'   (exact null conditions)
+  'none'           (no gating — ablation only)
 
-Numerical note on discretization:
-  Forward Euler (shown above) is first-order. The bilinear (Tustin) method is
-  more stable for stiff systems:
-      m_t = (I + A/(2t))^{-1} (I - A/(2t)) m_{t-1} + B/t · u_t
-  For RL inference (step-by-step, small t), forward Euler is fine. For very
-  long sequences (t>10000) or training stability, use bilinear. We default to
-  forward Euler here and flag where to switch.
+See lmu_t.py docstring for full gate type documentation.
 
-Architecture note:
-  Everything outside the memory dynamics is IDENTICAL to lmu_t.py:
-  - OrthoLayer W_pre and Cayley updates: unchanged
-  - e_x, E_h, e_m encoding: unchanged
-  - W_query dynamic read head: unchanged
-  - W_x, W_h, W_m hidden update: unchanged
-  - r_intr, gate, innov diagnostics: unchanged
+API difference from LMUCell: forward() takes an extra argument t (B,) int.
+The step counter is tracked externally and reset to 1 at episode boundaries.
 
-  This means the policy class (policies.py) and lmu_ppo.py work with LegSCell
-  by changing one import line. No other changes needed.
-
-Usage:
-  # In policies.py (or wherever LMUCell is imported):
-  # BEFORE: from lmu_ppo.lmu_t import LMUCell
-  # AFTER:  from lmu_ppo.lmu_s import LegSCell as LMUCell
-  # That's the entire integration change.
+Integration: change one import line in policies.py.
+    from lmu_ppo.lmu_t import LMUCell          # LegT
+    from lmu_ppo.lmu_s import LegSCell as LMUCell  # LegS
+Plus threading t through forward calls. See legs-integration artifact.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple
+from typing import Literal, Tuple
 
 from torch.nn.utils import spectral_norm
 
-# Import OrthoLayer from lmu_t — it's identical and we don't want to duplicate.
-from lmu_ppo.lmu_t import OrthoLayer
+# OrthoLayer and GateType are identical to lmu_t — import directly,
+# no duplication.
+from lmu_ppo.lmu_t import OrthoLayer, GateType
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,74 +120,60 @@ class LegSCell(nn.Module):
     One step of the multichannel HiPPO-LegS recurrent cell.
 
     State:
-        h:       (B, hidden_size)        — nonlinear hidden state (same as LMUCell)
-        m:       (B, memory_size, C)     — polynomial memory coefficients
-        step:    scalar int              — current step within episode (managed externally)
+        h:    (B, hidden_size)    — nonlinear hidden state
+        m:    (B, memory_size, C) — polynomial memory coefficients
+        t:    (B,) int            — step counter within episode (caller-managed)
 
     The step counter is NOT stored in the cell. It is tracked by the caller
-    (lmu_ppo.collect_rollouts) and passed in at each forward call. This avoids
-    state management issues across environments and reset boundaries.
+    (lmu_ppo.collect_rollouts) and passed in at each forward call. Reset to 1
+    at episode boundaries. This avoids state management issues across envs.
 
-    Forward arguments: (x, h_prev, m_prev, t)
-    where t: (B,) int tensor — per-env step counter within current episode.
-    Episodes that reset should have t[i] = 1 (first step).
+    Args:
+        input_size:      C — encoder output dimension
+        hidden_size:     n — hidden state dimension
+        memory_size:     d — Legendre polynomial order
+        gate_type:       'softsign_sum' | 'tanh_product' | 'none'
+        residual_scale:  anti-collapse floor for gated variants (0.0 = off)
+        discretization:  'euler' (default) | 'bilinear' (more stable at t>1000)
 
-    Returns: h_new, m_new, r_intr, gate, innov, u_x   (same as LMUCell)
-
-    API DIFFERENCE FROM LMUCell: forward() takes an extra argument t.
-    All callers must pass t. In policies.py and lmu_ppo.py, where LMUCell is
-    called, add t to the call. See integration notes below.
-
-    INTEGRATION CHANGES from lmu_t → lmu_s:
-    ─────────────────────────────────────────
-    1. policies.py:
-       - In __init__: LegSCell instead of LMUCell. Remove theta arg.
-       - In forward/evaluate_actions/predict_values: pass t (step counter)
-         to self.lmu_cell(x, h_prev, m_prev, t)
-
-    2. lmu_ppo.py:
-       - In _setup_learn: init per-env step counter self._lmu_t (n_envs,)
-       - In collect_rollouts: pass self._lmu_t to policy.forward
-         Increment self._lmu_t after each step.
-         Reset self._lmu_t[i] = 1 when done[i].
-
-    3. lmu_ppo.py constructor: remove theta param (or keep for LegT compat).
+    Returns (from forward): h_new, m_new, r_intr, gate, innov, u_x
+    Identical return signature to LMUCell. Only forward() differs (adds t arg).
     """
 
     def __init__(
         self,
-        input_size:  int,
-        hidden_size: int,
-        memory_size: int,
-        # No theta — LegS is timescale-free
-        discretization: str = 'euler',  # 'euler' or 'bilinear'
+        input_size:     int,
+        hidden_size:    int,
+        memory_size:    int,
+        gate_type:      GateType = 'softsign_sum',
+        residual_scale: float    = 0.05,
+        discretization: str      = 'euler',
     ):
         super().__init__()
-        self.input_size   = input_size
-        self.hidden_size  = hidden_size
-        self.memory_size  = memory_size
+        self.input_size     = input_size
+        self.hidden_size    = hidden_size
+        self.memory_size    = memory_size
+        self.gate_type      = gate_type
+        self.residual_scale = residual_scale
         self.discretization = discretization
 
-        # LegS A and B — stored as buffers, NOT ZOH-discretized.
-        # Time-varying discretization is applied in forward().
+        # LegS A, B — continuous-time, no ZOH. Time-varying discretization
+        # is applied per-step in _legs_update.
         A, B = get_AB_legs(memory_size)
         self.register_buffer('A', torch.from_numpy(A))   # (d, d)
         self.register_buffer('B', torch.from_numpy(B))   # (d, 1)
 
-        # For bilinear: precompute (I + A/2)^{-1} if you want to cache it.
-        # We don't, because t changes each step. Computed on-the-fly.
-
-        # ── Encoding parameters (identical to LMUCell) ───────────────
+        # ── Encoding (identical to LMUCell) ──────────────────────────────
         self.e_x    = nn.Parameter(torch.empty(input_size))
         self.E_h    = spectral_norm(nn.Linear(hidden_size, input_size, bias=False))
         self.e_m    = nn.Parameter(torch.zeros(memory_size))
         self.W_pre  = OrthoLayer(input_size)
 
-        # ── Dynamic read head (identical to LMUCell) ──────────────────
+        # ── Dynamic read head (identical to LMUCell) ─────────────────────
         self.W_query = nn.Linear(hidden_size, memory_size, bias=False)
         nn.init.orthogonal_(self.W_query.weight, gain=0.01)
 
-        # ── Hidden state kernels (identical to LMUCell) ───────────────
+        # ── Hidden state kernels (identical to LMUCell) ───────────────────
         self.W_x = nn.Linear(input_size,  hidden_size, bias=True)
         self.W_h = spectral_norm(nn.Linear(hidden_size, hidden_size, bias=False))
         self.W_m = nn.Linear(input_size,  hidden_size, bias=False)
@@ -208,142 +183,145 @@ class LegSCell(nn.Module):
     def _reset_parameters(self):
         nn.init.uniform_(self.e_x, -1.0, 1.0)
         nn.init.xavier_normal_(self.E_h.weight)
-        # e_m stays zero: same silent-write logic as LMUCell
-        # W_pre identity init from OrthoLayer
         for layer in (self.W_x, self.W_h, self.W_m):
             nn.init.xavier_normal_(layer.weight)
         nn.init.zeros_(self.W_x.bias)
 
-    def _compute_u(
+    # ── Gate (identical logic to LMUCell._compute_write) ─────────────────────
+
+    @staticmethod
+    def _softsign(x: torch.Tensor) -> torch.Tensor:
+        return x / (1.0 + x.abs())
+
+    def _compute_write(
         self,
         u_x: torch.Tensor,
         u_h: torch.Tensor,
         u_m: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Gated write — identical to LMUCell._compute_u.
-        Two null conditions preserved:
-          u_x = 0    → gate = 0 → u_actual = pred  ✓
-          u_x = pred → innov = 0 → u_actual = pred  ✓
+        Identical to LMUCell._compute_write. Returns (u_actual, pred, gate, innov).
+        r_intr = ||u_actual - pred||₂ computed by caller.
         """
-        pred  = u_h + u_m
-        gate  = torch.tanh(u_x)
-        innov = torch.tanh(u_x - pred)
-        return self.W_pre(gate * innov) + pred
+        pred = u_h + u_m
+
+        if self.gate_type == 'softsign_sum':
+            gate  = self._softsign(u_x)
+            innov = self._softsign(u_x - pred)
+            u_actual = self.W_pre(gate + innov) + pred
+
+        elif self.gate_type == 'tanh_product':
+            gate  = torch.tanh(u_x)
+            innov = torch.tanh(u_x - pred)
+            u_actual = self.W_pre(gate * innov) + pred
+
+        elif self.gate_type == 'none':
+            u_actual = u_x + pred
+            gate  = torch.zeros_like(u_x)
+            innov = torch.zeros_like(u_x)
+
+        else:
+            raise ValueError(f"Unknown gate_type '{self.gate_type}'.")
+
+        if self.gate_type != 'none' and self.residual_scale > 0.0:
+            u_actual = u_actual + self.residual_scale * u_x.detach()
+
+        return u_actual, pred, gate, innov
+
+    # ── LegS memory update (the only part that differs from LMUCell) ──────────
 
     def _legs_update(
         self,
         m_prev:   torch.Tensor,   # (B, d, C)
         u_actual: torch.Tensor,   # (B, C)
-        t:        torch.Tensor,   # (B,) float — step counter per env
+        t:        torch.Tensor,   # (B,) — step counter, clamped >= 1
     ) -> torch.Tensor:
         """
-        Apply the LegS discrete recurrence:
+        LegS discrete recurrence:
 
             Forward Euler:
-                m_t = (I - A/t) m_{t-1} + (B/t) u_t
-                    = m_{t-1} - (1/t)(A m_{t-1} - B u_t)
+                m_t = m_{t-1} + (1/t)(B · u_t  −  A · m_{t-1})
 
-            Bilinear (Tustin):
-                m_t = (I + A/(2t))^{-1} [(I - A/(2t)) m_{t-1} + (B/t) u_t]
+            Bilinear (Tustin, more stable for large t):
+                (I + A/2t) m_t = (I − A/2t) m_{t-1} + (B/t) · u_t
 
-        t: per-env step counter, shape (B,). Clamp to >= 1 to avoid div/0.
+        t: (B,) per-env step counter. Clamped to >= 1 to avoid div/0.
+        As t grows, A/t → 0 and the memory updates more slowly — this is
+        how LegS stretches its window to cover [0, t].
 
-        Key difference from LegT: the A matrix is scaled by 1/t at every step.
-        As t grows, A/t shrinks and the memory updates more slowly — this is
-        the mechanism by which LegS "stretches" its window to cover [0, t].
+        For t=1 (first step): m_1 = m_0 + B·u_1 = B·u_1 (same as LegT).
         """
-        # t: (B,) → reshape for broadcasting with (B, d, C)
-        t_safe = t.float().clamp(min=1.0)           # (B,)
-        inv_t  = (1.0 / t_safe).view(-1, 1, 1)     # (B, 1, 1)
+        t_safe = t.float().clamp(min=1.0)        # (B,)
+        inv_t  = (1.0 / t_safe).view(-1, 1, 1)  # (B, 1, 1)
 
-        # Am: (B, d, C) — same einsum as LMUCell
         Am = torch.einsum('ij,bjc->bic', self.A, m_prev)   # (B, d, C)
-
-        # Bu: (B, d, C)
         Bu = self.B * u_actual.unsqueeze(1)                 # (B, d, C)
 
         if self.discretization == 'euler':
-            # m_t = m_{t-1} - (1/t)(Am - Bu)
-            #      = m_{t-1} + inv_t * (Bu - Am)
-            m_new = m_prev + inv_t * (Bu - Am)
+            # m_t = m_{t-1} + inv_t * (Bu - Am)
+            return m_prev + inv_t * (Bu - Am)
 
         else:  # bilinear
-            # Bilinear (more stable for large t):
-            # (I + A/(2t)) m_t = (I - A/(2t)) m_{t-1} + (B/t) u_t
-            # Per-env: need to solve a (d,d) system per env. Not batched easily.
-            # Use a fixed-point iteration or Neumann series approximation instead.
-            # Neumann: (I + X)^{-1} ≈ I - X + X² - ... for small ||X||
-            # For large t, A/(2t) is small and 2 terms suffice.
-            #
-            # Full batched solve approach (correct but O(d³) per step):
+            # Solve per-env: (I + A/2t) m_t = (I - A/2t) m_{t-1} + B/t · u
+            # O(d³) per env per step — correct but expensive; use for t > 1000.
             B_size = m_prev.shape[0]
             d = self.memory_size
-            C = self.input_size
             I_d = torch.eye(d, device=m_prev.device, dtype=m_prev.dtype)
-
             m_new_list = []
             for b in range(B_size):
-                half_At = self.A / (2.0 * t_safe[b])    # (d, d)
-                lhs = I_d + half_At                       # (d, d)
-                rhs_mat = I_d - half_At                   # (d, d)
-                # rhs: (d, C) = (I - A/2t) m_{t-1} + (B/t) u
-                rhs = (rhs_mat @ m_prev[b] +              # (d, C)
-                       (self.B / t_safe[b]) * u_actual[b])
-                # Solve: lhs @ m_new_b = rhs
-                m_new_b = torch.linalg.solve(lhs, rhs)   # (d, C)
-                m_new_list.append(m_new_b)
+                half_At = self.A / (2.0 * t_safe[b])
+                lhs = I_d + half_At
+                rhs = ((I_d - half_At) @ m_prev[b]
+                       + (self.B / t_safe[b]) * u_actual[b])
+                m_new_list.append(torch.linalg.solve(lhs, rhs))
+            return torch.stack(m_new_list, dim=0)
 
-            m_new = torch.stack(m_new_list, dim=0)       # (B, d, C)
-
-        return m_new
+    # ── Forward ───────────────────────────────────────────────────────────────
 
     def forward(
         self,
         x:      torch.Tensor,   # (B, C)
         h_prev: torch.Tensor,   # (B, hidden)
         m_prev: torch.Tensor,   # (B, d, C)
-        t:      torch.Tensor,   # (B,) int or float — step within episode (1-indexed)
+        t:      torch.Tensor,   # (B,) int/float — step within episode (1-indexed)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
                torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Returns: h_new, m_new, r_intr, gate, innov, u_x
-        Identical return signature to LMUCell.forward.
 
-        t must be 1-indexed (first step of episode = 1, not 0).
-        At episode reset, the caller zeros h and m, and resets t to 1.
+        Identical return signature to LMUCell.forward.
+        Only difference: requires t argument (per-env step counter).
+
+        r_intr = ||u_actual - pred||₂  (unified, same as LMUCell)
+        gate, innov, u_x are .detach()-ed diagnostics.
+        r_intr stays in graph.
+
+        t must be 1-indexed. Caller zeros h, m and resets t=1 at episode end.
         """
 
-        # ── Step 1: per-channel u ─────────────────────────────────────
-        e_x_n = F.normalize(self.e_x, dim=0)               # (C,)
-        u_x   = x * e_x_n                                   # (B, C)
+        # ── Step 1: encode ────────────────────────────────────────────────
+        e_x_n = F.normalize(self.e_x, dim=0)                    # (C,)
+        u_x   = x * e_x_n                                        # (B, C)
+        u_h   = self.E_h(h_prev)                                 # (B, C)
+        u_m   = torch.einsum('d,bdc->bc', self.e_m, m_prev)     # (B, C)
 
-        u_h = self.E_h(h_prev)                              # (B, C)
-        u_m = torch.einsum('d,bdc->bc', self.e_m, m_prev)  # (B, C)
+        # ── Step 2: gated write ───────────────────────────────────────────
+        u_actual, pred, gate, innov = self._compute_write(u_x, u_h, u_m)
 
-        pred     = u_h + u_m
-        gate     = torch.tanh(u_x)
-        innov    = torch.tanh(u_x - pred)
-        u_actual = self.W_pre(gate * innov) + pred          # (B, C)
+        # ── Step 3: intrinsic reward ──────────────────────────────────────
+        r_intr = (u_actual - pred).norm(dim=-1)                  # (B,)
 
-        # ── Intrinsic reward (identical to LMUCell) ───────────────────
-        u_null = self._compute_u(torch.zeros_like(u_x), u_h, u_m)
-        r_intr = (u_actual - u_null).norm(dim=-1)           # (B,) — in graph
+        # ── Step 4: LegS memory update (only difference from LMUCell) ────
+        m_new = self._legs_update(m_prev, u_actual, t)           # (B, d, C)
 
-        # ── Step 2: LegS memory update ────────────────────────────────
-        # This is the ONLY line that differs from LMUCell:
-        # LMUCell:  m_new = einsum(A, m_prev) + B * u_actual
-        # LegSCell: m_new = m_prev - (1/t)(A m_prev - B u_actual)
-        m_new = self._legs_update(m_prev, u_actual, t)      # (B, d, C)
+        # ── Step 5: dynamic read head ─────────────────────────────────────
+        C_t = F.normalize(self.W_query(h_prev), dim=-1)         # (B, d)
+        y   = torch.einsum('bd,bdc->bc', C_t, m_new)            # (B, C)
 
-        # ── Step 3: dynamic read head (identical to LMUCell) ─────────
-        C_t = F.normalize(self.W_query(h_prev), dim=-1)     # (B, d)
-        y   = torch.einsum('bd,bdc->bc', C_t, m_new)        # (B, C)
-
-        # ── Step 4: hidden update (identical to LMUCell) ─────────────
+        # ── Step 6: hidden update ─────────────────────────────────────────
         h_new = torch.tanh(
             self.W_x(x) + self.W_h(h_prev) + self.W_m(y)
-        )                                                    # (B, hidden)
+        )                                                        # (B, hidden)
 
         return h_new, m_new, r_intr, gate.detach(), innov.detach(), u_x.detach()
 

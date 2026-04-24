@@ -28,7 +28,7 @@ from torch.distributions import Categorical
 from gymnasium import spaces
 from typing import Dict, Tuple
 
-from lmu import LMUCell
+from lmu_t import LMUCell
 
 
 class MinigridEncoder(nn.Module):
