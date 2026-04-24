@@ -27,7 +27,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from lmu import LMUCell, LMU, OrthoLayer
+from lmu_t import LMUCell, LMU, OrthoLayer
 
 
 # ─────────────────────────────────────────────────────────────────────────────
