@@ -120,6 +120,9 @@ def main():
     parser.add_argument("--n_epochs",    type=int,   default=4)
     parser.add_argument("--lr",          type=float, default=3e-4)
     parser.add_argument("--n_chunks_per_batch", type=int, default=32)
+    parser.add_argument("--chunk_len",   type=int,   default=None,
+                        help="Override default chunk length (see CHUNK_LEN_DEFAULT). "
+                             "Must divide n_steps.")
 
     # ── Intrinsic rewards ────────────────────────────────────────────
     parser.add_argument("--beta", type=float, default=0.001,
@@ -161,7 +164,13 @@ def main():
     env_id = ENV_IDS[args.env]
     arch   = ARCH[args.env]
     theta  = THETA[args.env]
-    chunk_len = CHUNK_LEN_DEFAULT[args.env]
+
+
+    
+    if args.chunk_len is not None:
+        chunk_len = args.chunk_len
+    else:
+        chunk_len = CHUNK_LEN_DEFAULT[args.env]
 
     # n_steps must be divisible by chunk_len
     if args.n_steps % chunk_len != 0:
@@ -274,3 +283,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
