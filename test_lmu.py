@@ -35,7 +35,7 @@ try:
 except ImportError:
     HAS_MPL = False
 
-from lmu import LMUCell, get_AB
+from lmu_t import LMUCell, get_AB
 
 
 # ─── Utilities ────────────────────────────────────────────────────────────────

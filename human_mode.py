@@ -40,7 +40,7 @@ def main():
         render_mode="human",
         tile_size=args.tile_size,
     )
-    env = MemoryStartWrapper(env)
+    # env = MemoryStartWrapper(env)
 
 
     if args.seed is not None:
