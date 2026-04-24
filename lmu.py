@@ -250,9 +250,9 @@ class LMUCell(nn.Module):
         Note: W_pre(0) = 0 exactly because OrthoLayer has no bias.
         """
         pred  = u_h + u_m
-        gate  = torch.tanh(u_x)
-        innov = torch.tanh(u_x - pred)
-        return self.W_pre(gate * innov) + pred
+        gate  = u_x /(1+ u_x.abs())
+        innov = (u_x - pred) / (1 + (u_x - pred).abs())
+        return self.W_pre(gate + innov) + pred
 
     def forward(
         self,
@@ -293,10 +293,10 @@ class LMUCell(nn.Module):
         u_h = self.E_h(h_prev)                              # (B, C)
         u_m = torch.einsum('d,bdc->bc', self.e_m, m_prev)  # (B, C)
 
-        pred     = u_h + u_m
-        gate     = torch.tanh(u_x)
-        innov    = torch.tanh(u_x - pred)
-        u_actual = self.W_pre(gate * innov) + pred           # (B, C)
+        pred  = u_h + u_m
+        gate  = u_x /(1+ u_x.abs())
+        innov = (u_x - pred) / (1 + (u_x - pred).abs())
+        u_actual = self.W_pre(gate + innov) + pred           # (B, C)
 
         # [OLD] self._last_gate  = gate.detach()
         # [OLD] self._last_innov = innov.detach()
