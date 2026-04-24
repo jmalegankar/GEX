@@ -131,6 +131,27 @@ def main():
                         help="E3B regularization λ. Smaller = more exploration "
                              "pressure; larger = tighter bonus near hint.")
 
+    # ── Memory cell ──────────────────────────────────────────────────
+    parser.add_argument(
+        "--measure", default="LegT", choices=["LegT", "LegS"],
+        help="Memory measure. LegT=sliding window (theta required). "
+             "LegS=full history, timescale-free (Craftax target).",
+    )
+    parser.add_argument(
+        "--gate_type", default="softsign_sum",
+        choices=["softsign_sum", "tanh_product", "none"],
+        help="Gate type for the LMU write. "
+             "softsign_sum: fastest convergence, approximate null conditions. "
+             "tanh_product: exact null conditions, slower convergence. "
+             "none: no gating (ablation, lower ceiling).",
+    )
+    parser.add_argument(
+        "--residual_scale", type=float, default=0.05,
+        help="Anti-collapse residual scale for gated variants. Adds "
+             "residual_scale * u_x.detach() to the write, bypassing the gate. "
+             "Set to 0.0 to disable. Ignored for gate_type='none'.",
+    )
+
     # ── Logging ──────────────────────────────────────────────────────
     parser.add_argument("--tb_log", default="runs/lmu_ppo")
     parser.add_argument("--device", default="auto")
@@ -189,6 +210,9 @@ def main():
         beta=args.beta,
         beta_ep=args.beta_ep,
         lambda_reg=args.lambda_reg,
+        measure=args.measure,
+        gate_type=args.gate_type,
+        residual_scale=args.residual_scale,
         tensorboard_log=args.tb_log,
         verbose=1,
         seed=args.seed,
@@ -205,6 +229,8 @@ def main():
           f"view_size={view_str}")
     print(f"  beta={args.beta}  beta_ep={args.beta_ep}  "
           f"lambda_reg={args.lambda_reg}")
+    print(f"  measure={args.measure}  gate_type={args.gate_type}  "
+          f"residual_scale={args.residual_scale}")
     print(f"  encoder=64  hidden={arch['hidden_size']}  "
           f"memory={arch['memory_size']}  theta={theta}")
     print(f"  gamma={model.gamma}  n_envs={args.n_envs}  "
@@ -225,7 +251,12 @@ def main():
     wrapper_tag = "wrap" if args.use_wrapper else "nowrap"
     ep_tag = f"ep{args.beta_ep}" if args.beta_ep > 0 else "noep"
     vs_tag = f"vs{args.view_size}" if args.view_size else "vs7"
-    run_name = (f"lmu_{args.env}_{wrapper_tag}_{ep_tag}_{vs_tag}_s{args.seed}")
+    gate_tag = {
+        'softsign_sum': 'ss', 'tanh_product': 'tp', 'none': 'ng'
+    }[args.gate_type]
+    meas_tag = args.measure.lower()
+    run_name = (f"lmu_{args.env}_{wrapper_tag}_{ep_tag}_{vs_tag}_"
+                f"{meas_tag}_{gate_tag}_s{args.seed}")
 
     model.learn(
         total_timesteps=args.total_steps,
