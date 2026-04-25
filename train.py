@@ -1,5 +1,5 @@
 """
-LMU-PPO training script — Phase 2.
+LMU-PPO training script — Phase 2 / Phase 3.
 
 Standard runs:
 ──────────────
@@ -9,29 +9,18 @@ python train.py --env MemoryS11 --seed 0 --use_wrapper --beta_ep 0.0
 # Phase 2: lifelong + E3B, NO wrapper (target experiment)
 python train.py --env MemoryS11 --seed 0 --beta_ep 0.03
 
-# Phase 2 hyperparameter sweep:
-# β_ep ∈ {0.01, 0.03, 0.1, 0.3}  ×  λ ∈ {0.1, 1.0, 10.0}
-python train.py --env MemoryS11 --seed 0 --beta_ep 0.01 --lambda_reg 0.1
-python train.py --env MemoryS11 --seed 0 --beta_ep 0.03 --lambda_reg 1.0
-...
-
-Memory validity ablation:
-─────────────────────────
-# Retrain with view_size=3 — definitive memory test
-# If this solves S11 with similar sample efficiency, memory is load-bearing.
-python train.py --env MemoryS11 --seed 0 --view_size 3 --beta_ep 0.03 \
-                --total_steps 5_000_000
-
-# Compare view sizes (run all three in parallel):
-for vs in 3 5 7; do
-    python train.py --env MemoryS11 --seed 0 --view_size $vs --beta_ep 0.0 \
-                    --tb_log runs/view_ablation &
+# Phase 3: ObstructedMaze (5 seeds, 10M steps)
+for seed in 0 1 2 3 4; do
+  python train.py --env ObstructedMaze2Dlhb --seed $seed \
+    --gate_type softsign_sum --beta_ep 0.1 --lambda_reg 1.0 --beta 0.0 \
+    --total_steps 10_000_000 &
 done
 
-Success criterion (Phase 2):
+Success criterion (Phase 3):
 ────────────────────────────
-eval/mean_reward > 0.9 within 5M steps on S11 WITHOUT --use_wrapper.
-Run 3 seeds (0, 1, 2) before drawing conclusions.
+Any non-zero eval/mean_reward within 10M steps on ObstructedMaze2Dlhb.
+If zero across all 5 seeds at 10M, stop and diagnose before scaling up.
+Watch ratio_b — if it drops below 1.5 within first 2M steps, add inv-dyn aux.
 """
 
 import argparse
@@ -49,36 +38,63 @@ from mem_start import MemoryStartWrapper
 
 
 ENV_IDS = {
-    "MemoryS5":  "MiniGrid-MemoryS5-v0",
-    "MemoryS7":  "MiniGrid-MemoryS7-v0",
-    "MemoryS9":  "MiniGrid-MemoryS9-v0",
-    "MemoryS11": "MiniGrid-MemoryS11-v0",
-    "MemoryS13": "MiniGrid-MemoryS13-v0",
+    "MemoryS5":             "MiniGrid-MemoryS5-v0",
+    "MemoryS7":             "MiniGrid-MemoryS7-v0",
+    "MemoryS9":             "MiniGrid-MemoryS9-v0",
+    "MemoryS11":            "MiniGrid-MemoryS11-v0",
+    "MemoryS13":            "MiniGrid-MemoryS13-v0",
+    # Phase 3 — ObstructedMaze variants (2Dlhb = hardest, matches E3B paper)
+    "ObstructedMaze1Dl":    "MiniGrid-ObstructedMaze-1Dl-v0",
+    "ObstructedMaze1Dlhb":  "MiniGrid-ObstructedMaze-1Dlhb-v0",
+    "ObstructedMaze2Dl":    "MiniGrid-ObstructedMaze-2Dl-v0",
+    "ObstructedMaze2Dlhb":  "MiniGrid-ObstructedMaze-2Dlhb-v0",
 }
 
+# theta must cover EXPLORATION time, not just task length.
+# ObstructedMaze: agent navigates 2 rooms with locked doors + obstructions.
+# Conservative upper bound on steps-to-goal from random start.
 THETA = {
-    "MemoryS5":   64,
-    "MemoryS7":  100,
-    "MemoryS9":  120,
-    "MemoryS11": 160,
-    "MemoryS13": 200,
+    "MemoryS5":             64,
+    "MemoryS7":             100,
+    "MemoryS9":             120,
+    "MemoryS11":            160,
+    "MemoryS13":            200,
+    "ObstructedMaze1Dl":    300,
+    "ObstructedMaze1Dlhb":  300,
+    "ObstructedMaze2Dl":    400,
+    "ObstructedMaze2Dlhb":  400,
 }
 
+# ObstructedMaze obs space is identical (7x7x3 egocentric), so encoder_dim=64
+# stays. Larger hidden/memory for harder task — same scale as moving S11→S13.
 ARCH = {
-    "MemoryS5":  dict(hidden_size=64,  memory_size=32),
-    "MemoryS7":  dict(hidden_size=64,  memory_size=32),
-    "MemoryS9":  dict(hidden_size=128, memory_size=48),
-    "MemoryS11": dict(hidden_size=128, memory_size=64),
-    "MemoryS13": dict(hidden_size=128, memory_size=96),
+    "MemoryS5":             dict(hidden_size=64,  memory_size=32),
+    "MemoryS7":             dict(hidden_size=64,  memory_size=32),
+    "MemoryS9":             dict(hidden_size=128, memory_size=48),
+    "MemoryS11":            dict(hidden_size=128, memory_size=64),
+    "MemoryS13":            dict(hidden_size=128, memory_size=96),
+    "ObstructedMaze1Dl":    dict(hidden_size=256, memory_size=128),
+    "ObstructedMaze1Dlhb":  dict(hidden_size=256, memory_size=128),
+    "ObstructedMaze2Dl":    dict(hidden_size=256, memory_size=128),
+    "ObstructedMaze2Dlhb":  dict(hidden_size=256, memory_size=128),
 }
 
+# chunk_len must divide n_steps (default 512).
+# Longer chunk for ObstructedMaze: episodes are longer, BPTT needs more context.
 CHUNK_LEN_DEFAULT = {
-    "MemoryS5":  16,
-    "MemoryS7":  16,
-    "MemoryS9":  32,
-    "MemoryS11": 16,
-    "MemoryS13": 16,
+    "MemoryS5":             16,
+    "MemoryS7":             16,
+    "MemoryS9":             32,
+    "MemoryS11":            16,
+    "MemoryS13":            16,
+    "ObstructedMaze1Dl":    32,
+    "ObstructedMaze1Dlhb":  32,
+    "ObstructedMaze2Dl":    32,
+    "ObstructedMaze2Dlhb":  32,
 }
+
+# Whether the env supports MemoryStartWrapper (Memory family only)
+SUPPORTS_WRAPPER = {k: k.startswith("Memory") for k in ENV_IDS}
 
 
 def make_env(env_id: str, seed: int, rank: int = 0,
@@ -106,7 +122,7 @@ def main():
     parser.add_argument("--env", default="MemoryS11", choices=list(ENV_IDS))
     parser.add_argument("--use_wrapper", action='store_true',
                         help="Use MemoryStartWrapper (places agent near hint). "
-                             "Omit for the real Phase 2 experiment.")
+                             "Memory envs only. Ignored for ObstructedMaze.")
     parser.add_argument("--view_size", type=int, default=None,
                         help="Override agent view size. Default: env's built-in "
                              "(7 for MiniGrid-Memory). Set to 3 for the memory "
@@ -161,12 +177,16 @@ def main():
 
     args = parser.parse_args()
 
+    # Guard: wrapper only valid for Memory envs
+    if args.use_wrapper and not SUPPORTS_WRAPPER[args.env]:
+        print(f"  [warn] --use_wrapper ignored for {args.env} "
+              f"(MemoryStartWrapper is Memory-env specific)")
+        args.use_wrapper = False
+
     env_id = ENV_IDS[args.env]
     arch   = ARCH[args.env]
     theta  = THETA[args.env]
 
-
-    
     if args.chunk_len is not None:
         chunk_len = args.chunk_len
     else:
@@ -215,7 +235,7 @@ def main():
         vf_coef=1.0,
         clip_range_vf=0.2,
         max_grad_norm=0.5,
-        clip_range=0.2, 
+        clip_range=0.2,
         target_kl=0.05,
         beta=args.beta,
         beta_ep=args.beta_ep,
@@ -234,8 +254,8 @@ def main():
     total_params = sum(p.numel() for p in model.policy.parameters())
     view_str = f"{args.view_size}" if args.view_size else "default(7)"
 
-    print(f"\nLMU-PPO Phase 2  ·  {env_id}  ·  seed={args.seed}")
-    print(f"  wrapper={'ON' if args.use_wrapper else 'OFF (Phase 2 target)'}  "
+    print(f"\nLMU-PPO Phase 3  ·  {env_id}  ·  seed={args.seed}")
+    print(f"  wrapper={'ON' if args.use_wrapper else 'OFF'}  "
           f"view_size={view_str}")
     print(f"  beta={args.beta}  beta_ep={args.beta_ep}  "
           f"lambda_reg={args.lambda_reg}")
@@ -252,15 +272,15 @@ def main():
     if args.beta_ep == 0.0:
         print("  [mode] LIFELONG ONLY — E3B disabled (baseline run)")
     elif not args.use_wrapper:
-        print("  [mode] PHASE 2 — E3B active, no wrapper")
+        print("  [mode] E3B active, no wrapper")
     else:
-        print("  [mode] PHASE 2 + WRAPPER — for ablation comparison")
+        print("  [mode] E3B active + wrapper")
     print()
 
     # ── Run name for TensorBoard ──────────────────────────────────────
     wrapper_tag = "wrap" if args.use_wrapper else "nowrap"
-    ep_tag = f"ep{args.beta_ep}" if args.beta_ep > 0 else "noep"
-    vs_tag = f"vs{args.view_size}" if args.view_size else "vs7"
+    ep_tag  = f"ep{args.beta_ep}" if args.beta_ep > 0 else "noep"
+    vs_tag  = f"vs{args.view_size}" if args.view_size else "vs7"
     gate_tag = {
         'softsign_sum': 'ss', 'tanh_product': 'tp', 'none': 'ng'
     }[args.gate_type]
@@ -284,5 +304,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
