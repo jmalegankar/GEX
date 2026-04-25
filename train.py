@@ -156,7 +156,7 @@ def main():
     )
 
     # ── Logging ──────────────────────────────────────────────────────
-    parser.add_argument("--tb_log", default="runs/lmu_ppo")
+    parser.add_argument("--tb_log", default="runs/lmu_ppo_e3b_test",)
     parser.add_argument("--device", default="auto")
 
     args = parser.parse_args()
@@ -213,8 +213,9 @@ def main():
         lr=args.lr,
         ent_coef=0.008,
         vf_coef=1.0,
+        clip_range_vf=0.2,
         max_grad_norm=0.5,
-        clip_range=0.2,
+        clip_range=0.2, 
         target_kl=0.05,
         beta=args.beta,
         beta_ep=args.beta_ep,

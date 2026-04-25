@@ -101,6 +101,8 @@ class EllipticalEpisodicBonus:
 
         # b_t = phi^T M phi — per-env dot product
         bonus = (phi * Mphi).sum(dim=-1)  # (n_envs,)
+        bonus = torch.clamp(bonus, max=2.0)
+
 
         # Sherman-Morrison:
         # M_new = M - (M phi phi^T M) / (1 + phi^T M phi)
