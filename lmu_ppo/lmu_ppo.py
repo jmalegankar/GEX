@@ -272,7 +272,7 @@ class LMUPPO(PPO):
                         self.policy.lmu_cell.W_query(self._lmu_h), dim=-1
                     )  # (n_envs, d)
                     y_t = th.einsum('bd,bdc->bc', C_t, m_new)  # (n_envs, C)
-                    y_t = F.normalize(y_t, dim=-1)
+
                     b_raw = self._ep_bonus.bonus_and_update(y_t)  # (n_envs,)
 
                     # Update running std with this batch of bonus values
