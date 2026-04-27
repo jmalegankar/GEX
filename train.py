@@ -133,6 +133,18 @@ def main():
     parser.add_argument("--lambda_reg", type=float, default=1.0,
                         help="E3B regularization λ. Smaller = more exploration "
                              "pressure; larger = tighter bonus near hint.")
+    parser.add_argument(
+        "--phi_source",
+        default="y_readout",
+        choices=["y_readout", "y_readout_unnorm",
+                 "random_encoder", "encoder_detached", "innovation"],
+        help="Source of phi for E3B bonus. "
+             "y_readout: LMU's W_query readout (default, current). "
+             "y_readout_unnorm: y_readout without F.normalize on C_t. "
+             "random_encoder: fresh frozen CNN (Burda 2018 baseline). "
+             "encoder_detached: policy encoder with stop-gradient. "
+             "innovation: u_x - u_h - u_m (LMU world-model innovation).",
+    )
 
     # ── Memory cell ──────────────────────────────────────────────────
     parser.add_argument(
@@ -156,7 +168,7 @@ def main():
     )
 
     # ── Logging ──────────────────────────────────────────────────────
-    parser.add_argument("--tb_log", default="runs/lmu_ppo_e3b_test",)
+    parser.add_argument("--tb_log", default="runs/lmu_ppo_e3b_rnd",)
     parser.add_argument("--device", default="auto")
 
     args = parser.parse_args()
@@ -220,6 +232,7 @@ def main():
         beta=args.beta,
         beta_ep=args.beta_ep,
         lambda_reg=args.lambda_reg,
+        phi_source=args.phi_source,
         measure=args.measure,
         gate_type=args.gate_type,
         residual_scale=args.residual_scale,
@@ -265,8 +278,13 @@ def main():
         'softsign_sum': 'ss', 'tanh_product': 'tp', 'none': 'ng'
     }[args.gate_type]
     meas_tag = args.measure.lower()
+    phi_tag = {
+        'y_readout': 'phY', 'y_readout_unnorm': 'phYU',
+        'random_encoder': 'phR', 'encoder_detached': 'phD',
+        'innovation': 'phINN',
+    }[args.phi_source]
     run_name = (f"lmu_{args.env}_{wrapper_tag}_{ep_tag}_{vs_tag}_"
-                f"{meas_tag}_{gate_tag}_s{args.seed}")
+                f"{meas_tag}_{gate_tag}_{phi_tag}_s{args.seed}")
 
     model.learn(
         total_timesteps=args.total_steps,

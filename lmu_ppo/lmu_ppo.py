@@ -47,7 +47,7 @@ from .episodic_bonus import (
     HintCorridorDiscriminationTracker,
     RunningStd,
 )
-from .policies import LMUActorCriticPolicy
+from .policies import LMUActorCriticPolicy, MinigridEncoder
 
 
 class LMUPPO(PPO):
@@ -95,6 +95,7 @@ class LMUPPO(PPO):
         beta: float = 0.001,
         beta_ep: float = 0.03,     # [NEW] episodic bonus weight
         lambda_reg: float = 1.0,   # [NEW] E3B regularization
+        phi_source: str = 'y_readout',     # [NEW] 'y_readout' | 'random_encoder' | 'encoder_detached'
         measure: str = 'LegT',     # [NEW] 'LegT' | 'LegS'
         gate_type: str = 'softsign_sum',   # [NEW] 'softsign_sum' | 'tanh_product' | 'none'
         residual_scale: float = 0.05,      # [NEW] anti-collapse residual
@@ -113,6 +114,11 @@ class LMUPPO(PPO):
         self.beta = beta
         self.beta_ep = beta_ep
         self.lambda_reg = lambda_reg
+        assert phi_source in ('y_readout', 'y_readout_unnorm',
+                              'random_encoder', 'encoder_detached',
+                              'innovation'), \
+            f"phi_source must be one of those, got {phi_source!r}"
+        self.phi_source = phi_source
         self.measure = measure
         self.gate_type = gate_type
         self.residual_scale = residual_scale
@@ -220,10 +226,28 @@ class LMUPPO(PPO):
             )
             self._b_running_std = RunningStd(epsilon=1e-4)
             self._disc_tracker = HintCorridorDiscriminationTracker()
+
+            # [NEW] Random encoder for phi (Burda 2018 baseline).
+            # Only allocated when phi_source == 'random_encoder'.
+            if self.phi_source == 'random_encoder':
+                self._phi_encoder = MinigridEncoder(
+                    self.observation_space, out_dim=self.encoder_dim,
+                ).to(self.device)
+                for p in self._phi_encoder.parameters():
+                    p.requires_grad = False
+                self._phi_encoder.eval()
+                if self.verbose >= 1:
+                    n = sum(p.numel() for p in self._phi_encoder.parameters())
+                    print(f"  phi_source=random_encoder ({n:,} frozen params)")
+            else:
+                self._phi_encoder = None
+                if self.verbose >= 1:
+                    print(f"  phi_source={self.phi_source}")
         else:
             self._ep_bonus = None
             self._b_running_std = None
             self._disc_tracker = None
+            self._phi_encoder = None
 
         return ret
 
@@ -266,14 +290,38 @@ class LMUPPO(PPO):
 
                 # ── E3B bonus ────────────────────────────────────────────
                 if self._ep_bonus is not None:
-                    # Recompute y using h_prev (before update) and m_new
-                    # (after write). Matches LMUCell.forward's read head.
-                    C_t = F.normalize(
-                        self.policy.lmu_cell.W_query(self._lmu_h), dim=-1
-                    )  # (n_envs, d)
-                    y_t = th.einsum('bd,bdc->bc', C_t, m_new)  # (n_envs, C)
+                    # Compute phi based on configured source.
+                    if self.phi_source == 'y_readout':
+                        # LMU's W_query readout: phi = C_t · m_new
+                        # Uses h_prev (before update) and m_new (after write).
+                        C_t = F.normalize(
+                            self.policy.lmu_cell.W_query(self._lmu_h), dim=-1
+                        )                                          # (n_envs, d)
+                        phi_t = th.einsum('bd,bdc->bc', C_t, m_new)  # (n_envs, C)
+                    elif self.phi_source == 'y_readout_unnorm':
+                        # [EXPERIMENT α] Same as y_readout but without F.normalize.
+                        # Tests whether sphere constraint on C_t was the bottleneck.
+                        C_t = self.policy.lmu_cell.W_query(self._lmu_h)  # unbounded
+                        phi_t = th.einsum('bd,bdc->bc', C_t, m_new)
+                    elif self.phi_source == 'innovation':
+                        # phi = u_x - u_h - u_m (LMU world-model innovation).
+                        # u_x already returned from policy.forward.
+                        lmu = self.policy.lmu_cell
+                        u_h = lmu.E_h(self._lmu_h)                         # (n_envs, C)
+                        u_m = th.einsum('d,bdc->bc', lmu.e_m, self._lmu_m) # (n_envs, C)
+                        phi_t = (u_x - u_h - u_m).detach()
+                    elif self.phi_source == 'random_encoder':
+                        # Fresh frozen CNN, never trained — Burda 2018 baseline.
+                        phi_t = self._phi_encoder(obs_t)
+                    elif self.phi_source == 'encoder_detached':
+                        # Policy's learned encoder, stop-gradient.
+                        phi_t = self.policy.encoder(obs_t).detach()
+                    else:
+                        raise ValueError(
+                            f"Unknown phi_source: {self.phi_source}"
+                        )
 
-                    b_raw = self._ep_bonus.bonus_and_update(y_t)  # (n_envs,)
+                    b_raw = self._ep_bonus.bonus_and_update(phi_t)  # (n_envs,)
 
                     # Update running std with this batch of bonus values
                     self._b_running_std.update(b_raw.cpu().numpy())
@@ -385,6 +433,11 @@ class LMUPPO(PPO):
         self.logger.record("debug/m_norm", m_norm)
         self.logger.record("intrinsic/beta",    beta)
         self.logger.record("intrinsic/beta_ep", beta_ep)
+        self.logger.record(
+            "intrinsic/phi_source",
+            {'y_readout': 0, 'random_encoder': 1, 'encoder_detached': 2,
+             'y_readout_unnorm': 3, 'innovation': 4}.get(self.phi_source, -1),
+        )
         self.logger.record("intrinsic/r_intr_contribution",
                            beta * r_intr_all.mean().item())
 
@@ -444,6 +497,29 @@ class LMUPPO(PPO):
                 if disc['ratio_b'] < 2.0 and self.verbose >= 1:
                     print(f"  [warn] episodic ratio_b = {disc['ratio_b']:.2f} "
                           f"(below 2.0 — consider adding inverse dynamics aux)")
+            # NEW: numerical safety diagnostics
+            safety = self._ep_bonus.get_diagnostics()
+            self.logger.record("episodic/M_min_eigval",
+                            self._ep_bonus.min_eigenvalue())
+            self.logger.record("episodic/n_skipped",  safety['n_skipped'])
+            self.logger.record("episodic/n_reset",    safety['n_reset'])
+            self.logger.record("episodic/b_max",      safety['b_max'])
+            self.logger.record("episodic/skip_frac",  safety['skip_frac'])
+            self.logger.record("episodic/reset_frac", safety['reset_frac'])
+
+            # Loud warnings if anything fires — these should be 0 in healthy training
+            if self.verbose >= 1:
+                if safety['n_reset'] > 0:
+                    print(f"  [warn] M was reset {safety['n_reset']} times "
+                        f"(b_true went negative — M corruption recovery)")
+                if safety['skip_frac'] > 0.01:
+                    print(f"  [warn] {safety['skip_frac']:.2%} of M updates skipped "
+                        f"(b_true non-finite or > {self._ep_bonus.reject_threshold:.0e}); "
+                        f"b_max = {safety['b_max']:.3g}")
+                e_min = self._ep_bonus.min_eigenvalue()
+                if e_min < 0:
+                    print(f"  [ERROR] M_min_eigval = {e_min:.3e} — math is broken, "
+                        f"investigate immediately")
 
         callback.on_rollout_end()
         return True

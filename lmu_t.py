@@ -96,26 +96,38 @@ class OrthoLayer(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x @ self.weights   # (B, C) @ (C, C) → (B, C)
 
+    # def ortho_update(self, lr: float) -> None:
+    #     """
+    #     Riemannian gradient step on O(C) via Cayley retraction.
+    #     Call AFTER loss.backward(), BEFORE optimizer.step().
+    #     Zeros the gradient so Adam never touches this parameter.
+    #     """
+    #     with torch.no_grad():
+    #         if self.weights.grad is None:
+    #             return
+    #         G = self.weights.grad
+    #         W = self.weights
+    #         A = G @ W.t() - W @ G.t()   # skew-symmetric Riemannian gradient
+    #         I = torch.eye(W.size(0), device=W.device, dtype=W.dtype)
+    #         W_new = torch.linalg.solve(I + lr * A, (I - lr * A) @ W)
+    #         self.weights.copy_(W_new)
+    #         self.weights.grad.zero_()
     def ortho_update(self, lr: float) -> None:
-        """
-        Riemannian gradient step on O(C) via Cayley retraction.
-        Call AFTER loss.backward(), BEFORE optimizer.step().
-        Zeros the gradient so Adam never touches this parameter.
-        """
         with torch.no_grad():
             if self.weights.grad is None:
                 return
-            G = self.weights.grad
-            W = self.weights
-            A = G @ W.t() - W @ G.t()   # skew-symmetric Riemannian gradient
+            G, W = self.weights.grad, self.weights
+            A = G @ W.t() - W @ G.t()
             I = torch.eye(W.size(0), device=W.device, dtype=W.dtype)
             W_new = torch.linalg.solve(I + lr * A, (I - lr * A) @ W)
-            self.weights.copy_(W_new)
+            if not (torch.isnan(W_new).any() or torch.isinf(W_new).any()):
+                self.weights.copy_(W_new)
             self.weights.grad.zero_()
-
     @torch.no_grad()
     def reorthogonalize(self) -> None:
-        """Hard SVD reset. Use when orthogonality_error() > 1e-3."""
+        if torch.isnan(self.weights).any() or torch.isinf(self.weights).any():
+            nn.init.eye_(self.weights)
+            return
         U, _, Vh = torch.linalg.svd(self.weights, full_matrices=False)
         self.weights.copy_(U @ Vh)
 
