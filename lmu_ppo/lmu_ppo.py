@@ -1,29 +1,11 @@
 """
-LMU-PPO: PPO with an LMU recurrent policy + E3B episodic bonus.
+LMU-PPO: PPO with a swappable memory cell (gated_lmu / vanilla_lmu / gru / lstm)
+and an optional E3B episodic bonus. POPGym-only.
 
-Phase 2 additions on top of the Phase 0 patched version:
-─────────────────────────────────────────────────────────
-1. EllipticalEpisodicBonus (from episodic_bonus.py) wired into
-   collect_rollouts. The bonus b_t = y_t^T M_{t-1}^{-1} y_t is computed
-   from the LMU's W_query readout y at each step, normalized by a running
-   std, scaled by beta_ep, and added to the reward alongside r_intr.
-
-2. y computation: recomputed from (h_prev, m_new) inside the rollout loop
-   using the same formula as LMUCell.forward's read head. This avoids
-   touching the cell's return signature.
-
-3. HintCorridorDiscriminationTracker logs ratio_b = E[b|hint] / E[b|corridor]
-   per rollout. If this drops below ~2 for several rollouts, add the
-   inverse dynamics auxiliary loss (plan.md Phase 2.5).
-
-4. beta_ep = 0.0 disables the episodic bonus entirely — this is the flag
-   for the no-wrapper baseline run without E3B.
-
-New constructor args vs Phase 0:
-    beta_ep    : float, episodic bonus weight (default 0.03, 0.0 = disabled)
-    lambda_reg : float, E3B regularization lambda (default 1.0)
-
-All Phase 0 changes are preserved intact.
+Reward composition:
+    r_t = r_ext_t
+          + beta     * r_intr_t  * (1 - episode_start_t)   [lifelong]
+          + beta_ep  * b_t_norm  * (1 - episode_start_t)   [episodic]
 """
 
 from typing import Optional, Union
@@ -42,28 +24,17 @@ from stable_baselines3.common.utils import (
 )
 
 from .buffer import LMURolloutBuffer
-from .episodic_bonus import (
-    EllipticalEpisodicBonus,
-    HintCorridorDiscriminationTracker,
-    RunningStd,
-)
-from .policies import LMUActorCriticPolicy, MinigridEncoder
+from .episodic_bonus import EllipticalEpisodicBonus, RunningStd
+from .policies import LMUActorCriticPolicy
+from .popgym_encoders import make_encoder
 
 
 class LMUPPO(PPO):
     """
-    PPO with LMU recurrent policy and E3B episodic bonus.
+    PPO with a swappable recurrent cell and optional E3B episodic bonus.
 
-    Total reward at step t:
-        r_t = r_ext_t
-              + beta     * r_intr_t  * (1 - episode_start_t)   [lifelong]
-              + beta_ep  * b_t_norm  * (1 - episode_start_t)   [episodic]
-
-    r_intr_t = ||gate ⊙ innov||₂   from LMUCell (gated write prediction error)
-    b_t_norm = b_t / running_std(b) where b_t = y_t^T M_{t-1}^{-1} y_t
-
-    Set beta_ep=0.0 to run the lifelong-only baseline (reproduces Phase 0).
-    Set beta=0.0 to run E3B-only (not recommended; lifelong signal is cheap).
+    Set beta_ep=0.0 for lifelong-only.
+    Set cell_type='vanilla_lmu' / 'gru' / 'lstm' for baseline comparisons.
     """
 
     policy: LMUActorCriticPolicy
@@ -77,7 +48,7 @@ class LMUPPO(PPO):
         n_steps: int = 2048,
         batch_size: int = 256,
         n_epochs: int = 10,
-        gamma: float = 0.999,
+        gamma: float = 0.99,
         gae_lambda: float = 0.95,
         clip_range: Union[float, Schedule] = 0.2,
         clip_range_vf: Optional[float] = None,
@@ -93,12 +64,14 @@ class LMUPPO(PPO):
         chunk_len: int = 16,
         n_chunks_per_batch: int = 16,
         beta: float = 0.001,
-        beta_ep: float = 0.03,     # [NEW] episodic bonus weight
-        lambda_reg: float = 1.0,   # [NEW] E3B regularization
-        phi_source: str = 'y_readout',     # [NEW] 'y_readout' | 'random_encoder' | 'encoder_detached'
-        measure: str = 'LegT',     # [NEW] 'LegT' | 'LegS'
-        gate_type: str = 'softsign_sum',   # [NEW] 'softsign_sum' | 'tanh_product' | 'none'
-        residual_scale: float = 0.05,      # [NEW] anti-collapse residual
+        beta_ep: float = 0.03,
+        lambda_reg: float = 1.0,
+        phi_source: str = 'y_readout',
+        measure: str = 'LegT',
+        gate_type: str = 'softsign_sum',
+        residual_scale: float = 0.05,
+        read_head: str = 'dynamic',
+        cell_type: str = 'gated_lmu',
         tensorboard_log: Optional[str] = None,
         verbose: int = 1,
         seed: Optional[int] = None,
@@ -114,14 +87,18 @@ class LMUPPO(PPO):
         self.beta = beta
         self.beta_ep = beta_ep
         self.lambda_reg = lambda_reg
-        assert phi_source in ('y_readout', 'y_readout_unnorm',
-                              'random_encoder', 'encoder_detached',
-                              'innovation'), \
-            f"phi_source must be one of those, got {phi_source!r}"
+        assert phi_source in (
+            'y_readout', 'y_readout_unnorm',
+            'random_encoder', 'encoder_detached',
+            'innovation',
+        ), f"phi_source invalid: {phi_source!r}"
         self.phi_source = phi_source
         self.measure = measure
         self.gate_type = gate_type
         self.residual_scale = residual_scale
+        self.read_head = read_head
+        self.cell_type = cell_type
+        self.is_lmu = cell_type in ('gated_lmu', 'vanilla_lmu')
 
         super().__init__(
             policy="MultiInputPolicy",
@@ -168,6 +145,8 @@ class LMUPPO(PPO):
             measure=self.measure,
             gate_type=self.gate_type,
             residual_scale=self.residual_scale,
+            read_head=self.read_head,
+            cell_type=self.cell_type,
         ).to(self.device)
 
         self.rollout_buffer = LMURolloutBuffer(
@@ -192,7 +171,7 @@ class LMUPPO(PPO):
         self._lmu_m: Optional[th.Tensor] = None
 
     # ------------------------------------------------------------------
-    # Learn setup — E3B objects created here (n_envs is known)
+    # Learn setup — E3B + phi_encoder + compatibility validation
     # ------------------------------------------------------------------
 
     def _setup_learn(self, total_timesteps, callback=None,
@@ -206,17 +185,32 @@ class LMUPPO(PPO):
             self.n_envs, self.device
         )
 
-        # LegS per-env step counter (1-indexed). None for LegT.
-        if self.measure == 'LegS':
+        # LegS per-env step counter — only meaningful for LMU cells.
+        if self.measure == 'LegS' and self.is_lmu:
             self._lmu_t = th.ones(self.n_envs, dtype=th.int32, device=self.device)
         else:
             self._lmu_t = None
 
         if self.verbose >= 1:
-            print(f"  measure={self.measure}  gate_type={self.gate_type}  "
+            print(f"  cell_type={self.cell_type}  measure={self.measure}  "
+                  f"gate_type={self.gate_type}  read_head={self.read_head}  "
                   f"residual_scale={self.residual_scale}")
 
-        # E3B objects — only allocated if beta_ep > 0
+        # ── phi-source compatibility validation (only when beta_ep > 0) ──
+        if self.beta_ep > 0:
+            if self.phi_source in ('y_readout', 'y_readout_unnorm'):
+                assert self.cell_type == 'gated_lmu' and self.read_head == 'dynamic', (
+                    f"phi_source={self.phi_source!r} requires cell_type='gated_lmu' "
+                    f"with read_head='dynamic' (needs W_query); got cell_type="
+                    f"{self.cell_type!r}, read_head={self.read_head!r}."
+                )
+            if self.phi_source == 'innovation':
+                assert self.is_lmu, (
+                    f"phi_source='innovation' requires an LMU cell "
+                    f"(needs E_h and e_m); got cell_type={self.cell_type!r}."
+                )
+
+        # ── E3B objects ──
         if self.beta_ep > 0:
             self._ep_bonus = EllipticalEpisodicBonus(
                 n_envs=self.n_envs,
@@ -225,12 +219,9 @@ class LMUPPO(PPO):
                 device=self.device,
             )
             self._b_running_std = RunningStd(epsilon=1e-4)
-            self._disc_tracker = HintCorridorDiscriminationTracker()
 
-            # [NEW] Random encoder for phi (Burda 2018 baseline).
-            # Only allocated when phi_source == 'random_encoder'.
             if self.phi_source == 'random_encoder':
-                self._phi_encoder = MinigridEncoder(
+                self._phi_encoder = make_encoder(
                     self.observation_space, out_dim=self.encoder_dim,
                 ).to(self.device)
                 for p in self._phi_encoder.parameters():
@@ -246,7 +237,6 @@ class LMUPPO(PPO):
         else:
             self._ep_bonus = None
             self._b_running_std = None
-            self._disc_tracker = None
             self._phi_encoder = None
 
         return ret
@@ -262,14 +252,13 @@ class LMUPPO(PPO):
         rollout_buffer.reset()
         callback.on_rollout_start()
 
-        # Diagnostic buffers — GPU, transferred once at rollout end
+        # Diagnostic buffers
         r_intr_buf = []
         prod_buf   = []
         u_x_buf    = []
         gate_buf   = []
         innov_buf  = []
         ep_start_buf = []
-        # E3B bonus buffer (CPU numpy, parallel to r_intr_buf)
         b_buf = []
 
         beta    = self.beta
@@ -286,52 +275,39 @@ class LMUPPO(PPO):
                         obs_t, self._lmu_h, self._lmu_m, t=self._lmu_t
                     )
 
-                prod = gate * innov  # (n_envs, C) detached, GPU
+                prod = gate * innov
 
                 # ── E3B bonus ────────────────────────────────────────────
                 if self._ep_bonus is not None:
-                    # Compute phi based on configured source.
                     if self.phi_source == 'y_readout':
-                        # LMU's W_query readout: phi = C_t · m_new
-                        # Uses h_prev (before update) and m_new (after write).
                         C_t = F.normalize(
                             self.policy.lmu_cell.W_query(self._lmu_h), dim=-1
-                        )                                          # (n_envs, d)
-                        phi_t = th.einsum('bd,bdc->bc', C_t, m_new)  # (n_envs, C)
+                        )
+                        phi_t = th.einsum('bd,bdc->bc', C_t, m_new)
                     elif self.phi_source == 'y_readout_unnorm':
-                        # [EXPERIMENT α] Same as y_readout but without F.normalize.
-                        # Tests whether sphere constraint on C_t was the bottleneck.
-                        C_t = self.policy.lmu_cell.W_query(self._lmu_h)  # unbounded
+                        C_t = self.policy.lmu_cell.W_query(self._lmu_h)
                         phi_t = th.einsum('bd,bdc->bc', C_t, m_new)
                     elif self.phi_source == 'innovation':
-                        # phi = u_x - u_h - u_m (LMU world-model innovation).
-                        # u_x already returned from policy.forward.
-                        phi_t = u_x
+                        lmu = self.policy.lmu_cell
+                        u_h = lmu.E_h(self._lmu_h)
+                        u_m = th.einsum('d,bdc->bc', lmu.e_m, self._lmu_m)
+                        phi_t = (u_x - u_h - u_m).detach()
                     elif self.phi_source == 'random_encoder':
-                        # Fresh frozen CNN, never trained — Burda 2018 baseline.
                         phi_t = self._phi_encoder(obs_t)
                     elif self.phi_source == 'encoder_detached':
-                        # Policy's learned encoder, stop-gradient.
                         phi_t = self.policy.encoder(obs_t).detach()
                     else:
                         raise ValueError(
                             f"Unknown phi_source: {self.phi_source}"
                         )
 
-                    b_raw = self._ep_bonus.bonus_and_update(phi_t)  # (n_envs,)
+                    b_raw = self._ep_bonus.bonus_and_update(phi_t)
 
-                    # Update running std with this batch of bonus values
                     self._b_running_std.update(b_raw.cpu().numpy())
                     b_norm = (b_raw.cpu().numpy()
                               / (self._b_running_std.std + 1e-6))
 
-                    b_buf.append(b_norm)  # (n_envs,) numpy
-
-                    # Track discrimination for monitoring
-                    # self._last_obs['image'] is (n_envs, C, H, W) numpy
-                    self._disc_tracker.record(
-                        self._last_obs['image'], b_raw.cpu().numpy()
-                    )
+                    b_buf.append(b_norm)
 
             ep_start_buf.append(self._last_episode_starts.copy())
 
@@ -354,7 +330,7 @@ class LMUPPO(PPO):
             n_steps += 1
 
             # ── Reward combination ────────────────────────────────────
-            mask = (1.0 - self._last_episode_starts)  # (n_envs,)
+            mask = (1.0 - self._last_episode_starts)
             r_intr_masked = r_intr.cpu().numpy() * mask
             rewards_combined = rewards + beta * r_intr_masked
 
@@ -377,17 +353,16 @@ class LMUPPO(PPO):
             self._lmu_h = h_new.clone()
             self._lmu_m = m_new.clone()
 
-            # Advance LegS step counter for all envs before episode-boundary reset.
             if self._lmu_t is not None:
                 self._lmu_t = self._lmu_t + 1
 
-            # Reset LMU state and E3B buffer at episode boundaries
+            # Reset cell state and E3B buffer at episode boundaries.
             done_envs = np.where(dones)[0].tolist()
             for i in done_envs:
                 self._lmu_h[i].zero_()
                 self._lmu_m[i].zero_()
                 if self._lmu_t is not None:
-                    self._lmu_t[i] = 1   # first step of next episode
+                    self._lmu_t[i] = 1
             if self._ep_bonus is not None and done_envs:
                 self._ep_bonus.reset(done_envs)
 
@@ -403,29 +378,30 @@ class LMUPPO(PPO):
         rollout_buffer.compute_returns_and_advantage(values, dones)
 
         # ────────── Per-rollout diagnostics ──────────────────────────
-        r_intr_all = th.stack(r_intr_buf).cpu()    # (T, n_envs)
-        prod_all   = th.stack(prod_buf).cpu()      # (T, n_envs, C)
+        r_intr_all = th.stack(r_intr_buf).cpu()
+        prod_all   = th.stack(prod_buf).cpu()
         u_x_all    = th.stack(u_x_buf).cpu()
         gate_all   = th.stack(gate_buf).cpu()
         innov_all  = th.stack(innov_buf).cpu()
-        ep_start_all = np.stack(ep_start_buf)      # (T, n_envs) bool
+        ep_start_all = np.stack(ep_start_buf)
 
-        # ── r_intr ───────────────────────────────────────────────────
+        # ── r_intr (zero for GRU/LSTM, kept for uniform logging) ─────
         self.logger.record("debug/r_intr_mean", r_intr_all.mean().item())
         self.logger.record("debug/r_intr_max",  r_intr_all.max().item())
 
-        # ── W_pre and e_x ────────────────────────────────────────────
-        e_x_norm = F.normalize(self.policy.lmu_cell.e_x, dim=0).norm().item()
-        self.logger.record("debug/e_x_norm", e_x_norm)
+        # ── LMU-specific diagnostics — gate on is_lmu ────────────────
+        if self.is_lmu:
+            e_x_norm = F.normalize(self.policy.lmu_cell.e_x, dim=0).norm().item()
+            self.logger.record("debug/e_x_norm", e_x_norm)
 
-        ortho_err = self.policy.lmu_cell.W_pre.orthogonality_error()
-        self.logger.record("debug/W_pre_ortho_error", ortho_err)
-        if ortho_err > 1e-3:
-            if self.verbose >= 1:
-                print(f"  [warn] W_pre ortho error = {ortho_err:.2e} — SVD reset")
-            self.policy.lmu_cell.W_pre.reorthogonalize()
+            ortho_err = self.policy.lmu_cell.W_pre.orthogonality_error()
+            self.logger.record("debug/W_pre_ortho_error", ortho_err)
+            if ortho_err > 1e-3:
+                if self.verbose >= 1:
+                    print(f"  [warn] W_pre ortho error = {ortho_err:.2e} — SVD reset")
+                self.policy.lmu_cell.W_pre.reorthogonalize()
 
-        # ── Memory magnitude ─────────────────────────────────────────
+        # ── Memory magnitude (zero for GRU; LSTM packs c-state here) ─
         m_norm = self._lmu_m.norm(dim=(1, 2)).mean().item()
         self.logger.record("debug/m_norm", m_norm)
         self.logger.record("intrinsic/beta",    beta)
@@ -437,44 +413,49 @@ class LMUPPO(PPO):
         )
         self.logger.record("intrinsic/r_intr_contribution",
                            beta * r_intr_all.mean().item())
+        self.logger.record(
+            "intrinsic/cell_type",
+            {'gated_lmu': 0, 'vanilla_lmu': 1, 'gru': 2, 'lstm': 3}.get(
+                self.cell_type, -1
+            ),
+        )
 
-        # ── Bug 1: cold-start sign bias ──────────────────────────────
-        ep_start_t = th.from_numpy(ep_start_all)          # (T, n_envs) bool
-        prod_cold = prod_all[ep_start_t]
-        prod_warm = prod_all[~ep_start_t]
+        # ── Cold-start sign bias / per-channel novelty — LMU only ────
+        if self.is_lmu:
+            ep_start_t = th.from_numpy(ep_start_all)
+            prod_cold = prod_all[ep_start_t]
+            prod_warm = prod_all[~ep_start_t]
 
-        if prod_cold.numel() > 0:
-            self.logger.record("debug/prod_positive_frac_cold_start",
-                               (prod_cold > 0).float().mean().item())
-            gate_cold  = gate_all[ep_start_t]
-            innov_cold = innov_all[ep_start_t]
-            self.logger.record("debug/gate_positive_frac_cold",
-                               (gate_cold > 0).float().mean().item())
-            self.logger.record("debug/innov_positive_frac_cold",
-                               (innov_cold > 0).float().mean().item())
-        if prod_warm.numel() > 0:
-            self.logger.record("debug/prod_positive_frac_warm",
-                               (prod_warm > 0).float().mean().item())
-        self.logger.record("debug/prod_positive_frac_all",
-                           (prod_all > 0).float().mean().item())
-        self.logger.record("debug/gate_abs_mean",  gate_all.abs().mean().item())
-        self.logger.record("debug/innov_abs_mean", innov_all.abs().mean().item())
+            if prod_cold.numel() > 0:
+                self.logger.record("debug/prod_positive_frac_cold_start",
+                                   (prod_cold > 0).float().mean().item())
+                gate_cold  = gate_all[ep_start_t]
+                innov_cold = innov_all[ep_start_t]
+                self.logger.record("debug/gate_positive_frac_cold",
+                                   (gate_cold > 0).float().mean().item())
+                self.logger.record("debug/innov_positive_frac_cold",
+                                   (innov_cold > 0).float().mean().item())
+            if prod_warm.numel() > 0:
+                self.logger.record("debug/prod_positive_frac_warm",
+                                   (prod_warm > 0).float().mean().item())
+            self.logger.record("debug/prod_positive_frac_all",
+                               (prod_all > 0).float().mean().item())
+            self.logger.record("debug/gate_abs_mean",  gate_all.abs().mean().item())
+            self.logger.record("debug/innov_abs_mean", innov_all.abs().mean().item())
 
-        # ── Encoder saturation ────────────────────────────────────────
-        self.logger.record("debug/u_x_zero_frac",
-                           (u_x_all.abs() < 1e-6).float().mean().item())
+            self.logger.record("debug/u_x_zero_frac",
+                               (u_x_all.abs() < 1e-6).float().mean().item())
 
-        # ── Per-channel novelty concentration ─────────────────────────
-        per_chan = prod_all.abs().mean(dim=(0, 1))  # (C,)
-        self.logger.record("debug/per_channel_mean", per_chan.mean().item())
-        self.logger.record("debug/per_channel_std",  per_chan.std().item())
-        self.logger.record("debug/per_channel_max",  per_chan.max().item())
-        active = (per_chan > 0.1 * per_chan.max()).float().sum().item()
-        self.logger.record("debug/active_channel_count", active)
+            per_chan = prod_all.abs().mean(dim=(0, 1))
+            self.logger.record("debug/per_channel_mean", per_chan.mean().item())
+            self.logger.record("debug/per_channel_std",  per_chan.std().item())
+            self.logger.record("debug/per_channel_max",  per_chan.max().item())
+            active = (per_chan > 0.1 * per_chan.max()).float().sum().item()
+            self.logger.record("debug/active_channel_count", active)
 
         # ── E3B diagnostics ───────────────────────────────────────────
         if self._ep_bonus is not None and b_buf:
-            b_all = np.stack(b_buf)  # (T, n_envs)
+            b_all = np.stack(b_buf)
             self.logger.record("episodic/b_mean",    float(b_all.mean()))
             self.logger.record("episodic/b_max",     float(b_all.max()))
             self.logger.record("episodic/b_std",     float(b_all.std()))
@@ -483,40 +464,27 @@ class LMUPPO(PPO):
             self.logger.record("episodic/b_contribution",
                                beta_ep * float(b_all.mean()))
 
-            # Discrimination monitoring — KEY metric for Phase 2 health
-            disc = self._disc_tracker.flush()
-            for k, v in disc.items():
-                self.logger.record(f"episodic/disc_{k}", v)
-
-            # The critical number — log prominently
-            if 'ratio_b' in disc:
-                self.logger.record("episodic/ratio_b", disc['ratio_b'])
-                if disc['ratio_b'] < 2.0 and self.verbose >= 1:
-                    print(f"  [warn] episodic ratio_b = {disc['ratio_b']:.2f} "
-                          f"(below 2.0 — consider adding inverse dynamics aux)")
-            # NEW: numerical safety diagnostics
             safety = self._ep_bonus.get_diagnostics()
             self.logger.record("episodic/M_min_eigval",
-                            self._ep_bonus.min_eigenvalue())
+                               self._ep_bonus.min_eigenvalue())
             self.logger.record("episodic/n_skipped",  safety['n_skipped'])
             self.logger.record("episodic/n_reset",    safety['n_reset'])
             self.logger.record("episodic/b_max",      safety['b_max'])
             self.logger.record("episodic/skip_frac",  safety['skip_frac'])
             self.logger.record("episodic/reset_frac", safety['reset_frac'])
 
-            # Loud warnings if anything fires — these should be 0 in healthy training
             if self.verbose >= 1:
                 if safety['n_reset'] > 0:
                     print(f"  [warn] M was reset {safety['n_reset']} times "
-                        f"(b_true went negative — M corruption recovery)")
+                          f"(b_true went negative — M corruption recovery)")
                 if safety['skip_frac'] > 0.01:
                     print(f"  [warn] {safety['skip_frac']:.2%} of M updates skipped "
-                        f"(b_true non-finite or > {self._ep_bonus.reject_threshold:.0e}); "
-                        f"b_max = {safety['b_max']:.3g}")
+                          f"(b_true non-finite or > {self._ep_bonus.reject_threshold:.0e}); "
+                          f"b_max = {safety['b_max']:.3g}")
                 e_min = self._ep_bonus.min_eigenvalue()
                 if e_min < 0:
                     print(f"  [ERROR] M_min_eigval = {e_min:.3e} — math is broken, "
-                        f"investigate immediately")
+                          f"investigate immediately")
 
         callback.on_rollout_end()
         return True
@@ -536,7 +504,7 @@ class LMUPPO(PPO):
         else:
             n = observation.shape[0]
 
-        is_legs = self.measure == 'LegS'
+        is_legs = (self.measure == 'LegS') and self.is_lmu
 
         if state is None:
             h, m = self.policy.initial_state(n, self.device)
@@ -571,7 +539,7 @@ class LMUPPO(PPO):
         return actions, (h_new, m_new)
 
     # ------------------------------------------------------------------
-    # PPO update — unchanged from Phase 0
+    # PPO update
     # ------------------------------------------------------------------
 
     def train(self) -> None:
@@ -593,6 +561,8 @@ class LMUPPO(PPO):
             "encoder": [], "lmu_cell": [], "actor": [], "critic": []
         }
 
+        has_W_pre = hasattr(self.policy.lmu_cell, 'W_pre')
+
         continue_training = True
         for epoch in range(self.n_epochs):
             for batch in self.rollout_buffer.get(self.n_chunks_per_batch):
@@ -603,7 +573,7 @@ class LMUPPO(PPO):
                     lmu_m=batch.lmu_m,
                     episode_starts=batch.episode_starts,
                     actions_seq=batch.actions,
-                    lmu_t=batch.lmu_t if self.measure == 'LegS' else None,
+                    lmu_t=batch.lmu_t if (self.measure == 'LegS' and self.is_lmu) else None,
                 )
 
                 advantages = batch.advantages
@@ -648,11 +618,13 @@ class LMUPPO(PPO):
                 self.policy.optimizer.zero_grad()
                 loss.backward()
 
-                if self.policy.lmu_cell.W_pre.weights.grad is not None:
-                    wpre_grad_norms.append(
-                        self.policy.lmu_cell.W_pre.weights.grad.norm().item()
-                    )
-                self.policy.lmu_cell.W_pre.ortho_update(lr=1e-3)
+                # W_pre Riemannian update — only for cells that have W_pre.
+                if has_W_pre:
+                    if self.policy.lmu_cell.W_pre.weights.grad is not None:
+                        wpre_grad_norms.append(
+                            self.policy.lmu_cell.W_pre.weights.grad.norm().item()
+                        )
+                    self.policy.lmu_cell.W_pre.ortho_update(lr=1e-3)
 
                 _per_comp = []
                 for _name, _mod in [
@@ -670,7 +642,7 @@ class LMUPPO(PPO):
                 grad_norm = max(_per_comp)
                 self.policy.optimizer.step()
 
-                if self._n_updates % 100 == 0:
+                if has_W_pre and self._n_updates % 100 == 0:
                     ortho_err = self.policy.lmu_cell.W_pre.orthogonality_error()
                     if ortho_err > 1e-3:
                         if self.verbose >= 1:
