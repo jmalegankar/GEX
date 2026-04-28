@@ -1,8 +1,8 @@
 """
-LMU-PPO training script — Phase 2.
+LMU-PPO training script — Phase 2 + Phase 3.1 (ObstructedMaze).
 
-Standard runs:
-──────────────
+Standard runs (MiniGrid-Memory):
+────────────────────────────────
 # Baseline: lifelong only, with wrapper (reproduces Phase 0 validation)
 python train.py --env MemoryS11 --seed 0 --use_wrapper --beta_ep 0.0
 
@@ -28,10 +28,40 @@ for vs in 3 5 7; do
                     --tb_log runs/view_ablation &
 done
 
+Phase 3.1 — ObstructedMaze runs (random-φ E3B, no wrapper):
+───────────────────────────────────────────────────────────
+# Headline external-validation runs vs. Henaff 2022 Fig. 4.
+# 2Dlhb is the hardest 2D variant (locked + hidden + blocked).
+python train.py --env ObstructedMaze-2Dlhb --seed 0 \
+    --phi_source random_encoder --beta_ep 0.1 --beta 0.0 \
+    --total_steps 10_000_000 --tb_log runs/obstructedmaze_phR
+
+# Three seeds for the headline:
+for s in 0 1 2; do
+    python train.py --env ObstructedMaze-2Dlhb --seed $s \
+        --phi_source random_encoder --beta_ep 0.1 --beta 0.0 \
+        --total_steps 10_000_000 --tb_log runs/obstructedmaze_phR &
+done
+
+# Optional difficulty ladder (2Dl easiest → 2Dlhb hardest):
+python train.py --env ObstructedMaze-2Dl   --seed 0 --phi_source random_encoder ...
+python train.py --env ObstructedMaze-2Dlh  --seed 0 --phi_source random_encoder ...
+python train.py --env ObstructedMaze-2Dlhb --seed 0 --phi_source random_encoder ...
+
+# Sanity check (always run before a full 10M launch on a new env):
+python train.py --env ObstructedMaze-2Dlhb --seed 0 \
+    --phi_source random_encoder --beta_ep 0.1 --beta 0.0 \
+    --total_steps 100_000 --tb_log runs/obstructedmaze_sanity
+
 Success criterion (Phase 2):
 ────────────────────────────
 eval/mean_reward > 0.9 within 5M steps on S11 WITHOUT --use_wrapper.
 Run 3 seeds (0, 1, 2) before drawing conclusions.
+
+Success criterion (Phase 3.1 ObstructedMaze):
+─────────────────────────────────────────────
+Match or beat Henaff 2022 Fig. 4 (E3B-IDM ~0.5 at 25M steps on 2Dlhb)
+at 10M steps. Run 3 seeds.
 """
 
 import argparse
@@ -49,11 +79,22 @@ from mem_start import MemoryStartWrapper
 
 
 ENV_IDS = {
+    # MiniGrid-Memory (Phase 0–2)
     "MemoryS5":  "MiniGrid-MemoryS5-v0",
     "MemoryS7":  "MiniGrid-MemoryS7-v0",
     "MemoryS9":  "MiniGrid-MemoryS9-v0",
     "MemoryS11": "MiniGrid-MemoryS11-v0",
     "MemoryS13": "MiniGrid-MemoryS13-v0",
+
+    # ObstructedMaze 2D variants (Phase 3.1).
+    # All three share a 2×2 room layout (4 rooms × room_size=6).
+    # Source: max_steps = 4 · num_rooms_visited · room_size² = 4·4·36 = 576.
+    # Difficulty: l = locked doors, h = keys hidden in boxes, b = doors blocked by balls.
+    # Using -v0 for direct comparability with Henaff 2022 (E3B paper, Fig. 4);
+    # Minigrid -v1 fixes a rare unsolvability bug but post-dates the published baseline.
+    "ObstructedMaze-2Dl":   "MiniGrid-ObstructedMaze-2Dl-v0",
+    "ObstructedMaze-2Dlh":  "MiniGrid-ObstructedMaze-2Dlh-v0",
+    "ObstructedMaze-2Dlhb": "MiniGrid-ObstructedMaze-2Dlhb-v0",
 }
 
 THETA = {
@@ -62,6 +103,16 @@ THETA = {
     "MemoryS9":  120,
     "MemoryS11": 160,
     "MemoryS13": 200,
+
+    # ObstructedMaze θ calibration (LegT only — LegS ignores θ).
+    # max_steps = 576 for all 2D variants. Ideal θ ≈ max_steps to cover the full
+    # episode, but with memory_size=128 that gives θ/m ≈ 4.5 steps per Legendre
+    # component — coarse but workable. These tasks are a strong argument for
+    # LegS (θ-free): pass --measure LegS to sidestep this entirely.
+    # Easier variants have shorter typical solution paths so smaller θ suffices.
+    "ObstructedMaze-2Dl":   400,
+    "ObstructedMaze-2Dlh":  500,
+    "ObstructedMaze-2Dlhb": 600,
 }
 
 ARCH = {
@@ -70,6 +121,13 @@ ARCH = {
     "MemoryS9":  dict(hidden_size=128, memory_size=48),
     "MemoryS11": dict(hidden_size=128, memory_size=64),
     "MemoryS13": dict(hidden_size=128, memory_size=96),
+
+    # ObstructedMaze: more rooms + key/door/box bindings to remember + longer
+    # episodes than S13 → bump memory_size to 128. Hidden size stays at 128
+    # since the per-step encoding burden (egocentric 7×7×3 patch) is unchanged.
+    "ObstructedMaze-2Dl":   dict(hidden_size=128, memory_size=128),
+    "ObstructedMaze-2Dlh":  dict(hidden_size=128, memory_size=128),
+    "ObstructedMaze-2Dlhb": dict(hidden_size=128, memory_size=128),
 }
 
 CHUNK_LEN_DEFAULT = {
@@ -78,6 +136,12 @@ CHUNK_LEN_DEFAULT = {
     "MemoryS9":  32,
     "MemoryS11": 16,
     "MemoryS13": 16,
+
+    # ObstructedMaze: same BPTT trade-off as MemoryS13. Increase via --chunk_len
+    # if VRAM permits and you want longer credit assignment within a chunk.
+    "ObstructedMaze-2Dl":   16,
+    "ObstructedMaze-2Dlh":  16,
+    "ObstructedMaze-2Dlhb": 16,
 }
 
 
@@ -106,11 +170,11 @@ def main():
     parser.add_argument("--env", default="MemoryS11", choices=list(ENV_IDS))
     parser.add_argument("--use_wrapper", action='store_true',
                         help="Use MemoryStartWrapper (places agent near hint). "
-                             "Omit for the real Phase 2 experiment.")
+                             "MiniGrid-Memory only — invalid for ObstructedMaze.")
     parser.add_argument("--view_size", type=int, default=None,
                         help="Override agent view size. Default: env's built-in "
-                             "(7 for MiniGrid-Memory). Set to 3 for the memory "
-                             "ablation test.")
+                             "(7 for MiniGrid-Memory and ObstructedMaze). Set to "
+                             "3 for the memory ablation test.")
 
     # ── Training ─────────────────────────────────────────────────────
     parser.add_argument("--seed",        type=int,   default=0)
@@ -150,7 +214,8 @@ def main():
     parser.add_argument(
         "--measure", default="LegT", choices=["LegT", "LegS"],
         help="Memory measure. LegT=sliding window (theta required). "
-             "LegS=full history, timescale-free (Craftax target).",
+             "LegS=full history, timescale-free (recommended for ObstructedMaze "
+             "and Craftax-class long-episode tasks).",
     )
     parser.add_argument(
         "--gate_type", default="softsign_sum",
@@ -172,6 +237,16 @@ def main():
     parser.add_argument("--device", default="auto")
 
     args = parser.parse_args()
+
+    # ── Argument compatibility checks ────────────────────────────────
+    # MemoryStartWrapper is MiniGrid-Memory-specific; would silently misbehave
+    # or crash on ObstructedMaze (different env structure, no hint object).
+    if args.use_wrapper and args.env.startswith("ObstructedMaze"):
+        parser.error(
+            f"--use_wrapper is MiniGrid-Memory specific (places agent near "
+            f"the hint object). It does not apply to ObstructedMaze tasks "
+            f"(got --env {args.env}). Re-run without --use_wrapper."
+        )
 
     env_id = ENV_IDS[args.env]
     arch   = ARCH[args.env]
@@ -225,7 +300,6 @@ def main():
         lr=args.lr,
         ent_coef=0.008,
         vf_coef=1.0,
-        clip_range_vf=0.2,
         max_grad_norm=0.5,
         clip_range=0.2, 
         target_kl=0.05,
@@ -247,11 +321,11 @@ def main():
     total_params = sum(p.numel() for p in model.policy.parameters())
     view_str = f"{args.view_size}" if args.view_size else "default(7)"
 
-    print(f"\nLMU-PPO Phase 2  ·  {env_id}  ·  seed={args.seed}")
-    print(f"  wrapper={'ON' if args.use_wrapper else 'OFF (Phase 2 target)'}  "
+    print(f"\nLMU-PPO  ·  {env_id}  ·  seed={args.seed}")
+    print(f"  wrapper={'ON' if args.use_wrapper else 'OFF'}  "
           f"view_size={view_str}")
     print(f"  beta={args.beta}  beta_ep={args.beta_ep}  "
-          f"lambda_reg={args.lambda_reg}")
+          f"lambda_reg={args.lambda_reg}  phi_source={args.phi_source}")
     print(f"  measure={args.measure}  gate_type={args.gate_type}  "
           f"residual_scale={args.residual_scale}")
     print(f"  encoder=64  hidden={arch['hidden_size']}  "
@@ -264,10 +338,10 @@ def main():
 
     if args.beta_ep == 0.0:
         print("  [mode] LIFELONG ONLY — E3B disabled (baseline run)")
-    elif not args.use_wrapper:
-        print("  [mode] PHASE 2 — E3B active, no wrapper")
+    elif args.use_wrapper:
+        print("  [mode] E3B + WRAPPER — for ablation comparison")
     else:
-        print("  [mode] PHASE 2 + WRAPPER — for ablation comparison")
+        print("  [mode] E3B active — no wrapper")
     print()
 
     # ── Run name for TensorBoard ──────────────────────────────────────
@@ -302,5 +376,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

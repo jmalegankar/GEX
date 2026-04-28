@@ -306,10 +306,7 @@ class LMUPPO(PPO):
                     elif self.phi_source == 'innovation':
                         # phi = u_x - u_h - u_m (LMU world-model innovation).
                         # u_x already returned from policy.forward.
-                        lmu = self.policy.lmu_cell
-                        u_h = lmu.E_h(self._lmu_h)                         # (n_envs, C)
-                        u_m = th.einsum('d,bdc->bc', lmu.e_m, self._lmu_m) # (n_envs, C)
-                        phi_t = (u_x - u_h - u_m).detach()
+                        phi_t = u_x
                     elif self.phi_source == 'random_encoder':
                         # Fresh frozen CNN, never trained — Burda 2018 baseline.
                         phi_t = self._phi_encoder(obs_t)
