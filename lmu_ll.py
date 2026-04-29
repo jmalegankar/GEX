@@ -178,6 +178,20 @@ class LMUCell(nn.Module):
         """
         Primarily to estimate gradients from flushes on each step
         Flushes are rare and thus there will be very few updates
+
+        Estimation process:
+        Assume that a flush happend at this step
+
+        Compute the final memory state as:
+
+        m_new = A^k m_self + sum_{i=1}^k A^{k-i} B u_i
+
+        where gradients only flow through u_i = f(m_oth[:, i, :], h_self)
+        and not through m_self or h_self (detach)
+
+        Stack all intermediate h states for an LMU cell that might
+        be in series with the flush point
+
         """
         m_oth = m_oth.view(self.batch_size, -1, self.input_size)  # (B, k, p)
         m_new = m_self.clone()
