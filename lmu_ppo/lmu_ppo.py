@@ -71,6 +71,8 @@ class LMUPPO(PPO):
         gate_type: str = 'softsign_sum',
         residual_scale: float = 0.05,
         read_head: str = 'dynamic',
+        postprocessor_dim: Optional[int] = None,
+        head_layernorm: bool = False,
         cell_type: str = 'gated_lmu',
         tensorboard_log: Optional[str] = None,
         verbose: int = 1,
@@ -97,6 +99,8 @@ class LMUPPO(PPO):
         self.gate_type = gate_type
         self.residual_scale = residual_scale
         self.read_head = read_head
+        self.postprocessor_dim = postprocessor_dim
+        self.head_layernorm = head_layernorm
         self.cell_type = cell_type
         self.is_lmu = cell_type in ('gated_lmu', 'vanilla_lmu')
 
@@ -147,6 +151,8 @@ class LMUPPO(PPO):
             residual_scale=self.residual_scale,
             read_head=self.read_head,
             cell_type=self.cell_type,
+            postprocessor_dim=self.postprocessor_dim,
+            head_layernorm=self.head_layernorm,
         ).to(self.device)
 
         self.rollout_buffer = LMURolloutBuffer(

@@ -1,30 +1,22 @@
 """
-LMU Actor-Critic Policy — supports gated_lmu / vanilla_lmu / gru / lstm cells.
+Policy with optional head_layernorm + postprocessor.
 
-Cell dispatch (delegated to lmu_ppo.cell_wrappers.make_cell):
-    'gated_lmu'   — current default. LMUCell with full innovations.
-    'vanilla_lmu' — LMUCell with gate=none, residual=0, read_head=first_coef.
-                    Mimics POPGym's published LMU baseline.
-    'gru'         — GRUCellWrapper (POPGym baseline).
-    'lstm'        — LSTMCellWrapper (POPGym baseline).
+Architecture flow:
+    obs → encoder → cell → read_state(h, m) → [LayerNorm] → [postprocessor] → actor/critic
 
-Encoder dispatch (delegated to lmu_ppo.popgym_encoders.make_encoder):
-    Single-key Dict({obs: Discrete | MultiDiscrete | Box}) → POPGym* encoder.
+Where:
+    [LayerNorm]: applied if head_layernorm=True. Normalizes the cell's
+                 read_state output so it has unit-ish magnitude entering
+                 the heads. Helps when BPTT-attenuated recurrent grad is
+                 small relative to encoder grad — by rescaling the value
+                 channels feeding the heads, the recurrent path gets a
+                 stronger effective contribution to the policy gradient.
 
-Head sizing:
-    Actor/critic input size from self.lmu_cell.head_input_size.
-    Gated LMU (read_head='dynamic'):     hidden + encoder_dim
-    Vanilla LMU (read_head='first_coef'): hidden
-    GRU / LSTM:                           hidden
+    [postprocessor]: applied if postprocessor_dim is not None. Adds one
+                     Linear+ReLU layer between the (optionally normed)
+                     cell output and the heads.
 
-Optimizer exclusion:
-    LMU cells expose a W_pre (OrthoLayer) updated via Riemannian steps in
-    the train loop. Excluded from Adam here. GRU/LSTM have no W_pre, so all
-    their params go through Adam.
-
-LegS dispatch:
-    Only fires when self.cell_type ∈ {gated_lmu, vanilla_lmu} AND
-    self.measure == 'LegS'. For GRU/LSTM, t is never threaded.
+Both default to off / None for backward compatibility.
 """
 
 import torch
@@ -38,12 +30,6 @@ from .cell_wrappers import make_cell
 
 
 class LMUActorCriticPolicy(nn.Module):
-    """
-    Encoder → memory cell → actor + critic.
-
-    Cell type, encoder type, and head sizes are all dispatched at construction.
-    """
-
     def __init__(
         self,
         observation_space: spaces.Space,
@@ -58,6 +44,8 @@ class LMUActorCriticPolicy(nn.Module):
         residual_scale:    float = 0.05,
         read_head:         str = 'dynamic',
         cell_type:         str = 'gated_lmu',
+        postprocessor_dim: Optional[int] = None,
+        head_layernorm:    bool = False,                    # [NEW]
     ):
         super().__init__()
         assert isinstance(action_space, spaces.Discrete)
@@ -70,10 +58,8 @@ class LMUActorCriticPolicy(nn.Module):
         self.is_lmu      = cell_type in ('gated_lmu', 'vanilla_lmu')
         n_actions = action_space.n
 
-        # Encoder dispatch — single-key Dict POPGym obs.
         self.encoder = make_encoder(observation_space, out_dim=encoder_dim)
 
-        # Cell dispatch.
         self.lmu_cell = make_cell(
             cell_type,
             input_size=encoder_dim,
@@ -86,9 +72,33 @@ class LMUActorCriticPolicy(nn.Module):
             read_head=read_head,
         )
 
-        # Actor / critic heads sized from cell.head_input_size.
-        head_in = self.lmu_cell.head_input_size
+        # ── Head LayerNorm ────────────────────────────────────────────────
+        # Sits between cell.read_state and the (optional) postprocessor.
+        # Purpose: rescale recurrent-state magnitude so it competes with
+        # encoder magnitude entering the heads — addresses BPTT gradient
+        # attenuation observed in Diagnostic G.
+        cell_out_dim = self.lmu_cell.head_input_size
+        if head_layernorm:
+            self.head_norm = nn.LayerNorm(cell_out_dim)
+        else:
+            self.head_norm = nn.Identity()
 
+        # ── Postprocessor ─────────────────────────────────────────────────
+        if postprocessor_dim is not None:
+            self.postprocessor = nn.Sequential(
+                nn.Linear(cell_out_dim, postprocessor_dim),
+                nn.ReLU(),
+            )
+            for m in self.postprocessor.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.orthogonal_(m.weight, gain=nn.init.calculate_gain('relu'))
+                    nn.init.zeros_(m.bias)
+            head_in = postprocessor_dim
+        else:
+            self.postprocessor = nn.Identity()
+            head_in = cell_out_dim
+
+        # ── Actor / critic heads ──────────────────────────────────────────
         self.actor = nn.Linear(head_in, n_actions)
         nn.init.orthogonal_(self.actor.weight, gain=0.01)
         nn.init.zeros_(self.actor.bias)
@@ -103,8 +113,7 @@ class LMUActorCriticPolicy(nn.Module):
         nn.init.orthogonal_(self.critic[2].weight, gain=1.0)
         nn.init.zeros_(self.critic[2].bias)
 
-        # Optimizer: exclude W_pre (Riemannian-updated externally) only if
-        # the cell has it (LMU cells do, GRU/LSTM don't).
+        # ── Optimizer ─────────────────────────────────────────────────────
         if hasattr(self.lmu_cell, 'W_pre'):
             ortho_params  = set(self.lmu_cell.W_pre.parameters())
             main_params   = [p for p in self.parameters() if p not in ortho_params]
@@ -112,13 +121,8 @@ class LMUActorCriticPolicy(nn.Module):
             main_params = list(self.parameters())
         self.optimizer = torch.optim.Adam(main_params, lr=lr, eps=1e-5)
 
-    # ── helpers ───────────────────────────────────────────────────────────────
-
     def _critic_input(self, h: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        """Read the actor/critic head input from the current cell state."""
-        return self.lmu_cell.read_state(h, m)
-
-    # ── rollout (single step) ─────────────────────────────────────────────────
+        return self.postprocessor(self.head_norm(self.lmu_cell.read_state(h, m)))
 
     def forward(
         self,
@@ -126,12 +130,8 @@ class LMUActorCriticPolicy(nn.Module):
         h_prev: torch.Tensor,
         m_prev: torch.Tensor,
         t:      Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor,
-               torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns: action, value, log_prob, h, m, logits, r_intr, gate, innov, u_x"""
+    ):
         x = self.encoder(obs)
-
         if self.measure == 'LegS' and self.is_lmu:
             h, m, r_intr, gate, innov, u_x = self.lmu_cell(
                 x, h_prev, m_prev, t.float()
@@ -139,15 +139,14 @@ class LMUActorCriticPolicy(nn.Module):
         else:
             h, m, r_intr, gate, innov, u_x = self.lmu_cell(x, h_prev, m_prev)
 
-        logits   = self.actor(self._critic_input(h, m))
+        head     = self._critic_input(h, m)
+        logits   = self.actor(head)
         dist     = Categorical(logits=logits)
         action   = dist.sample()
         log_prob = dist.log_prob(action)
-        value    = self.critic(self._critic_input(h, m)).squeeze(-1)
+        value    = self.critic(head).squeeze(-1)
 
         return action, value, log_prob, h, m, logits, r_intr, gate, innov, u_x
-
-    # ── PPO update (K-step unroll) ────────────────────────────────────────────
 
     def evaluate_actions(
         self,
@@ -157,13 +156,10 @@ class LMUActorCriticPolicy(nn.Module):
         episode_starts: torch.Tensor,
         actions_seq:    torch.Tensor,
         lmu_t:          Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Unrolls K steps with full gradient. Returns flattened (B*K) tensors."""
+    ):
         B, K = episode_starts.shape
         h, m = lmu_h, lmu_m
-
         all_values, all_log_probs, all_entropy, all_r_intrs = [], [], [], []
-
         uses_legs = (self.measure == 'LegS' and self.is_lmu)
 
         for k in range(K):
@@ -195,15 +191,13 @@ class LMUActorCriticPolicy(nn.Module):
 
         return values, log_probs, entropy, r_intrs
 
-    # ── GAE bootstrap ─────────────────────────────────────────────────────────
-
     def predict_values(
         self,
         obs:   Dict[str, torch.Tensor],
         lmu_h: torch.Tensor,
         lmu_m: torch.Tensor,
         t:     Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ):
         x = self.encoder(obs)
         if self.measure == 'LegS' and self.is_lmu:
             h, m, _, _, _, _ = self.lmu_cell(x, lmu_h, lmu_m, t.float())
@@ -211,13 +205,8 @@ class LMUActorCriticPolicy(nn.Module):
             h, m, _, _, _, _ = self.lmu_cell(x, lmu_h, lmu_m)
         return self.critic(self._critic_input(h, m)).squeeze(-1)
 
-    # ── state helpers ─────────────────────────────────────────────────────────
-
-    def initial_state(
-        self, n_envs: int, device: torch.device
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def initial_state(self, n_envs: int, device: torch.device):
         return self.lmu_cell.initial_state(n_envs, device)
 
     def set_training_mode(self, mode: bool) -> None:
         self.train(mode)
-
